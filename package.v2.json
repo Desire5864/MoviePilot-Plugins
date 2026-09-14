@@ -1,0 +1,48 @@
+{
+  "QbCategoryPause": {
+    "name": "QB分类活动暂停",
+    "description": "监控QB指定分类，一旦有做种上传中（uploading）的种子立即暂停。",
+    "labels": "下载器",
+    "version": "1.3.0",
+    "icon": "Qbittorrent_A.png",
+    "author": "Desire5864",
+    "level": 1,
+    "system_version": ">=2.12.0",
+    "history": {
+      "v1.0.0": "初始版本：监控指定QB下载器的指定分类，发现活动种子立即暂停。",
+      "v1.1.0": "监控范围收窄为仅做种上传中（uploading）状态的种子。",
+      "v1.2.0": "插件详情页展示当前 uploading 任务的分类统计与明细。",
+      "v1.3.0": "新增已停止（stoppedUP）任务自动恢复功能，停止超过自定义时间后自动重新开始。"
+    }
+  },
+  "DeepSeekBalance": {
+    "name": "DeepSeek余额监控",
+    "description": "定时查询DeepSeek账户余额，记录消耗明细，低于阈值时通知提醒。",
+    "labels": "工具",
+    "version": "1.4.0",
+    "icon": "deepseek.png",
+    "author": "Desire5864",
+    "level": 1,
+    "system_version": ">=2.12.0",
+    "history": {
+      "v1.0.0": "初始版本：定时查询DeepSeek账户余额，低于阈值时通知，详情页展示余额明细。",
+      "v1.1.0": "新增用量监控：通过平台令牌查询账户全量Token用量与费用。",
+      "v1.2.0": "移除用量监控，改为记录余额消耗明细，详情页展示余额变化历史与消耗汇总。",
+      "v1.3.0": "消耗明细改为按日统计，展示每日首次/末次余额、当日消耗与记录次数。",
+      "v1.4.0": "检查间隔支持自定义数值与单位（分钟/小时），新增立即执行一次开关。"
+    }
+  },
+  "SiteUserDataFix": {
+    "name": "站点数据修正",
+    "description": "修正猫站、春天等站点做种数、做种体积、积分解析错误。",
+    "labels": "站点",
+    "version": "1.0",
+    "icon": "world.png",
+    "author": "Desire5864",
+    "level": 1,
+    "system_version": ">=2.12.0",
+    "history": {
+      "v1.0": "初始版本：修正猫站做种数/做种体积、春天积分解析错误。"
+    }
+  }
+}
