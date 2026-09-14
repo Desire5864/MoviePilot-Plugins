@@ -42,7 +42,7 @@ class QbCategoryPause(_PluginBase):
     # 插件版本
     plugin_version = "1.3.0"
     # 插件作者
-    plugin_author = "local"
+    plugin_author = "Desire5864"
     # 作者主页
     author_url = ""
     # 插件配置项ID前缀
