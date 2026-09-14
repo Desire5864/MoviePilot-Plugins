@@ -23,7 +23,7 @@ class SiteUserDataFix(_PluginBase):
     plugin_desc = "修正猫站、春天等站点做种数、做种体积、积分解析错误。"
     plugin_icon = "world.png"
     plugin_version = "1.0"
-    plugin_author = "local"
+    plugin_author = "Desire5864"
     plugin_config_prefix = "siteuserdatafix_"
     plugin_order = 1
     auth_level = 1
