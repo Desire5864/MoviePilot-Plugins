@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -387,52 +387,41 @@ class UhdBlurayAutoDownload(_PluginBase):
                     }
                 )
 
-                rows = []
+                # 使用卡片式布局，避免 VTable 单元格强制 nowrap 导致标题截断
+                card_items = []
                 for item in group_items:
-                    rows.append(
+                    card_items.append(
                         {
-                            "component": "tr",
+                            "component": "div",
+                            "props": {
+                                "style": "padding: 8px 10px; margin-bottom: 6px; "
+                                         "border-radius: 6px; background: rgba(var(--v-theme-surface-variant), 0.35);",
+                            },
                             "content": [
                                 {
-                                    "component": "td",
+                                    "component": "div",
                                     "props": {
-                                        "style": "white-space: normal !important; word-break: break-all !important; "
-                                                 "overflow: visible !important; text-overflow: clip !important; "
-                                                 "width: 70%; font-size: 14px; line-height: 1.5;",
+                                        "style": "white-space: normal; word-break: break-all; "
+                                                 "font-size: 14px; font-weight: 600; line-height: 1.5;",
                                     },
-                                    "content": [
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "style": "white-space: normal !important; word-break: break-all !important; "
-                                                         "font-weight: 500;",
-                                            },
-                                            "text": str(item.get("subtitle") or ""),
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "style": "white-space: normal !important; word-break: break-all !important; "
-                                                         "font-size: 12px; opacity: 0.75;",
-                                            },
-                                            "text": str(item.get("title") or ""),
-                                        },
-                                    ],
+                                    "text": str(item.get("subtitle") or ""),
                                 },
                                 {
-                                    "component": "td",
-                                    "props": {"style": "white-space: nowrap; font-size: 14px;"},
-                                    "text": str(item.get("size") or ""),
+                                    "component": "div",
+                                    "props": {
+                                        "style": "white-space: normal; word-break: break-all; "
+                                                 "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
+                                    },
+                                    "text": str(item.get("title") or ""),
                                 },
                                 {
-                                    "component": "td",
-                                    "props": {"style": "white-space: nowrap; font-size: 14px;"},
-                                    "text": str(item.get("progress") or ""),
-                                },
-                                {
-                                    "component": "td",
-                                    "props": {"style": "white-space: nowrap; font-size: 14px;"},
-                                    "text": str(item.get("action") or ""),
+                                    "component": "div",
+                                    "props": {
+                                        "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                    },
+                                    "text": f"大小：{item.get('size') or '-'}　|　"
+                                            f"站点进度：{item.get('progress') or '-'}　|　"
+                                            f"处理结果：{item.get('action') or '-'}",
                                 },
                             ],
                         }
@@ -445,48 +434,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTable",
-                                        "props": {"density": "compact"},
-                                        "content": [
-                                            {
-                                                "component": "thead",
-                                                "content": [
-                                                    {
-                                                        "component": "tr",
-                                                        "content": [
-                                                            {
-                                                                "component": "th",
-                                                                "props": {"style": "width: 70%; font-size: 14px;"},
-                                                                "text": "标题（上：中文名 / 下：原始名）",
-                                                            },
-                                                            {
-                                                                "component": "th",
-                                                                "props": {"style": "font-size: 14px;"},
-                                                                "text": "大小",
-                                                            },
-                                                            {
-                                                                "component": "th",
-                                                                "props": {"style": "font-size: 14px;"},
-                                                                "text": "站点进度",
-                                                            },
-                                                            {
-                                                                "component": "th",
-                                                                "props": {"style": "font-size: 14px;"},
-                                                                "text": "处理结果",
-                                                            },
-                                                        ],
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "tbody",
-                                                "content": rows,
-                                            },
-                                        ],
-                                    }
-                                ],
+                                "content": card_items,
                             }
                         ],
                     }
@@ -661,6 +609,13 @@ class UhdBlurayAutoDownload(_PluginBase):
                 "action": "",
             }
 
+            # 列表页副标题可能被站点截断（如彩虹岛显示为 "保留Dolb.."），
+            # 统一从详情页获取完整副标题
+            detail_subtitle = self.__fetch_detail_subtitle(site, torrent_id)
+            if detail_subtitle:
+                item["subtitle"] = detail_subtitle
+                torrent["subtitle"] = detail_subtitle
+
             # 站点进度判断：
             # "-"（我堡）或 "--"（彩虹岛）表示未下载，需要推送；
             # "0%"~"99%" 表示正在下载中，跳过；
@@ -680,12 +635,6 @@ class UhdBlurayAutoDownload(_PluginBase):
                 item["action"] = "已处理，跳过"
                 items.append(item)
                 continue
-
-            # 列表页副标题可能被站点截断，从详情页获取完整副标题
-            detail_subtitle = self.__fetch_detail_subtitle(site, torrent_id)
-            if detail_subtitle:
-                item["subtitle"] = detail_subtitle
-                torrent["subtitle"] = detail_subtitle
 
             # 下载种子文件并推送到 QB
             success = self.__download_and_push(
