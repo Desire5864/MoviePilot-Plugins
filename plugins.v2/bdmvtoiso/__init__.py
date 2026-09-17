@@ -17,6 +17,10 @@ SUBMITTED_LIMIT = 500
 DEFAULT_TAG = "UHD自动下载"
 # 默认分类（与 UHD原盘自动下载 插件推送 QB 时使用的分类保持一致）
 DEFAULT_CATEGORY = "彩虹岛&HR,OurBits原盘"
+# UHD原盘自动下载 插件ID（用于读取中文标题映射）
+UHD_PLUGIN_ID = "UhdBlurayAutoDownload"
+# UHD原盘自动下载 插件的已处理记录键名
+UHD_PROCESSED_DATA_KEY = "uhd_processed_map"
 # CD2 备份状态枚举
 CD2_STATUS_TEXT = {
     0: "空闲",
@@ -45,7 +49,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1298,6 +1302,28 @@ class BdmvToIso(_PluginBase):
                 pass
         self._cd2_client = None
 
+    def __get_cn_title(self, name: str) -> str:
+        """从 UHD原盘自动下载 插件的记录中查询资源目录对应的中文标题。
+
+        :param name: 资源目录名（QB 任务名）
+        :return: 中文标题；未找到返回空字符串
+        """
+        try:
+            processed_map = self.get_data(
+                UHD_PROCESSED_DATA_KEY, plugin_id=UHD_PLUGIN_ID
+            ) or {}
+        except Exception as err:
+            logger.warning(f"BDMV自动打包ISO：读取中文标题失败：{err}")
+            return ""
+
+        for record in processed_map.values():
+            if not isinstance(record, dict):
+                continue
+            title = str(record.get("title") or "")
+            if title and title == name:
+                return str(record.get("cn_title") or "")
+        return ""
+
     def __notify_submitted(self, name: str) -> None:
         """发送打包任务已提交通知。
 
@@ -1312,8 +1338,14 @@ class BdmvToIso(_PluginBase):
         except Exception as err:
             logger.warning(f"BDMV自动打包ISO：获取源盘大小失败：{err}")
 
+        cn_title = self.__get_cn_title(name)
+
         lines = ["🚀 BDMV 原盘开始打包", ""]
-        lines.append(f"📦 {name}")
+        if cn_title:
+            lines.append(f"📦 {cn_title}")
+            lines.append(f"　　{name}")
+        else:
+            lines.append(f"📦 {name}")
         lines.append("")
         if source_size:
             lines.append(f"▎📥 源盘大小　{source_size}")
@@ -1348,8 +1380,14 @@ class BdmvToIso(_PluginBase):
         # 源大小去掉服务端前缀，仅保留数值部分
         source_size = detail.replace("总大小：", "").strip() if detail else ""
 
+        cn_title = self.__get_cn_title(name)
+
         lines = ["🎬 BDMV 原盘打包完成", ""]
-        lines.append(f"📦 {name}")
+        if cn_title:
+            lines.append(f"📦 {cn_title}")
+            lines.append(f"　　{name}")
+        else:
+            lines.append(f"📦 {name}")
         lines.append("")
         if source_size:
             lines.append(f"▎📥 源盘大小　{source_size}")
