@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -393,8 +393,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                         {
                             "component": "tr",
                             "content": [
-                                {"component": "td", "text": str(item.get("title") or "")[:60]},
                                 {"component": "td", "text": str(item.get("subtitle") or "")[:40]},
+                                {"component": "td", "text": str(item.get("title") or "")[:60]},
                                 {"component": "td", "text": str(item.get("size") or "")},
                                 {"component": "td", "text": str(item.get("progress") or "")},
                                 {"component": "td", "text": str(item.get("action") or "")},
@@ -420,8 +420,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                     {
                                                         "component": "tr",
                                                         "content": [
-                                                            {"component": "th", "text": "主标题"},
                                                             {"component": "th", "text": "副标题"},
+                                                            {"component": "th", "text": "主标题"},
                                                             {"component": "th", "text": "大小"},
                                                             {"component": "th", "text": "站点进度"},
                                                             {"component": "th", "text": "处理结果"},
