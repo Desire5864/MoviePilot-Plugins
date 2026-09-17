@@ -43,7 +43,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -918,6 +918,19 @@ class BdmvToIso(_PluginBase):
                     submitted_map.pop(key, None)
             self.save_data(SUBMITTED_DATA_KEY, submitted_map)
 
+    @staticmethod
+    def __torrent_field(torrent: Any, key: str, default: Any = None) -> Any:
+        """兼容字典与对象两种形式读取种子字段。
+
+        :param torrent: 种子对象或字典
+        :param key: 字段名
+        :param default: 缺省值
+        :return: 字段值
+        """
+        if isinstance(torrent, dict):
+            return torrent.get(key, default)
+        return getattr(torrent, key, default)
+
     def __collect_completed_names(self) -> Optional[List[str]]:
         """收集下载器中带指定标签的已完成任务目录名。
 
@@ -945,30 +958,42 @@ class BdmvToIso(_PluginBase):
                 continue
 
             try:
-                torrents = downloader_obj.get_torrents() or []
+                # get_torrents 返回 (种子列表, 是否异常) 元组
+                result = downloader_obj.get_torrents()
             except Exception as err:
                 logger.error(f"BDMV自动打包ISO：获取 {service_name} 任务失败：{err}")
                 continue
 
-            for torrent in torrents:
+            if isinstance(result, tuple):
+                torrents, error = result
+                if error:
+                    logger.error(f"BDMV自动打包ISO：获取 {service_name} 任务返回异常")
+                    continue
+            else:
+                torrents = result
+
+            for torrent in torrents or []:
                 # 仅处理已完成任务
-                progress = float(getattr(torrent, "progress", 0) or 0)
+                try:
+                    progress = float(self.__torrent_field(torrent, "progress", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
                 if progress < 1:
                     continue
 
                 # 标签匹配
-                torrent_tags = getattr(torrent, "tags", None) or []
+                torrent_tags = self.__torrent_field(torrent, "tags", None) or []
                 if isinstance(torrent_tags, str):
                     torrent_tags = [tag.strip() for tag in torrent_tags.split(",") if tag.strip()]
                 if not any(tag in torrent_tags for tag in self._tags):
                     continue
 
                 # 取内容路径的目录名
-                content_path = getattr(torrent, "content_path", None) or ""
+                content_path = self.__torrent_field(torrent, "content_path", None) or ""
                 if not content_path:
                     continue
-                name = content_path.rstrip("/").split("/")[-1]
-                if name:
+                name = str(content_path).rstrip("/").split("/")[-1]
+                if name and name not in names:
                     names.append(name)
 
         return names
