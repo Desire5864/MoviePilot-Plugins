@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.3.0"
+    plugin_version = "2.3.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -682,16 +682,19 @@ class UhdBlurayAutoDownload(_PluginBase):
         """从站点副标题中提取中文标题。
 
         副标题格式形如「双子杀手 [DIY UHD原盘 ...]」或
-        「怒火战猴/地下杀神(港) 【DIY 国配...】」，
-        取第一个方括号之前的部分作为中文标题。
+        「查理·威尔森的战争 / 盖世奇才(台) / 韦氏风云 / [DIY ...]」，
+        先取第一个方括号之前的部分，再按别名分隔符（/ 或 |）取第一个别名。
 
         :param subtitle: 站点副标题
         :return: 中文标题；无法提取时返回空字符串
         """
         if not subtitle:
             return ""
-        head = re.split(r'[\[【]', subtitle, maxsplit=1)[0]
-        return head.strip().rstrip("/").strip()
+        # 去掉方括号内的制作说明
+        head = re.split(r'[\[【]', subtitle, maxsplit=1)[0].strip()
+        # 多别名时只保留第一个
+        first = re.split(r'\s*[/|]\s*', head, maxsplit=1)[0].strip()
+        return first.rstrip("/").strip()
 
     def __download_and_push(self, site: Dict[str, Any], site_conf: Dict[str, Any],
                             torrent: Dict[str, Any], downloader_obj: Any) -> bool:
