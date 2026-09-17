@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.8.0"
+    plugin_version = "1.9.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -397,7 +397,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                     "component": "td",
                                     "props": {
                                         "style": "white-space: normal; word-break: break-all; "
-                                                 "width: 32%; font-size: 12px; line-height: 1.4;",
+                                                 "width: 40%; font-size: 14px; line-height: 1.4;",
                                     },
                                     "text": str(item.get("subtitle") or ""),
                                 },
@@ -405,23 +405,23 @@ class UhdBlurayAutoDownload(_PluginBase):
                                     "component": "td",
                                     "props": {
                                         "style": "white-space: normal; word-break: break-all; "
-                                                 "width: 40%; font-size: 12px; line-height: 1.4;",
+                                                 "width: 30%; font-size: 14px; line-height: 1.4;",
                                     },
                                     "text": str(item.get("title") or ""),
                                 },
                                 {
                                     "component": "td",
-                                    "props": {"style": "white-space: nowrap; font-size: 12px;"},
+                                    "props": {"style": "white-space: nowrap; font-size: 14px;"},
                                     "text": str(item.get("size") or ""),
                                 },
                                 {
                                     "component": "td",
-                                    "props": {"style": "white-space: nowrap; font-size: 12px;"},
+                                    "props": {"style": "white-space: nowrap; font-size: 14px;"},
                                     "text": str(item.get("progress") or ""),
                                 },
                                 {
                                     "component": "td",
-                                    "props": {"style": "white-space: nowrap; font-size: 12px;"},
+                                    "props": {"style": "white-space: nowrap; font-size: 14px;"},
                                     "text": str(item.get("action") or ""),
                                 },
                             ],
@@ -448,27 +448,27 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                         "content": [
                                                             {
                                                                 "component": "th",
-                                                                "props": {"style": "width: 32%; font-size: 12px;"},
+                                                                "props": {"style": "width: 40%; font-size: 14px;"},
                                                                 "text": "副标题",
                                                             },
                                                             {
                                                                 "component": "th",
-                                                                "props": {"style": "width: 40%; font-size: 12px;"},
+                                                                "props": {"style": "width: 30%; font-size: 14px;"},
                                                                 "text": "主标题",
                                                             },
                                                             {
                                                                 "component": "th",
-                                                                "props": {"style": "font-size: 12px;"},
+                                                                "props": {"style": "font-size: 14px;"},
                                                                 "text": "大小",
                                                             },
                                                             {
                                                                 "component": "th",
-                                                                "props": {"style": "font-size: 12px;"},
+                                                                "props": {"style": "font-size: 14px;"},
                                                                 "text": "站点进度",
                                                             },
                                                             {
                                                                 "component": "th",
-                                                                "props": {"style": "font-size: 12px;"},
+                                                                "props": {"style": "font-size: 14px;"},
                                                                 "text": "处理结果",
                                                             },
                                                         ],
