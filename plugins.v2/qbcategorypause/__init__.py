@@ -40,7 +40,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -828,6 +828,7 @@ class QbCategoryPause(_PluginBase):
         # 筛选出监控分类中处于做种上传中（uploading）状态的种子
         active_hashes: List[str] = []
         active_names: List[str] = []
+        active_categories: List[str] = []
         for torrent in torrents:
             category = torrent.get("category") or ""
             if category not in self._categories:
@@ -836,6 +837,7 @@ class QbCategoryPause(_PluginBase):
             if torrent.get("state") in ACTIVE_STATES:
                 active_hashes.append(torrent.get("hash"))
                 active_names.append(torrent.get("name"))
+                active_categories.append(category)
 
         if not active_hashes:
             # 无活动种子时清空记录
@@ -849,12 +851,22 @@ class QbCategoryPause(_PluginBase):
         if downloader_obj.stop_torrents(ids=active_hashes):
             logger.info(f"QB分类活动暂停：下载器 {downloader_name} 已暂停 {len(active_hashes)} 个种子")
             if self._notify and active_hashes != self._last_paused_hashes:
+                # 按分类统计暂停数量
+                category_counter: Dict[str, int] = {}
+                for category in active_categories:
+                    category_counter[category] = category_counter.get(category, 0) + 1
+                category_summary = "；".join(
+                    f"已暂停{category} {count} 个活动种子"
+                    for category, count in sorted(
+                        category_counter.items(), key=lambda pair: pair[1], reverse=True
+                    )
+                )
                 self.post_message(
                     mtype=NotificationType.SiteMessage,
                     title="【QB分类活动暂停】",
                     text=f"下载器：{downloader_name}\n"
                          f"监控分类：{'、'.join(self._categories)}\n"
-                         f"已暂停 {len(active_hashes)} 个活动种子：\n"
+                         f"{category_summary}：\n"
                          + "\n".join(f"- {name}" for name in active_names[:20]),
                 )
             self._last_paused_hashes = active_hashes
