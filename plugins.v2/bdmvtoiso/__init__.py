@@ -45,7 +45,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -934,17 +934,7 @@ class BdmvToIso(_PluginBase):
                 changed = True
                 logger.info(f"BDMV自动打包ISO：已提交打包任务 {name}")
                 if self._notify:
-                    self.post_message(
-                        mtype=NotificationType.Plugin,
-                        title="【BDMV自动打包ISO】",
-                        text="\n".join([
-                            "🚀 已提交打包任务",
-                            "",
-                            f"📦 {name}",
-                            "",
-                            "⏳ 正在打包为 ISO，完成后将自动同步云端",
-                        ]),
-                    )
+                    self.__notify_submitted(name)
 
         # 5. 清理超量记录
         if changed:
@@ -1308,6 +1298,38 @@ class BdmvToIso(_PluginBase):
                 pass
         self._cd2_client = None
 
+    def __notify_submitted(self, name: str) -> None:
+        """发送打包任务已提交通知。
+
+        :param name: 资源目录名
+        """
+        # 提交后立即查询一次状态，尽量取到源盘大小
+        source_size = ""
+        try:
+            jobs = self.__fetch_status() or {}
+            detail = (jobs.get(name) or {}).get("detail") or ""
+            source_size = detail.replace("总大小：", "").strip()
+        except Exception as err:
+            logger.warning(f"BDMV自动打包ISO：获取源盘大小失败：{err}")
+
+        lines = ["🚀 BDMV 原盘开始打包", ""]
+        lines.append(f"📦 {name}")
+        lines.append("")
+        if source_size:
+            lines.append(f"▎📥 源盘大小　{source_size}")
+        lines.append("▎⏳ 状态　　　打包中")
+
+        if self._cd2_enabled and self._cd2_source_path:
+            lines.append("")
+            lines.append("☁️ 云端同步")
+            lines.append("　　⏸ 打包完成后自动触发")
+
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title="【BDMV自动打包ISO】",
+            text="\n".join(lines),
+        )
+
     def __notify_done(self, name: str, job: Dict[str, Any]) -> None:
         """发送打包完成通知，并按需触发 CD2 备份。
 
@@ -1329,23 +1351,19 @@ class BdmvToIso(_PluginBase):
         lines = ["🎬 BDMV 原盘打包完成", ""]
         lines.append(f"📦 {name}")
         lines.append("")
-        lines.append("━━━━━━━━━━━━━━━")
         if source_size:
-            lines.append(f"📥 源盘大小　{source_size}")
+            lines.append(f"▎📥 源盘大小　{source_size}")
         if size_text:
-            lines.append(f"💿 ISO 大小　{size_text}")
-        lines.append("━━━━━━━━━━━━━━━")
+            lines.append(f"▎💿 ISO 大小　{size_text}")
 
         # 打包完成后触发 CD2 备份同步
         if self._cd2_enabled:
+            lines.append("")
+            lines.append("☁️ 云端同步")
             if self.__trigger_cd2_backup():
-                lines.append("")
-                lines.append("☁️ 云端同步")
-                lines.append(f"　　✅ 已触发 CD2 备份")
+                lines.append("　　✅ 已触发 CD2 备份")
                 lines.append(f"　　📂 {self._cd2_source_path}")
             else:
-                lines.append("")
-                lines.append("☁️ 云端同步")
                 lines.append("　　❌ 触发失败，请检查 CD2 配置")
 
         if out_iso:
