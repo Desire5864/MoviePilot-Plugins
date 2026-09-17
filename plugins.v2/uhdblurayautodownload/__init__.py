@@ -32,7 +32,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -44,22 +44,25 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 可使用的用户级别
     auth_level = 1
 
-    # 站点配置：域名 -> 列表页地址、QB分类、保存路径、是否需要标题筛选
+    # 站点配置：域名 -> 列表页地址、QB分类、保存路径、筛选模式
+    # filter_mode: "uhd_title" 按标题匹配 UHD BluRay；"bluray_only" 仅排除非原盘（站点已按媒介筛选）
     _site_configs = {
         "ptchdbits.co": {
             "name": "彩虹岛",
             "list_url": "https://ptchdbits.co/torrents.php?medium=19&sort=4&type=desc",
             "category": "彩虹岛&HR",
             "save_path": "/原盘",
-            # 站点 medium=19 筛选不够严格，仍需按标题筛选 UHD BluRay
-            "need_title_filter": True,
+            # 站点 medium=19 已按 UHD Blu-ray 媒介筛选，标题不一定含 UHD，
+            # 因此仅排除 WEB-DL/HDTV/Encode 等非原盘
+            "filter_mode": "bluray_only",
         },
         "ourbits.club": {
             "name": "我堡",
             "list_url": "https://ourbits.club/torrents.php?standard=5&sort=4&type=desc",
             "category": "OurBits原盘",
             "save_path": "/原盘",
-            "need_title_filter": True,
+            # 站点 standard=5 仅按 2160p 分辨率筛选，需按标题匹配 UHD BluRay
+            "filter_mode": "uhd_title",
         },
     }
 
@@ -538,7 +541,7 @@ class UhdBlurayAutoDownload(_PluginBase):
             return items
 
         # 解析种子列表（列表页已按发布时间倒序，只取最新 N 条）
-        torrents = self.__parse_list_page(res.text, site_conf.get("need_title_filter", False))
+        torrents = self.__parse_list_page(res.text, site_conf.get("filter_mode", "uhd_title"))
         torrents = torrents[:self._latest_count]
         logger.info(f"UHD原盘自动下载：{site_name} 取最新 {len(torrents)} 个 UHD BluRay 原盘")
 
@@ -635,11 +638,12 @@ class UhdBlurayAutoDownload(_PluginBase):
         return success
 
     @staticmethod
-    def __parse_list_page(html: str, need_title_filter: bool) -> List[Dict[str, Any]]:
+    def __parse_list_page(html: str, filter_mode: str) -> List[Dict[str, Any]]:
         """解析站点种子列表页，提取 UHD BluRay 原盘。
 
         :param html: 页面 HTML
-        :param need_title_filter: 是否需要按标题筛选 UHD BluRay
+        :param filter_mode: 筛选模式，"uhd_title" 按标题匹配 UHD BluRay；
+                            "bluray_only" 仅排除非原盘（站点已按媒介筛选）
         :return: 种子信息列表
         """
         torrents: List[Dict[str, Any]] = []
@@ -666,9 +670,18 @@ class UhdBlurayAutoDownload(_PluginBase):
             if not title:
                 title = detail_links[0].xpath('string(.)').strip()
 
-            # 按标题筛选 UHD BluRay
-            if need_title_filter and not re.search(r'UHD\s*Blu-?ray', title, re.I):
-                continue
+            # 按筛选模式过滤
+            if filter_mode == "uhd_title":
+                # 需标题含 UHD BluRay
+                if not re.search(r'UHD\s*Blu-?ray', title, re.I):
+                    continue
+            else:
+                # 站点已按媒介筛选，仅排除非原盘（WEB-DL/HDTV/Encode 等）
+                if re.search(r'WEB-?DL|HDTV|WEBRip|Encode|Remux', title, re.I):
+                    continue
+                # 需含 BluRay/Blu-ray
+                if not re.search(r'Blu-?ray', title, re.I):
+                    continue
 
             # 副标题：优先从 font.subtitle（彩虹岛）提取，其次取 td.embedded 末尾文本（我堡）
             subtitle = ""
