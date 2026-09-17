@@ -45,7 +45,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -937,7 +937,13 @@ class BdmvToIso(_PluginBase):
                     self.post_message(
                         mtype=NotificationType.Plugin,
                         title="【BDMV自动打包ISO】",
-                        text=f"已提交打包任务：\n{name}",
+                        text="\n".join([
+                            "🚀 已提交打包任务",
+                            "",
+                            f"📦 {name}",
+                            "",
+                            "⏳ 正在打包为 ISO，完成后将自动同步云端",
+                        ]),
                     )
 
         # 5. 清理超量记录
@@ -1317,24 +1323,45 @@ class BdmvToIso(_PluginBase):
             except (TypeError, ValueError):
                 size_text = ""
 
-        lines = [f"资源目录：{name}"]
-        if detail:
-            lines.append(f"源大小：{detail}")
+        # 源大小去掉服务端前缀，仅保留数值部分
+        source_size = detail.replace("总大小：", "").strip() if detail else ""
+
+        lines = ["🎬 BDMV 原盘打包完成", ""]
+        lines.append(f"📦 {name}")
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━")
+        if source_size:
+            lines.append(f"📥 源盘大小　{source_size}")
         if size_text:
-            lines.append(f"ISO 大小：{size_text}")
-        if out_iso:
-            lines.append(f"输出路径：{out_iso}")
+            lines.append(f"💿 ISO 大小　{size_text}")
+        lines.append("━━━━━━━━━━━━━━━")
 
         # 打包完成后触发 CD2 备份同步
         if self._cd2_enabled:
             if self.__trigger_cd2_backup():
-                lines.append(f"CD2 备份：已触发同步（{self._cd2_source_path}）")
+                lines.append("")
+                lines.append("☁️ 云端同步")
+                lines.append(f"　　✅ 已触发 CD2 备份")
+                lines.append(f"　　📂 {self._cd2_source_path}")
             else:
-                lines.append("CD2 备份：触发失败，请检查 CD2 配置")
+                lines.append("")
+                lines.append("☁️ 云端同步")
+                lines.append("　　❌ 触发失败，请检查 CD2 配置")
+
+        if out_iso:
+            # 服务端返回的是其容器内路径，转换为 CD2 侧可读路径
+            iso_name = str(out_iso).rstrip("/").split("/")[-1]
+            if self._cd2_enabled and self._cd2_source_path:
+                display_path = f"{self._cd2_source_path}/{iso_name}"
+            else:
+                display_path = out_iso
+            lines.append("")
+            lines.append("📄 输出文件")
+            lines.append(f"　　{display_path}")
 
         self.post_message(
             mtype=NotificationType.Plugin,
-            title="【BDMV自动打包ISO】打包完成",
+            title="【BDMV自动打包ISO】",
             text="\n".join(lines),
         )
 
