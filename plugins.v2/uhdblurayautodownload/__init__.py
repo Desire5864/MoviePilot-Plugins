@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -396,18 +396,25 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 {
                                     "component": "td",
                                     "props": {
-                                        "style": "white-space: normal; word-break: break-all; "
+                                        "style": "white-space: normal !important; word-break: break-all !important; "
+                                                 "overflow: visible !important; text-overflow: clip !important; "
                                                  "width: 70%; font-size: 14px; line-height: 1.5;",
                                     },
                                     "content": [
                                         {
                                             "component": "div",
-                                            "props": {"style": "font-weight: 500;"},
+                                            "props": {
+                                                "style": "white-space: normal !important; word-break: break-all !important; "
+                                                         "font-weight: 500;",
+                                            },
                                             "text": str(item.get("subtitle") or ""),
                                         },
                                         {
                                             "component": "div",
-                                            "props": {"style": "font-size: 12px; opacity: 0.75;"},
+                                            "props": {
+                                                "style": "white-space: normal !important; word-break: break-all !important; "
+                                                         "font-size: 12px; opacity: 0.75;",
+                                            },
                                             "text": str(item.get("title") or ""),
                                         },
                                     ],
@@ -558,6 +565,47 @@ class UhdBlurayAutoDownload(_PluginBase):
                 text=f"已推送 {len(downloaded_items)} 个 UHD BluRay 原盘到 QB：\n" + "\n".join(lines),
             )
 
+    def __fetch_detail_subtitle(self, site: Dict[str, Any], torrent_id: str) -> str:
+        """从种子详情页获取完整副标题。
+
+        列表页的副标题可能被站点截断（如彩虹岛显示为 "保留Dolb.."），
+        详情页的"副标题"字段为完整内容。
+
+        :param site: 站点配置
+        :param torrent_id: 种子 ID
+        :return: 完整副标题；获取失败返回空字符串
+        """
+        if not torrent_id:
+            return ""
+        base_url = (site.get("url") or "").rstrip("/")
+        detail_url = f"{base_url}/details.php?id={torrent_id}"
+        try:
+            res = RequestUtils(
+                ua=site.get("ua"),
+                cookies=site.get("cookie"),
+                proxies=settings.PROXY if site.get("proxy") else None,
+                timeout=site.get("timeout") or 20,
+            ).get_res(url=detail_url)
+        except Exception as err:
+            logger.error(f"UHD原盘自动下载：获取详情页失败 {detail_url}，{err}")
+            return ""
+
+        if res is None or res.status_code != 200:
+            return ""
+
+        page = etree.HTML(res.text)
+        if page is None:
+            return ""
+        # 定位"副标题"字段所在行的下一个单元格
+        nodes = page.xpath(
+            '//td[text()="副标题" or text()="副標題"]/following-sibling::td[1]'
+        )
+        if nodes:
+            text = nodes[0].xpath('string(.)').strip()
+            if text:
+                return text
+        return ""
+
     def __process_site(self, domain: str, site_conf: Dict[str, Any], downloader_obj: Any,
                        processed_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """处理单个站点的 UHD BluRay 列表。
@@ -632,6 +680,12 @@ class UhdBlurayAutoDownload(_PluginBase):
                 item["action"] = "已处理，跳过"
                 items.append(item)
                 continue
+
+            # 列表页副标题可能被站点截断，从详情页获取完整副标题
+            detail_subtitle = self.__fetch_detail_subtitle(site, torrent_id)
+            if detail_subtitle:
+                item["subtitle"] = detail_subtitle
+                torrent["subtitle"] = detail_subtitle
 
             # 下载种子文件并推送到 QB
             success = self.__download_and_push(
