@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.2.0"
+    plugin_version = "2.3.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -82,6 +82,8 @@ class UhdBlurayAutoDownload(_PluginBase):
     _last_error: str = ""
     # 最近一次发现的种子明细
     _last_items: List[Dict[str, Any]] = []
+    # 详情页副标题缓存：种子ID -> 完整副标题
+    _subtitle_cache: Dict[str, str] = {}
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -101,6 +103,7 @@ class UhdBlurayAutoDownload(_PluginBase):
         self._last_check_time = None
         self._last_error = ""
         self._last_items = []
+        self._subtitle_cache = {}
 
         if not config:
             return
@@ -517,7 +520,8 @@ class UhdBlurayAutoDownload(_PluginBase):
         """从种子详情页获取完整副标题。
 
         列表页的副标题可能被站点截断（如彩虹岛显示为 "保留Dolb.."），
-        详情页的"副标题"字段为完整内容。
+        详情页的"副标题"字段为完整内容。请求失败时重试一次，
+        避免偶发超时导致回退到截断的列表页数据。
 
         :param site: 站点配置
         :param torrent_id: 种子 ID
@@ -525,33 +529,48 @@ class UhdBlurayAutoDownload(_PluginBase):
         """
         if not torrent_id:
             return ""
+        # 命中缓存直接返回，避免重复请求详情页
+        if torrent_id in self._subtitle_cache:
+            return self._subtitle_cache[torrent_id]
+
         base_url = (site.get("url") or "").rstrip("/")
         detail_url = f"{base_url}/details.php?id={torrent_id}"
-        try:
-            res = RequestUtils(
-                ua=site.get("ua"),
-                cookies=site.get("cookie"),
-                proxies=settings.PROXY if site.get("proxy") else None,
-                timeout=site.get("timeout") or 20,
-            ).get_res(url=detail_url)
-        except Exception as err:
-            logger.error(f"UHD原盘自动下载：获取详情页失败 {detail_url}，{err}")
+
+        for attempt in range(2):
+            try:
+                res = RequestUtils(
+                    ua=site.get("ua"),
+                    cookies=site.get("cookie"),
+                    proxies=settings.PROXY if site.get("proxy") else None,
+                    timeout=site.get("timeout") or 20,
+                ).get_res(url=detail_url)
+            except Exception as err:
+                logger.error(f"UHD原盘自动下载：获取详情页失败 {detail_url}，{err}")
+                continue
+
+            if res is None or res.status_code != 200:
+                logger.warning(
+                    f"UHD原盘自动下载：详情页返回异常 {detail_url}，"
+                    f"状态码 {res.status_code if res else 'None'}"
+                )
+                continue
+
+            page = etree.HTML(res.text)
+            if page is None:
+                continue
+            # 定位"副标题"字段所在行的下一个单元格
+            nodes = page.xpath(
+                '//td[text()="副标题" or text()="副標題"]/following-sibling::td[1]'
+            )
+            if nodes:
+                text = nodes[0].xpath('string(.)').strip()
+                if text:
+                    self._subtitle_cache[torrent_id] = text
+                    return text
+            # 页面正常但没有副标题字段，无需重试
             return ""
 
-        if res is None or res.status_code != 200:
-            return ""
-
-        page = etree.HTML(res.text)
-        if page is None:
-            return ""
-        # 定位"副标题"字段所在行的下一个单元格
-        nodes = page.xpath(
-            '//td[text()="副标题" or text()="副標題"]/following-sibling::td[1]'
-        )
-        if nodes:
-            text = nodes[0].xpath('string(.)').strip()
-            if text:
-                return text
+        logger.warning(f"UHD原盘自动下载：详情页副标题获取失败，已重试 {detail_url}")
         return ""
 
     def __process_site(self, domain: str, site_conf: Dict[str, Any], downloader_obj: Any,
@@ -647,6 +666,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                 item["action"] = "已推送"
                 processed_map[record_key] = {
                     "title": title,
+                    "cn_title": self.__extract_cn_title(item.get("subtitle") or ""),
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 logger.info(f"UHD原盘自动下载：已推送 {site_name} - {title[:60]}")
@@ -656,6 +676,22 @@ class UhdBlurayAutoDownload(_PluginBase):
             items.append(item)
 
         return items
+
+    @staticmethod
+    def __extract_cn_title(subtitle: str) -> str:
+        """从站点副标题中提取中文标题。
+
+        副标题格式形如「双子杀手 [DIY UHD原盘 ...]」或
+        「怒火战猴/地下杀神(港) 【DIY 国配...】」，
+        取第一个方括号之前的部分作为中文标题。
+
+        :param subtitle: 站点副标题
+        :return: 中文标题；无法提取时返回空字符串
+        """
+        if not subtitle:
+            return ""
+        head = re.split(r'[\[【]', subtitle, maxsplit=1)[0]
+        return head.strip().rstrip("/").strip()
 
     def __download_and_push(self, site: Dict[str, Any], site_conf: Dict[str, Any],
                             torrent: Dict[str, Any], downloader_obj: Any) -> bool:
