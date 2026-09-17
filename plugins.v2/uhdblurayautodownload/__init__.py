@@ -32,7 +32,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -670,13 +670,28 @@ class UhdBlurayAutoDownload(_PluginBase):
             if need_title_filter and not re.search(r'UHD\s*Blu-?ray', title, re.I):
                 continue
 
-            # 副标题：td.embedded 的末尾文本
+            # 副标题：优先从 font.subtitle（彩虹岛）提取，其次取 td.embedded 末尾文本（我堡）
             subtitle = ""
-            embedded = tds[1].xpath('.//td[@class="embedded"]')
-            if embedded:
-                texts = [t.strip() for t in embedded[0].xpath('.//text()') if t.strip()]
+            subtitle_nodes = tds[1].xpath('.//font[contains(@class,"subtitle")]')
+            if subtitle_nodes:
+                # 彩虹岛：副标题在 font.subtitle 内，需排除标签 div 与 H&R 标识 div
+                texts = []
+                for node in subtitle_nodes[0].xpath('.//text()'):
+                    text = node.strip()
+                    if not text:
+                        continue
+                    # 跳过纯 H&R 标识（如 h3、h5）
+                    if re.fullmatch(r'h[35]', text, re.I):
+                        continue
+                    texts.append(text)
                 if texts:
                     subtitle = texts[-1]
+            if not subtitle:
+                embedded = tds[1].xpath('.//td[@class="embedded"]')
+                if embedded:
+                    texts = [t.strip() for t in embedded[0].xpath('.//text()') if t.strip()]
+                    if texts:
+                        subtitle = texts[-1]
 
             # 大小
             size = tds[4].xpath('string(.)').strip() if len(tds) > 4 else ""
