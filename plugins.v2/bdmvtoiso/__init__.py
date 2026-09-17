@@ -15,6 +15,16 @@ SUBMITTED_DATA_KEY = "bdmv_submitted_map"
 SUBMITTED_LIMIT = 500
 # 默认标签
 DEFAULT_TAG = "UHD自动下载"
+# CD2 备份状态枚举
+CD2_STATUS_TEXT = {
+    0: "空闲",
+    1: "扫描中",
+    2: "错误",
+    3: "已禁用",
+    4: "已扫描",
+    5: "已完成",
+    6: "等待中",
+}
 
 
 class BdmvToIso(_PluginBase):
@@ -22,17 +32,18 @@ class BdmvToIso(_PluginBase):
 
     监控指定 QB 下载器中带指定标签的已完成任务，将下载目录名与
     自建「BDMV to ISO」服务的资源目录比对，命中后自动触发打包，
-    并轮询打包进度，完成后发送通知。
+    并轮询打包进度；打包完成后可自动触发 CloudDrive2 备份，
+    将 ISO 同步上传到云端，并发送通知。
     """
 
     # 插件名称
     plugin_name = "BDMV自动打包ISO"
     # 插件描述
-    plugin_desc = "监控QB指定标签的已完成原盘，自动调用BDMV to ISO服务打包为ISO并通知。"
+    plugin_desc = "监控QB指定标签的已完成原盘，自动打包为ISO，完成后触发CD2备份同步并通知。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -61,10 +72,22 @@ class BdmvToIso(_PluginBase):
     _interval: int = 300
     # 是否自动触发打包
     _auto_convert: bool = True
-    # 是否在打包完成后删除源 BDMV 目录（由服务端处理，此处仅记录意愿）
+    # 是否在打包完成后发送通知
     _notify_on_done: bool = True
+    # 是否在打包完成后触发 CD2 备份
+    _cd2_enabled: bool = False
+    # CD2 服务地址
+    _cd2_address: str = ""
+    # CD2 账号
+    _cd2_username: str = ""
+    # CD2 密码
+    _cd2_password: str = ""
+    # CD2 备份源路径（对应 ISO 输出目录）
+    _cd2_source_path: str = ""
     # 与服务端保持的登录会话
     _session: Optional[Session] = None
+    # CD2 gRPC 客户端
+    _cd2_client: Optional[Any] = None
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -85,7 +108,13 @@ class BdmvToIso(_PluginBase):
         self._interval = 300
         self._auto_convert = True
         self._notify_on_done = True
+        self._cd2_enabled = False
+        self._cd2_address = ""
+        self._cd2_username = ""
+        self._cd2_password = ""
+        self._cd2_source_path = ""
         self._session = None
+        self._cd2_client = None
 
         if not config:
             return
@@ -112,6 +141,13 @@ class BdmvToIso(_PluginBase):
 
         self._auto_convert = bool(config.get("auto_convert", True))
         self._notify_on_done = bool(config.get("notify_on_done", True))
+
+        # CD2 备份配置
+        self._cd2_enabled = bool(config.get("cd2_enabled"))
+        self._cd2_address = str(config.get("cd2_address") or "").strip()
+        self._cd2_username = str(config.get("cd2_username") or "").strip()
+        self._cd2_password = str(config.get("cd2_password") or "")
+        self._cd2_source_path = str(config.get("cd2_source_path") or "").strip().rstrip("/")
 
     def get_state(self) -> bool:
         """获取插件启用状态。
@@ -326,14 +362,115 @@ class BdmvToIso(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-2"},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "cd2_enabled",
+                                            "label": "打包完成后触发 CD2 备份同步",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cd2_address",
+                                            "label": "CD2 gRPC 地址",
+                                            "placeholder": "例如：192.168.3.36:19798",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cd2_source_path",
+                                            "label": "CD2 备份源路径",
+                                            "placeholder": "例如：/Storage/ISO",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cd2_username",
+                                            "label": "CD2 账号",
+                                            "placeholder": "CloudDrive2 登录账号",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cd2_password",
+                                            "label": "CD2 密码",
+                                            "type": "password",
+                                            "placeholder": "CloudDrive2 登录密码",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
                                         "component": "VAlert",
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "插件会按设定间隔检查所选下载器中带指定标签的已完成任务，"
                                                     "将任务目录名与 BDMV to ISO 服务的资源目录比对，"
-                                                    "命中后自动触发打包为 ISO，并轮询打包进度，"
-                                                    "完成后发送通知。",
+                                                    "命中后自动触发打包为 ISO，并轮询打包进度；"
+                                                    "打包完成后自动触发 CD2 备份扫描，将 ISO 同步到云端，"
+                                                    "并发送通知。",
                                         },
                                     }
                                 ],
@@ -353,6 +490,11 @@ class BdmvToIso(_PluginBase):
             "tags": DEFAULT_TAG,
             "auto_convert": True,
             "notify_on_done": True,
+            "cd2_enabled": False,
+            "cd2_address": "",
+            "cd2_username": "",
+            "cd2_password": "",
+            "cd2_source_path": "",
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -417,6 +559,60 @@ class BdmvToIso(_PluginBase):
                 }
             )
             return page_content
+
+        # CD2 备份状态
+        if self._cd2_enabled:
+            cd2_status = self.__get_cd2_backup_status()
+            if cd2_status:
+                cd2_text = (
+                    f"CD2 备份源 {self._cd2_source_path}："
+                    f"{cd2_status.get('status_text')}"
+                )
+                if cd2_status.get("message"):
+                    cd2_text += f"（{cd2_status['message']}）"
+                page_content.append(
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "success",
+                                            "variant": "tonal",
+                                            "text": cd2_text,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+            else:
+                page_content.append(
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "warning",
+                                            "variant": "tonal",
+                                            "text": "未能获取 CD2 备份状态，请检查 CD2 地址、账号密码与备份源路径。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
 
         # 服务端资源目录
         resources = self.__fetch_resources()
@@ -941,8 +1137,113 @@ class BdmvToIso(_PluginBase):
         logger.error(f"BDMV自动打包ISO：提交打包任务返回异常状态码 {res.status_code}")
         return False
 
+    def __get_cd2_client(self) -> Optional[Any]:
+        """获取已认证的 CloudDrive2 gRPC 客户端。
+
+        :return: 客户端实例，失败返回 None
+        """
+        if not self._cd2_enabled:
+            return None
+
+        if not self._cd2_address:
+            logger.warning("BDMV自动打包ISO：未配置 CD2 服务地址，跳过备份触发")
+            return None
+
+        # 复用已认证的客户端
+        if self._cd2_client is not None:
+            return self._cd2_client
+
+        try:
+            from clouddrive2_client import CloudDriveClient
+        except ImportError:
+            logger.error("BDMV自动打包ISO：未安装 clouddrive2-client，无法触发 CD2 备份")
+            return None
+
+        try:
+            client = CloudDriveClient(address=self._cd2_address)
+            if not client.authenticate(self._cd2_username, self._cd2_password):
+                logger.error("BDMV自动打包ISO：CD2 认证失败，请检查账号密码")
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return None
+        except Exception as err:
+            logger.error(f"BDMV自动打包ISO：连接 CD2 服务失败：{err}")
+            return None
+
+        self._cd2_client = client
+        return client
+
+    def __trigger_cd2_backup(self) -> bool:
+        """触发 CloudDrive2 备份扫描，将新生成的 ISO 同步到云端。
+
+        :return: 是否触发成功
+        """
+        client = self.__get_cd2_client()
+        if client is None:
+            return False
+
+        if not self._cd2_source_path:
+            logger.warning("BDMV自动打包ISO：未配置 CD2 备份源路径，跳过备份触发")
+            return False
+
+        try:
+            from clouddrive2_client.proto import clouddrive_pb2 as pb
+
+            metadata = client._create_authorized_metadata()
+            client.stub.BackupRestartWalkingThrough(
+                pb.StringValue(value=self._cd2_source_path),
+                metadata=metadata,
+            )
+        except Exception as err:
+            logger.error(f"BDMV自动打包ISO：触发 CD2 备份失败：{err}")
+            # 连接可能已失效，下次重新建立
+            self.__close_cd2_client()
+            return False
+
+        logger.info(f"BDMV自动打包ISO：已触发 CD2 备份扫描 {self._cd2_source_path}")
+        return True
+
+    def __get_cd2_backup_status(self) -> Optional[Dict[str, Any]]:
+        """查询 CD2 备份的当前状态。
+
+        :return: 状态字典，失败返回 None
+        """
+        client = self.__get_cd2_client()
+        if client is None or not self._cd2_source_path:
+            return None
+
+        try:
+            from clouddrive2_client.proto import clouddrive_pb2 as pb
+
+            metadata = client._create_authorized_metadata()
+            status = client.stub.BackupGetStatus(
+                pb.StringValue(value=self._cd2_source_path),
+                metadata=metadata,
+            )
+        except Exception as err:
+            logger.error(f"BDMV自动打包ISO：查询 CD2 备份状态失败：{err}")
+            self.__close_cd2_client()
+            return None
+
+        return {
+            "status": int(status.status),
+            "status_text": CD2_STATUS_TEXT.get(int(status.status), str(status.status)),
+            "message": status.statusMessage or "",
+        }
+
+    def __close_cd2_client(self) -> None:
+        """关闭并释放 CD2 客户端连接。"""
+        if self._cd2_client is not None:
+            try:
+                self._cd2_client.close()
+            except Exception:
+                pass
+        self._cd2_client = None
+
     def __notify_done(self, name: str, job: Dict[str, Any]) -> None:
-        """发送打包完成通知。
+        """发送打包完成通知，并按需触发 CD2 备份。
 
         :param name: 资源目录名
         :param job: 任务状态字典
@@ -963,6 +1264,13 @@ class BdmvToIso(_PluginBase):
             lines.append(f"ISO 大小：{size_text}")
         if out_iso:
             lines.append(f"输出路径：{out_iso}")
+
+        # 打包完成后触发 CD2 备份同步
+        if self._cd2_enabled:
+            if self.__trigger_cd2_backup():
+                lines.append(f"CD2 备份：已触发同步（{self._cd2_source_path}）")
+            else:
+                lines.append("CD2 备份：触发失败，请检查 CD2 配置")
 
         self.post_message(
             mtype=NotificationType.Plugin,
@@ -986,10 +1294,11 @@ class BdmvToIso(_PluginBase):
         return mapping.get(status, status or "-")
 
     def stop_service(self) -> None:
-        """停止插件服务并释放会话资源。"""
+        """停止插件服务并释放会话与连接资源。"""
         if self._session is not None:
             try:
                 self._session.close()
             except Exception:
                 pass
         self._session = None
+        self.__close_cd2_client()
