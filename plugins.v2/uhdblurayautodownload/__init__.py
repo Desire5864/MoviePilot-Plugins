@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.9.0"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -397,17 +397,20 @@ class UhdBlurayAutoDownload(_PluginBase):
                                     "component": "td",
                                     "props": {
                                         "style": "white-space: normal; word-break: break-all; "
-                                                 "width: 40%; font-size: 14px; line-height: 1.4;",
+                                                 "width: 70%; font-size: 14px; line-height: 1.5;",
                                     },
-                                    "text": str(item.get("subtitle") or ""),
-                                },
-                                {
-                                    "component": "td",
-                                    "props": {
-                                        "style": "white-space: normal; word-break: break-all; "
-                                                 "width: 30%; font-size: 14px; line-height: 1.4;",
-                                    },
-                                    "text": str(item.get("title") or ""),
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "props": {"style": "font-weight: 500;"},
+                                            "text": str(item.get("subtitle") or ""),
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {"style": "font-size: 12px; opacity: 0.75;"},
+                                            "text": str(item.get("title") or ""),
+                                        },
+                                    ],
                                 },
                                 {
                                     "component": "td",
@@ -448,13 +451,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                         "content": [
                                                             {
                                                                 "component": "th",
-                                                                "props": {"style": "width: 40%; font-size: 14px;"},
-                                                                "text": "副标题",
-                                                            },
-                                                            {
-                                                                "component": "th",
-                                                                "props": {"style": "width: 30%; font-size: 14px;"},
-                                                                "text": "主标题",
+                                                                "props": {"style": "width: 70%; font-size: 14px;"},
+                                                                "text": "标题（上：中文名 / 下：原始名）",
                                                             },
                                                             {
                                                                 "component": "th",
