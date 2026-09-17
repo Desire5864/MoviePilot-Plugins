@@ -15,6 +15,8 @@ SUBMITTED_DATA_KEY = "bdmv_submitted_map"
 SUBMITTED_LIMIT = 500
 # 默认标签
 DEFAULT_TAG = "UHD自动下载"
+# 默认分类（与 UHD原盘自动下载 插件推送 QB 时使用的分类保持一致）
+DEFAULT_CATEGORY = "彩虹岛&HR,OurBits原盘"
 # CD2 备份状态枚举
 CD2_STATUS_TEXT = {
     0: "空闲",
@@ -43,7 +45,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -68,6 +70,8 @@ class BdmvToIso(_PluginBase):
     _downloaders: List[str] = []
     # 监控标签
     _tags: List[str] = []
+    # 监控分类
+    _categories: List[str] = []
     # 检查间隔（秒）
     _interval: int = 300
     # 是否自动触发打包
@@ -105,6 +109,7 @@ class BdmvToIso(_PluginBase):
         self._password = ""
         self._downloaders = []
         self._tags = []
+        self._categories = []
         self._interval = 300
         self._auto_convert = True
         self._notify_on_done = True
@@ -132,6 +137,14 @@ class BdmvToIso(_PluginBase):
             tag.strip()
             for tag in str(tags_raw).replace("\n", ",").split(",")
             if tag.strip()
+        ]
+
+        # 分类支持逗号或换行分隔
+        categories_raw = config.get("categories") or DEFAULT_CATEGORY
+        self._categories = [
+            category.strip()
+            for category in str(categories_raw).replace("\n", ",").split(",")
+            if category.strip()
         ]
 
         try:
@@ -309,7 +322,7 @@ class BdmvToIso(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -320,7 +333,21 @@ class BdmvToIso(_PluginBase):
                                         },
                                     }
                                 ],
-                            }
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "categories",
+                                            "label": "监控分类",
+                                            "placeholder": f"用,分隔多个分类，默认：{DEFAULT_CATEGORY}",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     {
@@ -466,7 +493,7 @@ class BdmvToIso(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "插件会按设定间隔检查所选下载器中带指定标签的已完成任务，"
+                                            "text": "插件会按设定间隔检查所选下载器中同时满足「分类」与「标签」的已完成任务，"
                                                     "将任务目录名与 BDMV to ISO 服务的资源目录比对，"
                                                     "命中后自动触发打包为 ISO，并轮询打包进度；"
                                                     "打包完成后自动触发 CD2 备份扫描，将 ISO 同步到云端，"
@@ -488,6 +515,7 @@ class BdmvToIso(_PluginBase):
             "password": "",
             "downloaders": [],
             "tags": DEFAULT_TAG,
+            "categories": DEFAULT_CATEGORY,
             "auto_convert": True,
             "notify_on_done": True,
             "cd2_enabled": False,
@@ -507,6 +535,7 @@ class BdmvToIso(_PluginBase):
 
         downloaders_text = "、".join(self._downloaders) if self._downloaders else "未配置"
         tags_text = "、".join(self._tags) if self._tags else "未配置"
+        categories_text = "、".join(self._categories) if self._categories else "未配置"
 
         page_content: List[dict] = [
             {
@@ -523,6 +552,7 @@ class BdmvToIso(_PluginBase):
                                     "variant": "tonal",
                                     "text": f"服务地址：{self._server_url or '未配置'}；"
                                             f"监控下载器：{downloaders_text}；"
+                                            f"监控分类：{categories_text}；"
                                             f"监控标签：{tags_text}；"
                                             f"检查间隔：{self._interval} 秒；"
                                             f"自动打包：{'已启用' if self._auto_convert else '未启用'}",
@@ -981,11 +1011,16 @@ class BdmvToIso(_PluginBase):
                 if progress < 1:
                     continue
 
-                # 标签匹配
+                # 分类与标签双重匹配（两者都需命中）
                 torrent_tags = self.__torrent_field(torrent, "tags", None) or []
                 if isinstance(torrent_tags, str):
                     torrent_tags = [tag.strip() for tag in torrent_tags.split(",") if tag.strip()]
-                if not any(tag in torrent_tags for tag in self._tags):
+                tag_matched = any(tag in torrent_tags for tag in self._tags)
+
+                torrent_category = str(self.__torrent_field(torrent, "category", None) or "").strip()
+                category_matched = bool(torrent_category) and torrent_category in self._categories
+
+                if not (tag_matched and category_matched):
                     continue
 
                 # 取内容路径的目录名
