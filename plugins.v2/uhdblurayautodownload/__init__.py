@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -569,9 +569,17 @@ class UhdBlurayAutoDownload(_PluginBase):
                 "action": "",
             }
 
-            # 站点进度为 "-"（我堡）或 "--"（彩虹岛）表示未下载，才需要推送
+            # 站点进度判断：
+            # "-"（我堡）或 "--"（彩虹岛）表示未下载，需要推送；
+            # "0%"~"99%" 表示正在下载中，跳过；
+            # "100%" 表示已下载完成，跳过。
             if progress not in ("-", "--"):
-                item["action"] = "已下载，跳过"
+                if progress == "100%":
+                    item["action"] = "已下载完成，跳过"
+                elif re.match(r'^\d+(\.\d+)?%$', progress):
+                    item["action"] = f"下载中（{progress}），跳过"
+                else:
+                    item["action"] = "已下载，跳过"
                 items.append(item)
                 continue
 
