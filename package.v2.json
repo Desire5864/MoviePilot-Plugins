@@ -90,15 +90,16 @@
   },
   "BdmvToIso": {
     "name": "BDMV自动打包ISO",
-    "description": "监控QB指定标签的已完成原盘，自动调用BDMV to ISO服务打包为ISO并通知。",
+    "description": "监控QB指定标签的已完成原盘，自动打包为ISO，完成后触发CD2备份同步并通知。",
     "labels": "工具",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "UHD.png",
     "author": "Desire5864",
     "level": 1,
     "system_version": ">=2.12.0",
     "history": {
-      "v1.0.0": "初始版本：监控QB指定标签的已完成原盘任务，与BDMV to ISO服务资源目录比对后自动触发打包，记录已提交状态避免重复打包，完成后通知。"
+      "v1.0.0": "初始版本：监控QB指定标签的已完成原盘任务，与BDMV to ISO服务资源目录比对后自动触发打包，记录已提交状态避免重复打包，完成后通知。",
+      "v1.1.0": "新增CD2备份联动：打包完成后自动触发CloudDrive2备份扫描，将ISO同步到云端；详情页展示CD2备份状态。"
     }
   }
 }
