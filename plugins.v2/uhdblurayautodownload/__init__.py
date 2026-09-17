@@ -16,6 +16,8 @@ from app.utils.http import RequestUtils
 PROCESSED_DATA_KEY = "uhd_processed_map"
 # 已处理记录最多保留条数
 PROCESSED_LIMIT = 500
+# 自动下载任务标签
+DOWNLOAD_TAG = "UHD自动下载"
 
 
 class UhdBlurayAutoDownload(_PluginBase):
@@ -32,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -273,7 +275,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                             "text": "插件会定时抓取彩虹岛与我堡的 UHD BluRay 原盘列表，"
                                                     "只处理列表页最新的 N 条（默认 5 条），"
                                                     "筛选出站点进度列为「-」或「--」（未下载）的种子，"
-                                                    "自动推送到 QB 下载器。"
+                                                    "自动推送到 QB 下载器，并添加标签「UHD自动下载」。"
                                                     "彩虹岛使用分类「彩虹岛&HR」，我堡使用分类「OurBits原盘」，"
                                                     "保存路径均为「/原盘」。",
                                         },
@@ -352,85 +354,92 @@ class UhdBlurayAutoDownload(_PluginBase):
                 }
             )
 
-        # 最近发现的种子明细
+        # 最近发现的种子明细（按站点分组显示）
         if self._last_items:
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "success",
-                                        "variant": "tonal",
-                                        "text": f"最近一次检查发现 UHD BluRay 原盘：{len(self._last_items)} 个",
-                                    },
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
-
-            rows = []
+            # 按站点分组
+            site_groups: Dict[str, List[Dict[str, Any]]] = {}
             for item in self._last_items:
-                rows.append(
+                site_name = str(item.get("site") or "未知站点")
+                site_groups.setdefault(site_name, []).append(item)
+
+            for site_name, group_items in site_groups.items():
+                pushed_count = len([i for i in group_items if i.get("action") == "已推送"])
+                page_content.append(
                     {
-                        "component": "tr",
+                        "component": "VRow",
                         "content": [
-                            {"component": "td", "text": str(item.get("site") or "")},
-                            {"component": "td", "text": str(item.get("title") or "")[:60]},
-                            {"component": "td", "text": str(item.get("subtitle") or "")[:40]},
-                            {"component": "td", "text": str(item.get("size") or "")},
-                            {"component": "td", "text": str(item.get("progress") or "")},
-                            {"component": "td", "text": str(item.get("action") or "")},
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "success" if pushed_count else "info",
+                                            "variant": "tonal",
+                                            "text": f"【{site_name}】共 {len(group_items)} 个 UHD BluRay 原盘，"
+                                                    f"本次推送 {pushed_count} 个",
+                                        },
+                                    }
+                                ],
+                            }
                         ],
                     }
                 )
 
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
+                rows = []
+                for item in group_items:
+                    rows.append(
                         {
-                            "component": "VCol",
-                            "props": {"cols": 12},
+                            "component": "tr",
                             "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "站点"},
-                                                        {"component": "th", "text": "主标题"},
-                                                        {"component": "th", "text": "副标题"},
-                                                        {"component": "th", "text": "大小"},
-                                                        {"component": "th", "text": "站点进度"},
-                                                        {"component": "th", "text": "处理结果"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": rows,
-                                        },
-                                    ],
-                                }
+                                {"component": "td", "text": str(item.get("title") or "")[:60]},
+                                {"component": "td", "text": str(item.get("subtitle") or "")[:40]},
+                                {"component": "td", "text": str(item.get("size") or "")},
+                                {"component": "td", "text": str(item.get("progress") or "")},
+                                {"component": "td", "text": str(item.get("action") or "")},
                             ],
                         }
-                    ],
-                }
-            )
+                    )
+
+                page_content.append(
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTable",
+                                        "props": {"density": "compact"},
+                                        "content": [
+                                            {
+                                                "component": "thead",
+                                                "content": [
+                                                    {
+                                                        "component": "tr",
+                                                        "content": [
+                                                            {"component": "th", "text": "主标题"},
+                                                            {"component": "th", "text": "副标题"},
+                                                            {"component": "th", "text": "大小"},
+                                                            {"component": "th", "text": "站点进度"},
+                                                            {"component": "th", "text": "处理结果"},
+                                                        ],
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "tbody",
+                                                "content": rows,
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
 
         return page_content
 
@@ -628,11 +637,12 @@ class UhdBlurayAutoDownload(_PluginBase):
             logger.error(f"UHD原盘自动下载：下载种子文件失败，状态码 {res.status_code if res else 'None'}")
             return False
 
-        # 推送到 QB
+        # 推送到 QB（带标签 UHD自动下载，便于后续识别与处理）
         success, _ = downloader_obj.add_torrent(
             content=res.content,
             download_dir=site_conf.get("save_path"),
             category=site_conf.get("category"),
+            tag=DOWNLOAD_TAG,
             is_paused=False,
         )
         return success
