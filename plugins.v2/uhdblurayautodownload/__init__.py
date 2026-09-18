@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.4.1"
+    plugin_version = "2.4.2"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -674,6 +674,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                 item["action"] = "已推送"
                 processed_map[record_key] = {
                     "title": title,
+                    "subtitle": item.get("subtitle") or "",
                     "cn_title": self.__extract_cn_title(item.get("subtitle") or ""),
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
