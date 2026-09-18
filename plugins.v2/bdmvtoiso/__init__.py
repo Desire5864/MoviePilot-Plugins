@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,7 +50,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1302,8 +1303,23 @@ class BdmvToIso(_PluginBase):
                 pass
         self._cd2_client = None
 
+    @staticmethod
+    def __normalize_title(text: str) -> str:
+        """归一化标题用于模糊匹配。
+
+        站点列表页可能把标点替换为空格（如「5.1」显示为「5 1」），
+        因此比较时统一去除所有非字母数字字符并转小写。
+
+        :param text: 原始标题
+        :return: 归一化后的标题
+        """
+        return re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', str(text or '').lower())
+
     def __get_cn_title(self, name: str) -> str:
         """从 UHD原盘自动下载 插件的记录中查询资源目录对应的中文标题。
+
+        优先精确匹配，失败时按归一化标题模糊匹配，
+        以兼容站点列表页与 QB 任务名之间的标点差异。
 
         :param name: 资源目录名（QB 任务名）
         :return: 中文标题；未找到返回空字符串
@@ -1316,11 +1332,18 @@ class BdmvToIso(_PluginBase):
             logger.warning(f"BDMV自动打包ISO：读取中文标题失败：{err}")
             return ""
 
+        target = self.__normalize_title(name)
         for record in processed_map.values():
             if not isinstance(record, dict):
                 continue
             title = str(record.get("title") or "")
-            if title and title == name:
+            if not title:
+                continue
+            # 精确匹配优先
+            if title == name:
+                return str(record.get("cn_title") or "")
+            # 归一化模糊匹配
+            if target and self.__normalize_title(title) == target:
                 return str(record.get("cn_title") or "")
         return ""
 
