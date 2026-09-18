@@ -50,7 +50,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1315,14 +1315,14 @@ class BdmvToIso(_PluginBase):
         """
         return re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', str(text or '').lower())
 
-    def __get_cn_title(self, name: str) -> str:
-        """从 UHD原盘自动下载 插件的记录中查询资源目录对应的中文标题。
+    def __get_uhd_record(self, name: str) -> Dict[str, Any]:
+        """从 UHD原盘自动下载 插件的记录中查询资源目录对应的条目。
 
         优先精确匹配，失败时按归一化标题模糊匹配，
         以兼容站点列表页与 QB 任务名之间的标点差异。
 
         :param name: 资源目录名（QB 任务名）
-        :return: 中文标题；未找到返回空字符串
+        :return: 记录字典；未找到返回空字典
         """
         try:
             processed_map = self.get_data(
@@ -1330,7 +1330,7 @@ class BdmvToIso(_PluginBase):
             ) or {}
         except Exception as err:
             logger.warning(f"BDMV自动打包ISO：读取中文标题失败：{err}")
-            return ""
+            return {}
 
         target = self.__normalize_title(name)
         for record in processed_map.values():
@@ -1341,11 +1341,28 @@ class BdmvToIso(_PluginBase):
                 continue
             # 精确匹配优先
             if title == name:
-                return str(record.get("cn_title") or "")
+                return record
             # 归一化模糊匹配
             if target and self.__normalize_title(title) == target:
-                return str(record.get("cn_title") or "")
-        return ""
+                return record
+        return {}
+
+    def __get_cn_title(self, name: str) -> str:
+        """查询资源目录对应的中文标题。
+
+        优先返回完整副标题（含制作说明），缺失时回退到提取的中文名。
+
+        :param name: 资源目录名（QB 任务名）
+        :return: 中文标题；未找到返回空字符串
+        """
+        record = self.__get_uhd_record(name)
+        if not record:
+            return ""
+        # 优先使用完整副标题
+        subtitle = str(record.get("subtitle") or "").strip()
+        if subtitle:
+            return subtitle
+        return str(record.get("cn_title") or "").strip()
 
     def __notify_submitted(self, name: str) -> None:
         """发送打包任务已提交通知。
