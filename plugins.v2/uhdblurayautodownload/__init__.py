@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.4.2"
+    plugin_version = "2.4.3"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -397,8 +397,13 @@ class UhdBlurayAutoDownload(_PluginBase):
                         {
                             "component": "div",
                             "props": {
-                                "style": "padding: 8px 10px; margin-bottom: 6px; "
-                                         "border-radius: 6px; background: rgba(var(--v-theme-surface-variant), 0.35);",
+                                "style": "padding: 10px 12px; margin-bottom: 8px; "
+                                         "border-radius: 10px; "
+                                         "background: rgba(var(--v-theme-surface-variant), 0.18); "
+                                         "backdrop-filter: blur(10px) saturate(150%); "
+                                         "-webkit-backdrop-filter: blur(10px) saturate(150%); "
+                                         "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
+                                         "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);",
                             },
                             "content": [
                                 {
