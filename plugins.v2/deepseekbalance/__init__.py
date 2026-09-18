@@ -12,6 +12,8 @@ DEEPSEEK_BALANCE_API = "https://api.deepseek.com/user/balance"
 BALANCE_HISTORY_KEY = "balance_history"
 # 余额历史最多保留条数
 BALANCE_HISTORY_LIMIT = 200
+# 告警状态持久化键名（用于避免重复通知）
+ALERT_STATE_KEY = "alert_state"
 
 
 class DeepSeekBalance(_PluginBase):
@@ -28,7 +30,7 @@ class DeepSeekBalance(_PluginBase):
     # 插件图标
     plugin_icon = "deepseek.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -76,6 +78,8 @@ class DeepSeekBalance(_PluginBase):
         self._last_balance = None
         self._last_check_time = None
         self._last_error = ""
+        # 最近一次告警状态：True 表示当前处于告警中
+        self._alerting = False
 
         if not config:
             return
@@ -94,6 +98,10 @@ class DeepSeekBalance(_PluginBase):
             self._threshold = max(0.0, float(config.get("threshold") or 10.0))
         except (TypeError, ValueError):
             self._threshold = 10.0
+
+        # 恢复告警状态，避免重启后重复通知
+        alert_state = self.get_data(ALERT_STATE_KEY) or {}
+        self._alerting = bool(alert_state.get("alerting"))
 
         # 立即执行一次：执行后自动关闭开关
         if config.get("run_once"):
@@ -636,19 +644,28 @@ class DeepSeekBalance(_PluginBase):
 
         logger.info(f"DeepSeek余额监控：当前余额 {'；'.join(summary_lines)}")
 
-        # 余额不足或低于阈值时通知
-        if self._notify and (low_balance or not is_available):
+        # 余额不足或低于阈值时通知（同一轮告警只通知一次，恢复后再次触发才重新通知）
+        alerting = low_balance or not is_available
+        if self._notify and alerting and not self._alerting:
             title = "【DeepSeek余额不足】" if not is_available else "【DeepSeek余额告警】"
             text = "\n".join(summary_lines)
             if not is_available:
                 text += "\n账户余额不足，已无法调用 API，请及时充值。"
             else:
                 text += f"\n当前余额已低于告警阈值 {self._threshold}，请及时充值。"
+            text += "\n（本次告警仅通知一次，余额恢复后才会重新提醒）"
             self.post_message(
                 mtype=NotificationType.SiteMessage,
                 title=title,
                 text=text,
             )
+
+        # 记录告警状态变化
+        if alerting != self._alerting:
+            self._alerting = alerting
+            self.save_data(ALERT_STATE_KEY, {"alerting": alerting})
+            if not alerting:
+                logger.info("DeepSeek余额监控：余额已恢复至阈值以上，告警状态重置")
 
     def __record_balance_history(self, balance_data: Dict[str, Any]) -> None:
         """记录余额历史，用于展示消耗明细。
