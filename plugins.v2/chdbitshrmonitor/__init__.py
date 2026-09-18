@@ -27,7 +27,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -399,7 +399,8 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-            rows = []
+            # 使用卡片式布局，避免 VTable 单元格强制 nowrap 导致标题截断
+            card_items = []
             for task in self._last_hr_tasks:
                 # 计算做种进度与达标状态
                 cycle_hours = self.__parse_hr_cycle_hours(task.get("hr_cycle") or "")
@@ -409,28 +410,52 @@ class ChdbitsHrMonitor(_PluginBase):
                     remain_hours = max(0.0, cycle_hours - seeding_hours)
                     progress_text = f"{seeding_hours:.1f}h / {cycle_hours:.0f}h（{progress:.1f}%）"
                     if seeding_hours >= cycle_hours:
-                        status_text = "已达标"
+                        status_text = "✅ 已达标"
                     else:
-                        status_text = f"未达标，还差 {remain_hours:.1f}h"
+                        status_text = f"⏳ 未达标，还差 {remain_hours:.1f}h"
                 else:
                     progress_text = "-"
                     status_text = "-"
 
-                rows.append(
+                card_items.append(
                     {
-                        "component": "tr",
+                        "component": "div",
+                        "props": {
+                            "style": "padding: 8px 10px; margin-bottom: 6px; "
+                                     "border-radius: 6px; background: rgba(var(--v-theme-surface-variant), 0.35);",
+                        },
                         "content": [
                             {
-                                "component": "td",
-                                "props": {"style": "white-space: normal; word-break: break-all; min-width: 260px;"},
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
+                                },
                                 "text": str(task.get("title") or ""),
                             },
-                            {"component": "td", "text": str(task.get("hr_percent") or "")},
-                            {"component": "td", "text": str(task.get("remain_time") or "")},
-                            {"component": "td", "text": str(task.get("hr_cycle") or "")},
-                            {"component": "td", "text": str(task.get("seeding_time") or "")},
-                            {"component": "td", "text": progress_text},
-                            {"component": "td", "text": status_text},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                },
+                                "text": f"H&R百分比：{task.get('hr_percent') or '-'}　|　"
+                                        f"剩余时间：{task.get('remain_time') or '-'}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
+                                },
+                                "text": f"H&R周期：{task.get('hr_cycle') or '-'}　|　"
+                                        f"做种时间：{task.get('seeding_time') or '-'}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
+                                },
+                                "text": f"做种进度：{progress_text}　|　{status_text}",
+                            },
                         ],
                     }
                 )
@@ -442,35 +467,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         {
                             "component": "VCol",
                             "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "标题"},
-                                                        {"component": "th", "text": "H&R百分比"},
-                                                        {"component": "th", "text": "剩余时间"},
-                                                        {"component": "th", "text": "H&R周期"},
-                                                        {"component": "th", "text": "做种时间"},
-                                                        {"component": "th", "text": "做种进度"},
-                                                        {"component": "th", "text": "达标状态"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": rows,
-                                        },
-                                    ],
-                                }
-                            ],
+                            "content": card_items,
                         }
                     ],
                 }
@@ -480,23 +477,36 @@ class ChdbitsHrMonitor(_PluginBase):
         completed_map: Dict[str, Dict[str, Any]] = self.get_data(COMPLETED_DATA_KEY) or {}
         if completed_map:
             now_ts = datetime.now().timestamp()
-            rows = []
+            card_items = []
             for torrent_hash, record in completed_map.items():
                 completed_at = record.get("completed_at") or 0
                 elapsed_hours = (now_ts - completed_at) / 3600 if completed_at else 0
                 remain_hours = max(0, self._delete_delay_hours - elapsed_hours)
-                rows.append(
+                card_items.append(
                     {
-                        "component": "tr",
+                        "component": "div",
+                        "props": {
+                            "style": "padding: 8px 10px; margin-bottom: 6px; "
+                                     "border-radius: 6px; background: rgba(var(--v-theme-surface-variant), 0.35);",
+                        },
                         "content": [
                             {
-                                "component": "td",
-                                "props": {"style": "white-space: normal; word-break: break-all; min-width: 260px;"},
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
+                                },
                                 "text": str(record.get("name") or ""),
                             },
-                            {"component": "td", "text": str(record.get("completed_time") or "")},
-                            {"component": "td", "text": f"{elapsed_hours:.1f} 小时"},
-                            {"component": "td", "text": f"{remain_hours:.1f} 小时"},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                },
+                                "text": f"完成时间：{record.get('completed_time') or '-'}　|　"
+                                        f"已等待：{elapsed_hours:.1f} 小时　|　"
+                                        f"剩余：{remain_hours:.1f} 小时",
+                            },
                         ],
                     }
                 )
@@ -530,32 +540,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         {
                             "component": "VCol",
                             "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "标题"},
-                                                        {"component": "th", "text": "完成时间"},
-                                                        {"component": "th", "text": "已等待"},
-                                                        {"component": "th", "text": "剩余"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": rows,
-                                        },
-                                    ],
-                                }
-                            ],
+                            "content": card_items,
                         }
                     ],
                 }
@@ -586,22 +571,41 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-            rows = []
+            card_items = []
             for item in self._last_compare_items:
-                rows.append(
+                card_items.append(
                     {
-                        "component": "tr",
+                        "component": "div",
+                        "props": {
+                            "style": "padding: 8px 10px; margin-bottom: 6px; "
+                                     "border-radius: 6px; background: rgba(var(--v-theme-surface-variant), 0.35);",
+                        },
                         "content": [
                             {
-                                "component": "td",
-                                "props": {"style": "white-space: normal; word-break: break-all; min-width: 260px;"},
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
+                                },
                                 "text": str(item.get("name") or ""),
                             },
-                            {"component": "td", "text": str(item.get("status") or "")},
-                            {"component": "td", "text": str(item.get("hr_cycle") or "")},
-                            {"component": "td", "text": str(item.get("seeding_time") or "")},
-                            {"component": "td", "text": str(item.get("remain_time") or "")},
-                            {"component": "td", "text": str(item.get("detail") or "")},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                },
+                                "text": f"站点状态：{item.get('status') or '-'}　|　"
+                                        f"H&R周期：{item.get('hr_cycle') or '-'}　|　"
+                                        f"做种时间：{item.get('seeding_time') or '-'}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
+                                },
+                                "text": f"剩余做种时间：{item.get('remain_time') or '-'}　|　"
+                                        f"说明：{item.get('detail') or '-'}",
+                            },
                         ],
                     }
                 )
@@ -613,34 +617,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         {
                             "component": "VCol",
                             "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "QB任务标题"},
-                                                        {"component": "th", "text": "站点状态"},
-                                                        {"component": "th", "text": "H&R周期"},
-                                                        {"component": "th", "text": "做种时间"},
-                                                        {"component": "th", "text": "剩余做种时间"},
-                                                        {"component": "th", "text": "说明"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": rows,
-                                        },
-                                    ],
-                                }
-                            ],
+                            "content": card_items,
                         }
                     ],
                 }
