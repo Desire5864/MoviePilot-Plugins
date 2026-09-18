@@ -50,7 +50,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1393,8 +1393,8 @@ class BdmvToIso(_PluginBase):
         site_name = self.__get_site_name(name)
 
         lines = ["🚀 BDMV 原盘开始打包", ""]
-        # 首行：状态 + 源盘大小（与 UHD原盘自动下载 通知风格保持一致）
-        lines.append(f"▎【打包中】{source_size}" if source_size else "▎【打包中】")
+        # 首行：状态图标 + 文字 + 源盘大小
+        lines.append(f"▎🔄 打包中　{source_size}" if source_size else "▎🔄 打包中")
         # 中文标题，缺失时回退到原始目录名
         lines.append(f"▎中文标题：{cn_title or name}")
         if cn_title:
@@ -1435,13 +1435,13 @@ class BdmvToIso(_PluginBase):
         site_name = self.__get_site_name(name)
 
         lines = ["🎬 BDMV 原盘打包完成", ""]
-        # 首行：状态 + 源盘大小 → ISO 大小（与 UHD原盘自动下载 通知风格保持一致）
+        # 首行：绿色勾图标 + 源盘大小 → ISO 大小
         if source_size and size_text:
-            lines.append(f"▎【已完成】{source_size} → {size_text}")
+            lines.append(f"▎✅ {source_size} → {size_text}")
         elif size_text:
-            lines.append(f"▎【已完成】{size_text}")
+            lines.append(f"▎✅ {size_text}")
         else:
-            lines.append("▎【已完成】")
+            lines.append("▎✅")
         # 中文标题，缺失时回退到原始目录名
         lines.append(f"▎中文标题：{cn_title or name}")
         if cn_title:
