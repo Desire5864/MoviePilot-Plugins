@@ -50,7 +50,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.6.1"
+    plugin_version = "1.6.2"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1375,6 +1375,22 @@ class BdmvToIso(_PluginBase):
             return ""
         return str(record.get("site") or "").strip()
 
+    def __get_seed_title(self, name: str) -> str:
+        """查询资源目录对应的站点原始种子标题。
+
+        优先使用 UHD原盘自动下载 插件记录的站点标题，
+        缺失时回退到 QB 任务名。
+
+        :param name: 资源目录名（QB 任务名）
+        :return: 种子标题
+        """
+        record = self.__get_uhd_record(name)
+        if record:
+            title = str(record.get("title") or "").strip()
+            if title:
+                return title
+        return name
+
     def __notify_submitted(self, name: str) -> None:
         """发送打包任务已提交通知。
 
@@ -1391,6 +1407,7 @@ class BdmvToIso(_PluginBase):
 
         cn_title = self.__get_cn_title(name)
         site_name = self.__get_site_name(name)
+        seed_title = self.__get_seed_title(name)
 
         lines = ["🚀 BDMV 原盘开始打包", ""]
         # 首行：状态图标 + 文字 + 源盘大小
@@ -1398,7 +1415,7 @@ class BdmvToIso(_PluginBase):
         # 中文标题，缺失时回退到原始目录名
         lines.append(f"▎中文标题：{cn_title or name}")
         if cn_title:
-            lines.append(f"▎种子标题：{name}")
+            lines.append(f"▎种子标题：{seed_title}")
         if site_name:
             lines.append(f"▎站点：{site_name}")
 
@@ -1433,6 +1450,7 @@ class BdmvToIso(_PluginBase):
 
         cn_title = self.__get_cn_title(name)
         site_name = self.__get_site_name(name)
+        seed_title = self.__get_seed_title(name)
 
         lines = ["🎬 BDMV 原盘打包完成", ""]
         # 首行：绿色勾图标 + 源盘大小 → ISO 大小
@@ -1445,7 +1463,7 @@ class BdmvToIso(_PluginBase):
         # 中文标题，缺失时回退到原始目录名
         lines.append(f"▎中文标题：{cn_title or name}")
         if cn_title:
-            lines.append(f"▎种子标题：{name}")
+            lines.append(f"▎种子标题：{seed_title}")
         if site_name:
             lines.append(f"▎站点：{site_name}")
 
