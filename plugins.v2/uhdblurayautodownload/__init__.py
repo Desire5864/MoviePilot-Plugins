@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.4.0"
+    plugin_version = "2.4.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -510,13 +510,13 @@ class UhdBlurayAutoDownload(_PluginBase):
                 title = item.get("title") or ""
                 size = item.get("size") or ""
                 site = item.get("site") or ""
-                # 首行优先显示中文副标题，缺失时回退到主标题
+                # 首行：站点名 + 大小
+                head = f"▎【{site}】{size}" if site else f"▎{size}"
+                lines.append(head)
+                # 次行：中文副标题，缺失时回退到主标题
                 lines.append(f"▎📀 {subtitle or title}")
                 if subtitle:
                     lines.append(f"▎　　{title}")
-                meta = " · ".join([part for part in (size, site) if part])
-                if meta:
-                    lines.append(f"▎　　{meta}")
                 lines.append("")
             self.post_message(
                 mtype=NotificationType.SiteMessage,
