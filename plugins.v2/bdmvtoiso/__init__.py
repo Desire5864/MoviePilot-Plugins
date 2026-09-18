@@ -50,7 +50,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.5.2"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1364,6 +1364,17 @@ class BdmvToIso(_PluginBase):
             return subtitle
         return str(record.get("cn_title") or "").strip()
 
+    def __get_site_name(self, name: str) -> str:
+        """查询资源目录对应的来源站点名称。
+
+        :param name: 资源目录名（QB 任务名）
+        :return: 站点名称；未找到返回空字符串
+        """
+        record = self.__get_uhd_record(name)
+        if not record:
+            return ""
+        return str(record.get("site") or "").strip()
+
     def __notify_submitted(self, name: str) -> None:
         """发送打包任务已提交通知。
 
@@ -1379,14 +1390,17 @@ class BdmvToIso(_PluginBase):
             logger.warning(f"BDMV自动打包ISO：获取源盘大小失败：{err}")
 
         cn_title = self.__get_cn_title(name)
+        site_name = self.__get_site_name(name)
 
         lines = ["🚀 BDMV 原盘开始打包", ""]
         # 首行：状态 + 源盘大小（与 UHD原盘自动下载 通知风格保持一致）
         lines.append(f"▎【打包中】{source_size}" if source_size else "▎【打包中】")
-        # 次行：中文标题，缺失时回退到原始目录名
-        lines.append(f"▎📀 {cn_title or name}")
+        # 中文标题，缺失时回退到原始目录名
+        lines.append(f"▎中文标题：{cn_title or name}")
         if cn_title:
-            lines.append(f"▎　　{name}")
+            lines.append(f"▎种子标题：{name}")
+        if site_name:
+            lines.append(f"▎站点：{site_name}")
 
         if self._cd2_enabled and self._cd2_source_path:
             lines.append("")
@@ -1418,6 +1432,7 @@ class BdmvToIso(_PluginBase):
         source_size = detail.replace("总大小：", "").strip() if detail else ""
 
         cn_title = self.__get_cn_title(name)
+        site_name = self.__get_site_name(name)
 
         lines = ["🎬 BDMV 原盘打包完成", ""]
         # 首行：状态 + 源盘大小 → ISO 大小（与 UHD原盘自动下载 通知风格保持一致）
@@ -1427,10 +1442,12 @@ class BdmvToIso(_PluginBase):
             lines.append(f"▎【已完成】{size_text}")
         else:
             lines.append("▎【已完成】")
-        # 次行：中文标题，缺失时回退到原始目录名
-        lines.append(f"▎📀 {cn_title or name}")
+        # 中文标题，缺失时回退到原始目录名
+        lines.append(f"▎中文标题：{cn_title or name}")
         if cn_title:
-            lines.append(f"▎　　{name}")
+            lines.append(f"▎种子标题：{name}")
+        if site_name:
+            lines.append(f"▎站点：{site_name}")
 
         # 打包完成后触发 CD2 备份同步
         if self._cd2_enabled:
