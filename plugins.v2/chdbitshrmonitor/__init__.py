@@ -27,7 +27,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -420,7 +420,11 @@ class ChdbitsHrMonitor(_PluginBase):
                     {
                         "component": "tr",
                         "content": [
-                            {"component": "td", "text": str(task.get("title") or "")[:60]},
+                            {
+                                "component": "td",
+                                "props": {"style": "white-space: normal; word-break: break-all; min-width: 260px;"},
+                                "text": str(task.get("title") or ""),
+                            },
                             {"component": "td", "text": str(task.get("hr_percent") or "")},
                             {"component": "td", "text": str(task.get("remain_time") or "")},
                             {"component": "td", "text": str(task.get("hr_cycle") or "")},
@@ -485,7 +489,11 @@ class ChdbitsHrMonitor(_PluginBase):
                     {
                         "component": "tr",
                         "content": [
-                            {"component": "td", "text": str(record.get("name") or "")[:60]},
+                            {
+                                "component": "td",
+                                "props": {"style": "white-space: normal; word-break: break-all; min-width: 260px;"},
+                                "text": str(record.get("name") or ""),
+                            },
                             {"component": "td", "text": str(record.get("completed_time") or "")},
                             {"component": "td", "text": f"{elapsed_hours:.1f} 小时"},
                             {"component": "td", "text": f"{remain_hours:.1f} 小时"},
@@ -584,7 +592,11 @@ class ChdbitsHrMonitor(_PluginBase):
                     {
                         "component": "tr",
                         "content": [
-                            {"component": "td", "text": str(item.get("name") or "")[:60]},
+                            {
+                                "component": "td",
+                                "props": {"style": "white-space: normal; word-break: break-all; min-width: 260px;"},
+                                "text": str(item.get("name") or ""),
+                            },
                             {"component": "td", "text": str(item.get("status") or "")},
                             {"component": "td", "text": str(item.get("hr_cycle") or "")},
                             {"component": "td", "text": str(item.get("seeding_time") or "")},
