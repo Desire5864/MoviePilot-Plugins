@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.3.1"
+    plugin_version = "2.4.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -504,16 +504,24 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         # 发送通知
         if self._notify and downloaded_items:
-            lines = []
+            lines = [f"🎬 已推送 {len(downloaded_items)} 个 UHD 原盘到 QB", ""]
             for item in downloaded_items[:20]:
-                lines.append(
-                    f"- [{item.get('site')}] {item.get('title')[:60]}\n"
-                    f"  {item.get('subtitle') or ''}（{item.get('size')}）"
-                )
+                subtitle = item.get("subtitle") or ""
+                title = item.get("title") or ""
+                size = item.get("size") or ""
+                site = item.get("site") or ""
+                # 首行优先显示中文副标题，缺失时回退到主标题
+                lines.append(f"▎📀 {subtitle or title}")
+                if subtitle:
+                    lines.append(f"▎　　{title}")
+                meta = " · ".join([part for part in (size, site) if part])
+                if meta:
+                    lines.append(f"▎　　{meta}")
+                lines.append("")
             self.post_message(
                 mtype=NotificationType.SiteMessage,
                 title="【UHD原盘自动下载】",
-                text=f"已推送 {len(downloaded_items)} 个 UHD BluRay 原盘到 QB：\n" + "\n".join(lines),
+                text="\n".join(lines).rstrip(),
             )
 
     def __fetch_detail_subtitle(self, site: Dict[str, Any], torrent_id: str) -> str:
