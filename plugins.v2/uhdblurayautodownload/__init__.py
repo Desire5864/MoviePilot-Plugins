@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.4.3"
+    plugin_version = "2.4.4"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -498,6 +498,9 @@ class UhdBlurayAutoDownload(_PluginBase):
             except Exception as err:
                 logger.error(f"UHD原盘自动下载：处理站点 {site_conf.get('name')} 失败，{err}")
 
+        # 补齐历史记录中缺失的副标题（兼容旧版本记录）
+        self.__fill_missing_subtitles(processed_map)
+
         self._last_items = all_items
 
         # 限制记录长度
@@ -528,6 +531,49 @@ class UhdBlurayAutoDownload(_PluginBase):
                 title="【UHD原盘自动下载】",
                 text="\n".join(lines).rstrip(),
             )
+
+    def __fill_missing_subtitles(self, processed_map: Dict[str, Dict[str, Any]]) -> None:
+        """补齐历史记录中缺失的副标题。
+
+        旧版本记录只保存了 title 与 cn_title，缺少完整副标题。
+        此处按记录 key 中的域名与种子 ID 从站点详情页补全，
+        每次最多补全若干条，避免请求过多。
+
+        :param processed_map: 已处理记录字典
+        """
+        # 每次最多补全的条数，避免一次性请求过多
+        max_fill = 5
+        filled = 0
+
+        for record_key, record in processed_map.items():
+            if filled >= max_fill:
+                break
+            if not isinstance(record, dict):
+                continue
+            if record.get("subtitle"):
+                continue
+            if ":" not in record_key:
+                continue
+
+            domain, torrent_id = record_key.split(":", 1)
+            site = self.__get_site_config(domain)
+            if not site:
+                continue
+
+            subtitle = self.__fetch_detail_subtitle(site, torrent_id)
+            if not subtitle:
+                continue
+
+            record["subtitle"] = subtitle
+            if not record.get("cn_title"):
+                record["cn_title"] = self.__extract_cn_title(subtitle)
+            filled += 1
+            logger.info(
+                f"UHD原盘自动下载：已补齐副标题 {domain}:{torrent_id} - {subtitle[:50]}"
+            )
+
+        if filled:
+            logger.info(f"UHD原盘自动下载：本次共补齐 {filled} 条副标题")
 
     def __fetch_detail_subtitle(self, site: Dict[str, Any], torrent_id: str) -> str:
         """从种子详情页获取完整副标题。
@@ -662,8 +708,18 @@ class UhdBlurayAutoDownload(_PluginBase):
                 items.append(item)
                 continue
 
-            # 已处理过则跳过
+            # 已处理过则跳过，但补齐缺失的副标题（兼容旧版本记录）
             if record_key in processed_map:
+                record = processed_map[record_key]
+                if isinstance(record, dict) and not record.get("subtitle"):
+                    current_subtitle = item.get("subtitle") or ""
+                    if current_subtitle:
+                        record["subtitle"] = current_subtitle
+                        if not record.get("cn_title"):
+                            record["cn_title"] = self.__extract_cn_title(current_subtitle)
+                        logger.info(
+                            f"UHD原盘自动下载：已补齐副标题 {site_name} - {title[:60]}"
+                        )
                 item["action"] = "已处理，跳过"
                 items.append(item)
                 continue
