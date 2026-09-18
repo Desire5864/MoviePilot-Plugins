@@ -22,6 +22,10 @@ DEFAULT_CATEGORY = "彩虹岛&HR,OurBits原盘"
 UHD_PLUGIN_ID = "UhdBlurayAutoDownload"
 # UHD原盘自动下载 插件的已处理记录键名
 UHD_PROCESSED_DATA_KEY = "uhd_processed_map"
+# CD2 备份待完成记录的持久化键名
+CD2_PENDING_DATA_KEY = "cd2_pending_map"
+# CD2 待完成记录最多保留条数
+CD2_PENDING_LIMIT = 100
 # CD2 备份状态枚举
 CD2_STATUS_TEXT = {
     0: "空闲",
@@ -50,7 +54,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.6.2"
+    plugin_version = "1.7.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -949,6 +953,9 @@ class BdmvToIso(_PluginBase):
                     submitted_map.pop(key, None)
             self.save_data(SUBMITTED_DATA_KEY, submitted_map)
 
+        # 6. 检查已触发的 CD2 备份是否完成
+        self.__check_cd2_finished()
+
     @staticmethod
     def __torrent_field(torrent: Any, key: str, default: Any = None) -> Any:
         """兼容字典与对象两种形式读取种子字段。
@@ -1266,6 +1273,87 @@ class BdmvToIso(_PluginBase):
         logger.info(f"BDMV自动打包ISO：已触发 CD2 备份扫描 {self._cd2_source_path}")
         return True
 
+    def __record_cd2_trigger(self, name: str) -> None:
+        """记录 CD2 备份触发信息，用于后续检测同步是否完成。
+
+        :param name: 资源目录名
+        """
+        pending = self.get_data(CD2_PENDING_DATA_KEY) or {}
+        if not isinstance(pending, dict):
+            pending = {}
+        pending[name] = {
+            "trigger_ts": int(datetime.now().timestamp()),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        # 限制记录条数
+        if len(pending) > CD2_PENDING_LIMIT:
+            keys = list(pending.keys())
+            for key in keys[: len(pending) - CD2_PENDING_LIMIT]:
+                pending.pop(key, None)
+        self.save_data(CD2_PENDING_DATA_KEY, pending)
+
+    def __check_cd2_finished(self) -> None:
+        """检查已触发的 CD2 备份是否完成，完成后发送通知。"""
+        if not self._cd2_enabled or not self._cd2_source_path:
+            return
+
+        pending = self.get_data(CD2_PENDING_DATA_KEY) or {}
+        if not isinstance(pending, dict) or not pending:
+            return
+
+        status = self.__get_cd2_backup_status()
+        if not status:
+            return
+
+        last_finish_ts = int(status.get("last_finish_ts") or 0)
+        if not last_finish_ts:
+            return
+
+        destination = status.get("destination") or self._cd2_source_path
+        finished = []
+        for name, record in list(pending.items()):
+            if not isinstance(record, dict):
+                pending.pop(name, None)
+                continue
+            trigger_ts = int(record.get("trigger_ts") or 0)
+            # 目标端完成时间晚于触发时间，说明本次同步已完成
+            if trigger_ts and last_finish_ts >= trigger_ts:
+                finished.append((name, record))
+                pending.pop(name, None)
+
+        if not finished:
+            return
+
+        self.save_data(CD2_PENDING_DATA_KEY, pending)
+
+        for name, record in finished:
+            finish_time = datetime.fromtimestamp(last_finish_ts).strftime("%Y-%m-%d %H:%M:%S")
+            logger.info(f"BDMV自动打包ISO：CD2 备份已完成 {name} - {finish_time}")
+            if not self._notify:
+                continue
+
+            cn_title = self.__get_cn_title(name)
+            site_name = self.__get_site_name(name)
+            seed_title = self.__get_seed_title(name)
+
+            lines = ["☁️ BDMV 原盘云端同步完成", ""]
+            lines.append("▎✅ 已同步到云端")
+            lines.append(f"▎中文标题：{cn_title or name}")
+            if cn_title:
+                lines.append(f"▎种子标题：{seed_title}")
+            if site_name:
+                lines.append(f"▎站点：{site_name}")
+            lines.append("")
+            lines.append("📂 云端目录")
+            lines.append(f"　　{destination}")
+            lines.append(f"🕐 完成时间：{finish_time}")
+
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title="【BDMV自动打包ISO】",
+                text="\n".join(lines),
+            )
+
     def __get_cd2_backup_status(self) -> Optional[Dict[str, Any]]:
         """查询 CD2 备份的当前状态。
 
@@ -1288,10 +1376,25 @@ class BdmvToIso(_PluginBase):
             self.__close_cd2_client()
             return None
 
+        # 取目标端最后完成时间与目标路径
+        last_finish_ts = 0
+        destination = ""
+        for dest in status.backup.destinations:
+            if not dest.isEnabled:
+                continue
+            if not destination:
+                destination = dest.destinationPath or ""
+            if dest.HasField("lastFinishTime"):
+                ts = int(dest.lastFinishTime.seconds)
+                if ts > last_finish_ts:
+                    last_finish_ts = ts
+
         return {
             "status": int(status.status),
             "status_text": CD2_STATUS_TEXT.get(int(status.status), str(status.status)),
             "message": status.statusMessage or "",
+            "last_finish_ts": last_finish_ts,
+            "destination": destination,
         }
 
     def __close_cd2_client(self) -> None:
@@ -1472,6 +1575,8 @@ class BdmvToIso(_PluginBase):
             lines.append("")
             lines.append("☁️ 云端同步")
             if self.__trigger_cd2_backup():
+                # 记录触发时间，供后续检测同步是否完成
+                self.__record_cd2_trigger(name)
                 lines.append("　　✅ 已触发 CD2 备份")
                 lines.append(f"　　📂 {self._cd2_source_path}")
             else:
