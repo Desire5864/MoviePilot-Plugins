@@ -34,7 +34,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.4.4"
+    plugin_version = "2.5.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -550,14 +550,19 @@ class UhdBlurayAutoDownload(_PluginBase):
                 break
             if not isinstance(record, dict):
                 continue
-            if record.get("subtitle"):
-                continue
             if ":" not in record_key:
                 continue
 
             domain, torrent_id = record_key.split(":", 1)
             site = self.__get_site_config(domain)
             if not site:
+                continue
+
+            # 补齐站点名称
+            if not record.get("site"):
+                record["site"] = site.get("name") or ""
+
+            if record.get("subtitle"):
                 continue
 
             subtitle = self.__fetch_detail_subtitle(site, torrent_id)
@@ -708,18 +713,21 @@ class UhdBlurayAutoDownload(_PluginBase):
                 items.append(item)
                 continue
 
-            # 已处理过则跳过，但补齐缺失的副标题（兼容旧版本记录）
+            # 已处理过则跳过，但补齐缺失的副标题与站点（兼容旧版本记录）
             if record_key in processed_map:
                 record = processed_map[record_key]
-                if isinstance(record, dict) and not record.get("subtitle"):
-                    current_subtitle = item.get("subtitle") or ""
-                    if current_subtitle:
-                        record["subtitle"] = current_subtitle
-                        if not record.get("cn_title"):
-                            record["cn_title"] = self.__extract_cn_title(current_subtitle)
-                        logger.info(
-                            f"UHD原盘自动下载：已补齐副标题 {site_name} - {title[:60]}"
-                        )
+                if isinstance(record, dict):
+                    if not record.get("site"):
+                        record["site"] = site_name
+                    if not record.get("subtitle"):
+                        current_subtitle = item.get("subtitle") or ""
+                        if current_subtitle:
+                            record["subtitle"] = current_subtitle
+                            if not record.get("cn_title"):
+                                record["cn_title"] = self.__extract_cn_title(current_subtitle)
+                            logger.info(
+                                f"UHD原盘自动下载：已补齐副标题 {site_name} - {title[:60]}"
+                            )
                 item["action"] = "已处理，跳过"
                 items.append(item)
                 continue
@@ -737,6 +745,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     "title": title,
                     "subtitle": item.get("subtitle") or "",
                     "cn_title": self.__extract_cn_title(item.get("subtitle") or ""),
+                    "site": site_name,
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 logger.info(f"UHD原盘自动下载：已推送 {site_name} - {title[:60]}")
