@@ -54,7 +54,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1205,6 +1205,25 @@ class BdmvToIso(_PluginBase):
         logger.error(f"BDMV自动打包ISO：提交打包任务返回异常状态码 {res.status_code}")
         return False
 
+    @staticmethod
+    def __is_cd2_auth_error(err: Exception) -> bool:
+        """判断 CD2 调用异常是否为认证失效。
+
+        CD2 的 token 有有效期，插件进程长期运行时缓存的客户端可能已失效，
+        此时 gRPC 返回 UNAUTHENTICATED，需要重新认证后重试。
+
+        :param err: 捕获到的异常
+        :return: 是否为认证失效错误
+        """
+        try:
+            code = err.code()
+        except Exception:
+            code = None
+        if code is not None and "UNAUTHENTICATED" in str(code):
+            return True
+        text = str(err)
+        return "UNAUTHENTICATED" in text or "Invalid auth token" in text
+
     def __get_cd2_client(self) -> Optional[Any]:
         """获取已认证的 CloudDrive2 gRPC 客户端。
 
@@ -1221,6 +1240,13 @@ class BdmvToIso(_PluginBase):
         if self._cd2_client is not None:
             return self._cd2_client
 
+        return self.__create_cd2_client()
+
+    def __create_cd2_client(self) -> Optional[Any]:
+        """新建并认证一个 CD2 客户端。
+
+        :return: 客户端实例，失败返回 None
+        """
         try:
             from clouddrive2_client import CloudDriveClient
         except ImportError:
@@ -1243,35 +1269,55 @@ class BdmvToIso(_PluginBase):
         self._cd2_client = client
         return client
 
+    def __renew_cd2_client(self) -> Optional[Any]:
+        """关闭旧客户端并重新认证，用于 token 失效后重试。
+
+        :return: 新的客户端实例，失败返回 None
+        """
+        self.__close_cd2_client()
+        logger.info("BDMV自动打包ISO：CD2 认证已失效，正在重新认证")
+        return self.__create_cd2_client()
+
     def __trigger_cd2_backup(self) -> bool:
         """触发 CloudDrive2 备份扫描，将新生成的 ISO 同步到云端。
 
+        认证失效时自动重新认证并重试一次。
+
         :return: 是否触发成功
         """
-        client = self.__get_cd2_client()
-        if client is None:
-            return False
-
         if not self._cd2_source_path:
             logger.warning("BDMV自动打包ISO：未配置 CD2 备份源路径，跳过备份触发")
             return False
 
-        try:
-            from clouddrive2_client.proto import clouddrive_pb2 as pb
+        for attempt in range(2):
+            client = self.__get_cd2_client()
+            if client is None:
+                return False
 
-            metadata = client._create_authorized_metadata()
-            client.stub.BackupRestartWalkingThrough(
-                pb.StringValue(value=self._cd2_source_path),
-                metadata=metadata,
-            )
-        except Exception as err:
-            logger.error(f"BDMV自动打包ISO：触发 CD2 备份失败：{err}")
-            # 连接可能已失效，下次重新建立
-            self.__close_cd2_client()
-            return False
+            try:
+                from clouddrive2_client.proto import clouddrive_pb2 as pb
 
-        logger.info(f"BDMV自动打包ISO：已触发 CD2 备份扫描 {self._cd2_source_path}")
-        return True
+                metadata = client._create_authorized_metadata()
+                client.stub.BackupRestartWalkingThrough(
+                    pb.StringValue(value=self._cd2_source_path),
+                    metadata=metadata,
+                )
+            except Exception as err:
+                # 认证失效：重新认证后重试一次
+                if attempt == 0 and self.__is_cd2_auth_error(err):
+                    logger.warning(f"BDMV自动打包ISO：触发 CD2 备份认证失效，准备重试：{err}")
+                    if self.__renew_cd2_client() is None:
+                        return False
+                    continue
+                logger.error(f"BDMV自动打包ISO：触发 CD2 备份失败：{err}")
+                # 连接可能已失效，下次重新建立
+                self.__close_cd2_client()
+                return False
+
+            logger.info(f"BDMV自动打包ISO：已触发 CD2 备份扫描 {self._cd2_source_path}")
+            return True
+
+        return False
 
     def __record_cd2_trigger(self, name: str) -> None:
         """记录 CD2 备份触发信息，用于后续检测同步是否完成。
@@ -1357,23 +1403,40 @@ class BdmvToIso(_PluginBase):
     def __get_cd2_backup_status(self) -> Optional[Dict[str, Any]]:
         """查询 CD2 备份的当前状态。
 
+        认证失效时自动重新认证并重试一次。
+
         :return: 状态字典，失败返回 None
         """
-        client = self.__get_cd2_client()
-        if client is None or not self._cd2_source_path:
+        if not self._cd2_source_path:
             return None
 
-        try:
-            from clouddrive2_client.proto import clouddrive_pb2 as pb
+        status = None
+        for attempt in range(2):
+            client = self.__get_cd2_client()
+            if client is None:
+                return None
 
-            metadata = client._create_authorized_metadata()
-            status = client.stub.BackupGetStatus(
-                pb.StringValue(value=self._cd2_source_path),
-                metadata=metadata,
-            )
-        except Exception as err:
-            logger.error(f"BDMV自动打包ISO：查询 CD2 备份状态失败：{err}")
-            self.__close_cd2_client()
+            try:
+                from clouddrive2_client.proto import clouddrive_pb2 as pb
+
+                metadata = client._create_authorized_metadata()
+                status = client.stub.BackupGetStatus(
+                    pb.StringValue(value=self._cd2_source_path),
+                    metadata=metadata,
+                )
+            except Exception as err:
+                # 认证失效：重新认证后重试一次
+                if attempt == 0 and self.__is_cd2_auth_error(err):
+                    logger.warning(f"BDMV自动打包ISO：查询 CD2 状态认证失效，准备重试：{err}")
+                    if self.__renew_cd2_client() is None:
+                        return None
+                    continue
+                logger.error(f"BDMV自动打包ISO：查询 CD2 备份状态失败：{err}")
+                self.__close_cd2_client()
+                return None
+            break
+
+        if status is None:
             return None
 
         # 取目标端最后完成时间与目标路径
