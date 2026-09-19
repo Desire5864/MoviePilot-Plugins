@@ -54,7 +54,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.7.5"
+    plugin_version = "1.7.6"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1521,19 +1521,21 @@ class BdmvToIso(_PluginBase):
                 total = int(progress.get("size") or 0)
                 # 3=Transfer 传输中，0/1=预处理，4=暂停，7=排队
                 if status_enum in (0, 1, 3, 4, 7):
+                    # CD2 的 transferedBytes 偶发异常（如任务重建后计数重置），
+                    # 用云端实际文件大小交叉校验，取两者较小值作为可信进度
+                    cloud_size = self.__get_cd2_cloud_file_size(iso_name) or 0
+                    if cloud_size > 0 and cloud_size < transfered:
+                        logger.info(
+                            f"BDMV自动打包ISO：上传进度异常，改用云端文件大小 "
+                            f"({cloud_size} < {transfered})"
+                        )
+                        transfered = cloud_size
                     percent = (transfered / total * 100) if total else 0
                     logger.info(
                         f"BDMV自动打包ISO：云端上传进行中 {iso_name} "
                         f"({transfered}/{total} 字节, {percent:.1f}%)"
                     )
-                    # 首次检测到上传任务时发送「上传中」通知
-                    if not record.get("upload_notified"):
-                        record["upload_notified"] = True
-                        changed = True
-                        if self._notify:
-                            self.__notify_cd2_uploading(
-                                name, destination, transfered, total
-                            )
+                    # 上传中不发送通知，仅记录日志，避免进度不准造成误导
                     continue
                 # 9/10=错误，保留记录等待下次重试或人工处理
                 if status_enum in (9, 10):
@@ -1909,43 +1911,6 @@ class BdmvToIso(_PluginBase):
         lines.append("📂 云端目录")
         lines.append(f"　　{destination}")
         lines.append(f"🕐 扫描时间：{scan_time}")
-
-        self.post_message(
-            mtype=NotificationType.Plugin,
-            title="【BDMV自动打包ISO】",
-            text="\n".join(lines),
-        )
-
-    def __notify_cd2_uploading(
-        self, name: str, destination: str, transfered: int, total: int
-    ) -> None:
-        """发送 CD2 上传中通知（含进度）。
-
-        :param name: 资源目录名
-        :param destination: 云端目标目录
-        :param transfered: 已传输字节数
-        :param total: 文件总字节数
-        """
-        cn_title = self.__get_cn_title(name)
-        site_name = self.__get_site_name(name)
-        seed_title = self.__get_seed_title(name)
-
-        percent = (transfered / total * 100) if total else 0
-        transfered_gb = transfered / 1024 / 1024 / 1024
-        total_gb = total / 1024 / 1024 / 1024
-
-        lines = ["☁️ BDMV 原盘云端上传中", ""]
-        lines.append(
-            f"▎⬆️ 上传进度：{percent:.1f}%（{transfered_gb:.2f} GB / {total_gb:.2f} GB）"
-        )
-        lines.append(f"▎中文标题：{cn_title or name}")
-        if cn_title:
-            lines.append(f"▎种子标题：{seed_title}")
-        if site_name:
-            lines.append(f"▎站点：{site_name}")
-        lines.append("")
-        lines.append("📂 云端目录")
-        lines.append(f"　　{destination}")
 
         self.post_message(
             mtype=NotificationType.Plugin,
