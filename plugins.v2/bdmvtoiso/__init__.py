@@ -54,7 +54,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.7.4"
+    plugin_version = "1.7.5"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1456,14 +1456,16 @@ class BdmvToIso(_PluginBase):
         return None
 
     def __check_cd2_finished(self) -> None:
-        """检查已触发的 CD2 备份是否真正完成，完成后发送通知。
+        """检查已触发的 CD2 备份进度，并在关键阶段发送通知。
 
         CD2 的 BackupStatus 只提供 lastFinishTime，其语义为「扫描完成时间」，
         并非「上传完成时间」，扫描结束后文件仍可能长时间上传中。
 
         判断顺序：
-        1. 通过 GetUploadFileList 查询该 ISO 的上传任务，仍在传输中则继续等待；
-        2. 上传任务已结束（或查询不到）时，校验云端目标目录中文件是否已存在
+        1. 扫描完成（lastFinishTime 晚于触发时间）时发送「扫描完成」通知；
+        2. 通过 GetUploadFileList 查询该 ISO 的上传任务，首次检测到传输中时
+           发送「上传中」通知（含进度），之后继续等待；
+        3. 上传任务已结束（或查询不到）时，校验云端目标目录中文件是否已存在
            且大小与本地一致，确认后才发送「同步完成」通知。
         """
         if not self._cd2_enabled or not self._cd2_source_path:
@@ -1484,20 +1486,30 @@ class BdmvToIso(_PluginBase):
         destination = status.get("destination") or self._cd2_destination_path
 
         finished = []
+        changed = False
         for name, record in list(pending.items()):
             if not isinstance(record, dict):
                 pending.pop(name, None)
+                changed = True
                 continue
             trigger_ts = int(record.get("trigger_ts") or 0)
             # 扫描完成时间需晚于触发时间，说明本次扫描已结束
             if not trigger_ts or last_finish_ts < trigger_ts:
                 continue
 
+            # 扫描完成通知（每个任务只发一次）
+            if not record.get("scan_notified"):
+                record["scan_notified"] = True
+                changed = True
+                if self._notify:
+                    self.__notify_cd2_scan_done(name, destination, last_finish_ts)
+
             iso_name = str(record.get("iso_name") or "")
             iso_size = int(record.get("iso_size") or 0)
             if not iso_name:
                 # 旧记录缺少文件名，无法校验，直接清理避免长期滞留
                 pending.pop(name, None)
+                changed = True
                 logger.info(f"BDMV自动打包ISO：CD2 记录缺少 ISO 文件名，跳过校验 {name}")
                 continue
 
@@ -1514,6 +1526,14 @@ class BdmvToIso(_PluginBase):
                         f"BDMV自动打包ISO：云端上传进行中 {iso_name} "
                         f"({transfered}/{total} 字节, {percent:.1f}%)"
                     )
+                    # 首次检测到上传任务时发送「上传中」通知
+                    if not record.get("upload_notified"):
+                        record["upload_notified"] = True
+                        changed = True
+                        if self._notify:
+                            self.__notify_cd2_uploading(
+                                name, destination, transfered, total
+                            )
                     continue
                 # 9/10=错误，保留记录等待下次重试或人工处理
                 if status_enum in (9, 10):
@@ -1537,11 +1557,14 @@ class BdmvToIso(_PluginBase):
 
             finished.append((name, record))
             pending.pop(name, None)
+            changed = True
+
+        # 保存通知标记与清理结果
+        if changed:
+            self.save_data(CD2_PENDING_DATA_KEY, pending)
 
         if not finished:
             return
-
-        self.save_data(CD2_PENDING_DATA_KEY, pending)
 
         for name, _record in finished:
             finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1856,6 +1879,73 @@ class BdmvToIso(_PluginBase):
             lines.append("")
             lines.append("📄 输出文件")
             lines.append(f"　　{display_path}")
+
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title="【BDMV自动打包ISO】",
+            text="\n".join(lines),
+        )
+
+    def __notify_cd2_scan_done(self, name: str, destination: str, scan_ts: int) -> None:
+        """发送 CD2 扫描完成通知。
+
+        :param name: 资源目录名
+        :param destination: 云端目标目录
+        :param scan_ts: 扫描完成时间戳
+        """
+        cn_title = self.__get_cn_title(name)
+        site_name = self.__get_site_name(name)
+        seed_title = self.__get_seed_title(name)
+        scan_time = datetime.fromtimestamp(scan_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+        lines = ["☁️ BDMV 原盘云端扫描完成", ""]
+        lines.append("▎🔍 已扫描源目录，开始上传")
+        lines.append(f"▎中文标题：{cn_title or name}")
+        if cn_title:
+            lines.append(f"▎种子标题：{seed_title}")
+        if site_name:
+            lines.append(f"▎站点：{site_name}")
+        lines.append("")
+        lines.append("📂 云端目录")
+        lines.append(f"　　{destination}")
+        lines.append(f"🕐 扫描时间：{scan_time}")
+
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title="【BDMV自动打包ISO】",
+            text="\n".join(lines),
+        )
+
+    def __notify_cd2_uploading(
+        self, name: str, destination: str, transfered: int, total: int
+    ) -> None:
+        """发送 CD2 上传中通知（含进度）。
+
+        :param name: 资源目录名
+        :param destination: 云端目标目录
+        :param transfered: 已传输字节数
+        :param total: 文件总字节数
+        """
+        cn_title = self.__get_cn_title(name)
+        site_name = self.__get_site_name(name)
+        seed_title = self.__get_seed_title(name)
+
+        percent = (transfered / total * 100) if total else 0
+        transfered_gb = transfered / 1024 / 1024 / 1024
+        total_gb = total / 1024 / 1024 / 1024
+
+        lines = ["☁️ BDMV 原盘云端上传中", ""]
+        lines.append(
+            f"▎⬆️ 上传进度：{percent:.1f}%（{transfered_gb:.2f} GB / {total_gb:.2f} GB）"
+        )
+        lines.append(f"▎中文标题：{cn_title or name}")
+        if cn_title:
+            lines.append(f"▎种子标题：{seed_title}")
+        if site_name:
+            lines.append(f"▎站点：{site_name}")
+        lines.append("")
+        lines.append("📂 云端目录")
+        lines.append(f"　　{destination}")
 
         self.post_message(
             mtype=NotificationType.Plugin,
