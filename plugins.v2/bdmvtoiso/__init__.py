@@ -54,7 +54,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.7.2"
+    plugin_version = "1.7.3"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -97,6 +97,8 @@ class BdmvToIso(_PluginBase):
     _cd2_password: str = ""
     # CD2 备份源路径（对应 ISO 输出目录）
     _cd2_source_path: str = ""
+    # CD2 备份目标路径（云端目录，用于校验上传是否完成）
+    _cd2_destination_path: str = ""
     # 与服务端保持的登录会话
     _session: Optional[Session] = None
     # CD2 gRPC 客户端
@@ -127,6 +129,7 @@ class BdmvToIso(_PluginBase):
         self._cd2_username = ""
         self._cd2_password = ""
         self._cd2_source_path = ""
+        self._cd2_destination_path = ""
         self._session = None
         self._cd2_client = None
 
@@ -170,6 +173,7 @@ class BdmvToIso(_PluginBase):
         self._cd2_username = str(config.get("cd2_username") or "").strip()
         self._cd2_password = str(config.get("cd2_password") or "")
         self._cd2_source_path = str(config.get("cd2_source_path") or "").strip().rstrip("/")
+        self._cd2_destination_path = str(config.get("cd2_destination_path") or "").strip().rstrip("/")
 
     def get_state(self) -> bool:
         """获取插件启用状态。
@@ -461,6 +465,25 @@ class BdmvToIso(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cd2_destination_path",
+                                            "label": "CD2 备份目标路径（云端目录）",
+                                            "placeholder": "例如：/115open/云下载/蓝光原盘，用于校验上传是否完成",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
@@ -532,6 +555,7 @@ class BdmvToIso(_PluginBase):
             "cd2_username": "",
             "cd2_password": "",
             "cd2_source_path": "",
+            "cd2_destination_path": "",
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -1319,10 +1343,12 @@ class BdmvToIso(_PluginBase):
 
         return False
 
-    def __record_cd2_trigger(self, name: str) -> None:
+    def __record_cd2_trigger(self, name: str, iso_name: str = "", iso_size: int = 0) -> None:
         """记录 CD2 备份触发信息，用于后续检测同步是否完成。
 
         :param name: 资源目录名
+        :param iso_name: 输出 ISO 文件名（用于校验云端文件是否已存在）
+        :param iso_size: 输出 ISO 字节数（用于校验云端文件大小是否一致）
         """
         pending = self.get_data(CD2_PENDING_DATA_KEY) or {}
         if not isinstance(pending, dict):
@@ -1330,6 +1356,8 @@ class BdmvToIso(_PluginBase):
         pending[name] = {
             "trigger_ts": int(datetime.now().timestamp()),
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "iso_name": iso_name,
+            "iso_size": int(iso_size or 0),
         }
         # 限制记录条数
         if len(pending) > CD2_PENDING_LIMIT:
@@ -1338,8 +1366,53 @@ class BdmvToIso(_PluginBase):
                 pending.pop(key, None)
         self.save_data(CD2_PENDING_DATA_KEY, pending)
 
+    def __get_cd2_cloud_file_size(self, iso_name: str) -> Optional[int]:
+        """查询云端目标目录中指定文件的大小。
+
+        用于校验 ISO 是否已完整上传到云端（CD2 的 BackupStatus 不提供上传进度）。
+
+        :param iso_name: ISO 文件名
+        :return: 文件字节数；文件不存在返回 None
+        """
+        if not iso_name or not self._cd2_destination_path:
+            return None
+
+        client = self.__get_cd2_client()
+        if client is None:
+            return None
+
+        try:
+            from clouddrive2_client.proto import clouddrive_pb2 as pb
+
+            metadata = client._create_authorized_metadata()
+            stream = client.stub.GetSubFiles(
+                pb.ListSubFileRequest(path=self._cd2_destination_path),
+                metadata=metadata,
+            )
+            for reply in stream:
+                for item in reply.subFiles:
+                    if item.isDirectory:
+                        continue
+                    if item.name == iso_name:
+                        return int(item.size)
+        except Exception as err:
+            if self.__is_cd2_auth_error(err):
+                logger.warning(f"BDMV自动打包ISO：查询云端目录认证失效：{err}")
+                self.__close_cd2_client()
+            else:
+                logger.warning(f"BDMV自动打包ISO：查询云端目录失败：{err}")
+            return None
+
+        return None
+
     def __check_cd2_finished(self) -> None:
-        """检查已触发的 CD2 备份是否完成，完成后发送通知。"""
+        """检查已触发的 CD2 备份是否真正完成，完成后发送通知。
+
+        CD2 的 BackupStatus 只提供 lastFinishTime，其语义为「扫描完成时间」，
+        并非「上传完成时间」，扫描结束后文件仍可能长时间上传中。
+        因此这里改为校验云端目标目录中 ISO 文件是否已存在且大小与本地一致，
+        确认上传完成后才发送「同步完成」通知。
+        """
         if not self._cd2_enabled or not self._cd2_source_path:
             return
 
@@ -1355,25 +1428,49 @@ class BdmvToIso(_PluginBase):
         if not last_finish_ts:
             return
 
-        destination = status.get("destination") or self._cd2_source_path
+        destination = status.get("destination") or self._cd2_destination_path
+
         finished = []
         for name, record in list(pending.items()):
             if not isinstance(record, dict):
                 pending.pop(name, None)
                 continue
             trigger_ts = int(record.get("trigger_ts") or 0)
-            # 目标端完成时间晚于触发时间，说明本次同步已完成
-            if trigger_ts and last_finish_ts >= trigger_ts:
-                finished.append((name, record))
+            # 扫描完成时间需晚于触发时间，说明本次扫描已结束
+            if not trigger_ts or last_finish_ts < trigger_ts:
+                continue
+
+            iso_name = str(record.get("iso_name") or "")
+            iso_size = int(record.get("iso_size") or 0)
+            if not iso_name:
+                # 旧记录缺少文件名，无法校验，直接清理避免长期滞留
                 pending.pop(name, None)
+                logger.info(f"BDMV自动打包ISO：CD2 记录缺少 ISO 文件名，跳过校验 {name}")
+                continue
+
+            # 校验云端文件是否已完整上传
+            cloud_size = self.__get_cd2_cloud_file_size(iso_name)
+            if cloud_size is None:
+                # 文件尚未出现在云端，继续等待
+                continue
+            if iso_size and cloud_size != iso_size:
+                # 文件存在但大小不一致，说明仍在上传中
+                logger.info(
+                    f"BDMV自动打包ISO：云端文件仍在上传 {iso_name} "
+                    f"({cloud_size}/{iso_size} 字节)"
+                )
+                continue
+
+            finished.append((name, record))
+            pending.pop(name, None)
 
         if not finished:
             return
 
         self.save_data(CD2_PENDING_DATA_KEY, pending)
 
-        for name, record in finished:
-            finish_time = datetime.fromtimestamp(last_finish_ts).strftime("%Y-%m-%d %H:%M:%S")
+        for name, _record in finished:
+            finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"BDMV自动打包ISO：CD2 备份已完成 {name} - {finish_time}")
             if not self._notify:
                 continue
@@ -1655,13 +1752,22 @@ class BdmvToIso(_PluginBase):
         if site_name:
             lines.append(f"▎站点：{site_name}")
 
+        # 输出 ISO 文件名与大小（用于 CD2 上传完成校验）
+        iso_name = str(out_iso).rstrip("/").split("/")[-1] if out_iso else ""
+        iso_size = 0
+        if job.get("out_iso_bytes_disk"):
+            try:
+                iso_size = int(float(job["out_iso_bytes_disk"]))
+            except (TypeError, ValueError):
+                iso_size = 0
+
         # 打包完成后触发 CD2 备份同步
         if self._cd2_enabled:
             lines.append("")
             lines.append("☁️ 云端同步")
             if self.__trigger_cd2_backup():
-                # 记录触发时间，供后续检测同步是否完成
-                self.__record_cd2_trigger(name)
+                # 记录触发时间与 ISO 信息，供后续校验上传是否完成
+                self.__record_cd2_trigger(name, iso_name=iso_name, iso_size=iso_size)
                 lines.append("　　✅ 已触发 CD2 备份")
                 lines.append(f"　　📂 {self._cd2_source_path}")
             else:
@@ -1669,7 +1775,6 @@ class BdmvToIso(_PluginBase):
 
         if out_iso:
             # 服务端返回的是其容器内路径，转换为 CD2 侧可读路径
-            iso_name = str(out_iso).rstrip("/").split("/")[-1]
             if self._cd2_enabled and self._cd2_source_path:
                 display_path = f"{self._cd2_source_path}/{iso_name}"
             else:
