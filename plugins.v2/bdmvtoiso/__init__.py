@@ -54,7 +54,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1422,7 +1422,9 @@ class BdmvToIso(_PluginBase):
         """从 UHD原盘自动下载 插件的记录中查询资源目录对应的条目。
 
         优先精确匹配，失败时按归一化标题模糊匹配，
-        以兼容站点列表页与 QB 任务名之间的标点差异。
+        以兼容站点列表页与 QB 任务名之间的标点差异；
+        再退化为包含匹配，以兼容 QB 任务名带中文前缀
+        （如「93航班.United.93.2006...」）而记录标题仅含英文的情形。
 
         :param name: 资源目录名（QB 任务名）
         :return: 记录字典；未找到返回空字典
@@ -1436,19 +1438,39 @@ class BdmvToIso(_PluginBase):
             return {}
 
         target = self.__normalize_title(name)
+        if not target:
+            return {}
+
+        # 第一轮：精确匹配与归一化全等匹配
         for record in processed_map.values():
             if not isinstance(record, dict):
                 continue
             title = str(record.get("title") or "")
             if not title:
                 continue
-            # 精确匹配优先
             if title == name:
                 return record
-            # 归一化模糊匹配
-            if target and self.__normalize_title(title) == target:
+            if self.__normalize_title(title) == target:
                 return record
-        return {}
+
+        # 第二轮：包含匹配（记录标题为资源目录名的子串）
+        # 取最长匹配，避免短标题误命中
+        best_record: Dict[str, Any] = {}
+        best_len = 0
+        for record in processed_map.values():
+            if not isinstance(record, dict):
+                continue
+            title = str(record.get("title") or "")
+            if not title:
+                continue
+            norm_title = self.__normalize_title(title)
+            if len(norm_title) < 8:
+                # 过短的标题容易误匹配，跳过
+                continue
+            if norm_title in target and len(norm_title) > best_len:
+                best_record = record
+                best_len = len(norm_title)
+        return best_record
 
     def __get_cn_title(self, name: str) -> str:
         """查询资源目录对应的中文标题。
