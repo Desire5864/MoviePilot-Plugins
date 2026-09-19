@@ -4,7 +4,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from lxml import etree
 
+from app.chain.media import MediaChain
 from app.core.config import settings
+from app.core.metainfo import MetaInfo
 from app.db.site_oper import SiteOper
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
@@ -16,6 +18,8 @@ from app.utils.http import RequestUtils
 PROCESSED_DATA_KEY = "uhd_processed_map"
 # 已处理记录最多保留条数
 PROCESSED_LIMIT = 500
+# 简介迁移标记（旧版站点简介 → TMDB 简介）
+INTRO_MIGRATED_KEY = "intro_migrated_to_tmdb"
 # 自动下载任务标签
 DOWNLOAD_TAG = "UHD自动下载"
 
@@ -34,7 +38,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.5.0"
+    plugin_version = "2.6.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -84,6 +88,8 @@ class UhdBlurayAutoDownload(_PluginBase):
     _last_items: List[Dict[str, Any]] = []
     # 详情页副标题缓存：种子ID -> 完整副标题
     _subtitle_cache: Dict[str, str] = {}
+    # 详情页简介缓存：种子ID -> 清洗后的简介
+    _intro_cache: Dict[str, str] = {}
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -104,6 +110,7 @@ class UhdBlurayAutoDownload(_PluginBase):
         self._last_error = ""
         self._last_items = []
         self._subtitle_cache = {}
+        self._intro_cache = {}
 
         if not config:
             return
@@ -498,7 +505,10 @@ class UhdBlurayAutoDownload(_PluginBase):
             except Exception as err:
                 logger.error(f"UHD原盘自动下载：处理站点 {site_conf.get('name')} 失败，{err}")
 
-        # 补齐历史记录中缺失的副标题（兼容旧版本记录）
+        # 一次性迁移：清空旧版站点简介，改用 TMDB 简介重新抓取
+        self.__migrate_intro_to_tmdb(processed_map)
+
+        # 补齐历史记录中缺失的副标题与简介（兼容旧版本记录）
         self.__fill_missing_subtitles(processed_map)
 
         self._last_items = all_items
@@ -516,15 +526,23 @@ class UhdBlurayAutoDownload(_PluginBase):
             for item in downloaded_items[:20]:
                 subtitle = item.get("subtitle") or ""
                 title = item.get("title") or ""
+                intro = item.get("intro") or ""
                 size = item.get("size") or ""
                 site = item.get("site") or ""
-                # 首行：站点名 + 大小
-                head = f"▎【{site}】{size}" if site else f"▎{size}"
-                lines.append(head)
-                # 次行：中文副标题，缺失时回退到主标题
-                lines.append(f"▎📀 {subtitle or title}")
+                # 中文标题（副标题，缺失时回退到种子标题）
+                lines.append(f"▎中文标题：{subtitle or title}")
+                # 种子标题
                 if subtitle:
-                    lines.append(f"▎　　{title}")
+                    lines.append(f"▎种子标题：{title}")
+                # 站点
+                if site:
+                    lines.append(f"▎站点：{site}")
+                # 体积
+                if size:
+                    lines.append(f"▎体积：{size}")
+                # 影片简介（TMDB）
+                if intro:
+                    lines.append(f"▎简介：{intro}")
                 lines.append("")
             self.post_message(
                 mtype=NotificationType.SiteMessage,
@@ -532,10 +550,34 @@ class UhdBlurayAutoDownload(_PluginBase):
                 text="\n".join(lines).rstrip(),
             )
 
-    def __fill_missing_subtitles(self, processed_map: Dict[str, Dict[str, Any]]) -> None:
-        """补齐历史记录中缺失的副标题。
+    def __migrate_intro_to_tmdb(self, processed_map: Dict[str, Dict[str, Any]]) -> None:
+        """一次性迁移：清空旧版站点简介，改用 TMDB 简介重新抓取。
 
-        旧版本记录只保存了 title 与 cn_title，缺少完整副标题。
+        旧版本记录的 intro 来自站点详情页的"简介"字段（多为制作说明），
+        此处清空这些记录，交由 __fill_missing_subtitles 用 TMDB 重新补齐。
+        通过迁移标记确保只执行一次。
+
+        :param processed_map: 已处理记录字典
+        """
+        if self.get_data(INTRO_MIGRATED_KEY):
+            return
+
+        cleared = 0
+        for record in processed_map.values():
+            if not isinstance(record, dict):
+                continue
+            if record.get("intro"):
+                record["intro"] = ""
+                cleared += 1
+
+        self.save_data(INTRO_MIGRATED_KEY, True)
+        if cleared:
+            logger.info(f"UHD原盘自动下载：已清空 {cleared} 条旧版站点简介，将改用 TMDB 简介")
+
+    def __fill_missing_subtitles(self, processed_map: Dict[str, Dict[str, Any]]) -> None:
+        """补齐历史记录中缺失的副标题与简介。
+
+        旧版本记录只保存了 title 与 cn_title，缺少完整副标题与简介。
         此处按记录 key 中的域名与种子 ID 从站点详情页补全，
         每次最多补全若干条，避免请求过多。
 
@@ -562,23 +604,35 @@ class UhdBlurayAutoDownload(_PluginBase):
             if not record.get("site"):
                 record["site"] = site.get("name") or ""
 
-            if record.get("subtitle"):
+            # 副标题与简介都齐全时跳过
+            if record.get("subtitle") and record.get("intro"):
                 continue
 
-            subtitle = self.__fetch_detail_subtitle(site, torrent_id)
-            if not subtitle:
-                continue
+            if not record.get("subtitle"):
+                subtitle = self.__fetch_detail_subtitle(site, torrent_id)
+                if subtitle:
+                    record["subtitle"] = subtitle
+                    if not record.get("cn_title"):
+                        record["cn_title"] = self.__extract_cn_title(subtitle)
+                    filled += 1
+                    logger.info(
+                        f"UHD原盘自动下载：已补齐副标题 {domain}:{torrent_id} - {subtitle[:50]}"
+                    )
 
-            record["subtitle"] = subtitle
-            if not record.get("cn_title"):
-                record["cn_title"] = self.__extract_cn_title(subtitle)
-            filled += 1
-            logger.info(
-                f"UHD原盘自动下载：已补齐副标题 {domain}:{torrent_id} - {subtitle[:50]}"
-            )
+            if not record.get("intro"):
+                intro = self.__fetch_tmdb_intro(
+                    str(record.get("title") or ""),
+                    str(record.get("subtitle") or ""),
+                )
+                if intro:
+                    record["intro"] = intro
+                    filled += 1
+                    logger.info(
+                        f"UHD原盘自动下载：已补齐简介 {domain}:{torrent_id} - {intro[:50]}"
+                    )
 
         if filled:
-            logger.info(f"UHD原盘自动下载：本次共补齐 {filled} 条副标题")
+            logger.info(f"UHD原盘自动下载：本次共补齐 {filled} 条副标题/简介")
 
     def __fetch_detail_subtitle(self, site: Dict[str, Any], torrent_id: str) -> str:
         """从种子详情页获取完整副标题。
@@ -637,6 +691,66 @@ class UhdBlurayAutoDownload(_PluginBase):
         logger.warning(f"UHD原盘自动下载：详情页副标题获取失败，已重试 {detail_url}")
         return ""
 
+    def __fetch_tmdb_intro(self, title: str, subtitle: str = "") -> str:
+        """通过 TMDB 识别媒体并获取影片简介。
+
+        使用种子标题与副标题识别媒体，取 TMDB 的 overview 作为简介。
+        识别失败或 TMDB 无简介时返回空字符串。
+
+        :param title: 种子标题
+        :param subtitle: 站点副标题（含中文名，有助于识别）
+        :return: TMDB 影片简介；获取失败返回空字符串
+        """
+        if not title and not subtitle:
+            return ""
+        # 命中缓存直接返回，避免重复识别
+        cache_key = f"{title}|{subtitle}"
+        if cache_key in self._intro_cache:
+            return self._intro_cache[cache_key]
+
+        try:
+            meta = MetaInfo(title=title, subtitle=subtitle)
+            mediainfo = MediaChain().recognize_media(meta=meta)
+        except Exception as err:
+            logger.error(f"UHD原盘自动下载：TMDB 识别失败 {title[:60]}，{err}")
+            return ""
+
+        if not mediainfo:
+            logger.warning(f"UHD原盘自动下载：TMDB 未识别到媒体 {title[:60]}")
+            return ""
+
+        intro = self.__clean_intro(mediainfo.overview or "")
+        if intro:
+            self._intro_cache[cache_key] = intro
+            logger.info(
+                f"UHD原盘自动下载：TMDB 简介获取成功 {mediainfo.title} - {intro[:40]}"
+            )
+        return intro
+
+    @staticmethod
+    def __clean_intro(text: str, max_length: int = 500) -> str:
+        """清洗简介文本：去除 BBCode、HTML 残留与多余空白，并按长度截断。
+
+        :param text: 原始简介文本
+        :param max_length: 最大保留字符数
+        :return: 清洗后的简介
+        """
+        if not text:
+            return ""
+        # 去除 BBCode 标记（如 [quote]、[color=Red]、[/b] 等）
+        cleaned = re.sub(r'\[/?[a-zA-Z][^\]]*\]', '', text)
+        # 去除 HTML 标签残留
+        cleaned = re.sub(r'<[^>]+>', '', cleaned)
+        # 统一不可见字符为空格
+        cleaned = cleaned.replace('\xa0', ' ').replace('\u3000', ' ')
+        # 合并连续空白（保留换行结构）
+        cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        cleaned = cleaned.strip()
+        if len(cleaned) > max_length:
+            cleaned = cleaned[:max_length].rstrip() + "…"
+        return cleaned
+
     def __process_site(self, domain: str, site_conf: Dict[str, Any], downloader_obj: Any,
                        processed_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """处理单个站点的 UHD BluRay 列表。
@@ -687,6 +801,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                 "site": site_name,
                 "title": title,
                 "subtitle": torrent.get("subtitle") or "",
+                "intro": "",
                 "size": torrent.get("size") or "",
                 "progress": progress,
                 "action": "",
@@ -698,6 +813,11 @@ class UhdBlurayAutoDownload(_PluginBase):
             if detail_subtitle:
                 item["subtitle"] = detail_subtitle
                 torrent["subtitle"] = detail_subtitle
+
+            # 从 TMDB 获取影片简介
+            tmdb_intro = self.__fetch_tmdb_intro(title, item.get("subtitle") or "")
+            if tmdb_intro:
+                item["intro"] = tmdb_intro
 
             # 站点进度判断：
             # "-"（我堡）或 "--"（彩虹岛）表示未下载，需要推送；
@@ -744,6 +864,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                 processed_map[record_key] = {
                     "title": title,
                     "subtitle": item.get("subtitle") or "",
+                    "intro": item.get("intro") or "",
                     "cn_title": self.__extract_cn_title(item.get("subtitle") or ""),
                     "site": site_name,
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
