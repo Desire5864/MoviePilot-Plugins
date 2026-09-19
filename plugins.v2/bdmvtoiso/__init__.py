@@ -54,7 +54,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.7.3"
+    plugin_version = "1.7.4"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1366,6 +1366,56 @@ class BdmvToIso(_PluginBase):
                 pending.pop(key, None)
         self.save_data(CD2_PENDING_DATA_KEY, pending)
 
+    def __get_cd2_upload_progress(self, iso_name: str) -> Optional[Dict[str, Any]]:
+        """查询指定文件在 CD2 中的上传任务状态。
+
+        CD2 的 BackupStatus 不提供上传进度，但可通过 GetUploadFileList 查询
+        上传任务列表，其中包含目标路径、总大小、已传输字节数与状态。
+
+        :param iso_name: ISO 文件名
+        :return: 上传任务信息字典；无匹配任务返回 None
+        """
+        if not iso_name:
+            return None
+
+        client = self.__get_cd2_client()
+        if client is None:
+            return None
+
+        try:
+            from clouddrive2_client.proto import clouddrive_pb2 as pb
+
+            metadata = client._create_authorized_metadata()
+            # 用文件名作为过滤关键词，减少返回条数
+            request = pb.GetUploadFileListRequest(
+                getAll=False,
+                itemsPerPage=50,
+                pageNumber=0,
+                filter=iso_name,
+            )
+            result = client.stub.GetUploadFileList(request, metadata=metadata)
+        except Exception as err:
+            if self.__is_cd2_auth_error(err):
+                logger.warning(f"BDMV自动打包ISO：查询上传任务认证失效：{err}")
+                self.__close_cd2_client()
+            else:
+                logger.warning(f"BDMV自动打包ISO：查询上传任务失败：{err}")
+            return None
+
+        for item in result.uploadFiles:
+            # 目标路径需以该 ISO 文件名结尾，避免同名前缀误匹配
+            if not str(item.destPath or "").endswith(iso_name):
+                continue
+            return {
+                "size": int(item.size or 0),
+                "transfered": int(item.transferedBytes or 0),
+                "status": str(item.status or ""),
+                "status_enum": int(item.statusEnum or 0),
+                "operator_type": int(item.operatorType or 0),
+            }
+
+        return None
+
     def __get_cd2_cloud_file_size(self, iso_name: str) -> Optional[int]:
         """查询云端目标目录中指定文件的大小。
 
@@ -1410,8 +1460,11 @@ class BdmvToIso(_PluginBase):
 
         CD2 的 BackupStatus 只提供 lastFinishTime，其语义为「扫描完成时间」，
         并非「上传完成时间」，扫描结束后文件仍可能长时间上传中。
-        因此这里改为校验云端目标目录中 ISO 文件是否已存在且大小与本地一致，
-        确认上传完成后才发送「同步完成」通知。
+
+        判断顺序：
+        1. 通过 GetUploadFileList 查询该 ISO 的上传任务，仍在传输中则继续等待；
+        2. 上传任务已结束（或查询不到）时，校验云端目标目录中文件是否已存在
+           且大小与本地一致，确认后才发送「同步完成」通知。
         """
         if not self._cd2_enabled or not self._cd2_source_path:
             return
@@ -1448,7 +1501,28 @@ class BdmvToIso(_PluginBase):
                 logger.info(f"BDMV自动打包ISO：CD2 记录缺少 ISO 文件名，跳过校验 {name}")
                 continue
 
-            # 校验云端文件是否已完整上传
+            # 优先查询上传任务状态：任务仍在传输中则继续等待
+            progress = self.__get_cd2_upload_progress(iso_name)
+            if progress is not None:
+                status_enum = int(progress.get("status_enum") or 0)
+                transfered = int(progress.get("transfered") or 0)
+                total = int(progress.get("size") or 0)
+                # 3=Transfer 传输中，0/1=预处理，4=暂停，7=排队
+                if status_enum in (0, 1, 3, 4, 7):
+                    percent = (transfered / total * 100) if total else 0
+                    logger.info(
+                        f"BDMV自动打包ISO：云端上传进行中 {iso_name} "
+                        f"({transfered}/{total} 字节, {percent:.1f}%)"
+                    )
+                    continue
+                # 9/10=错误，保留记录等待下次重试或人工处理
+                if status_enum in (9, 10):
+                    logger.warning(
+                        f"BDMV自动打包ISO：云端上传出错 {iso_name} - {progress.get('status')}"
+                    )
+                    continue
+
+            # 上传任务已结束（或查询不到），再校验云端文件是否已完整上传
             cloud_size = self.__get_cd2_cloud_file_size(iso_name)
             if cloud_size is None:
                 # 文件尚未出现在云端，继续等待
