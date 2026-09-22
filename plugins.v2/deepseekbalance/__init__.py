@@ -12,6 +12,8 @@ DEEPSEEK_BALANCE_API = "https://api.deepseek.com/user/balance"
 BALANCE_HISTORY_KEY = "balance_history"
 # 余额历史最多保留条数
 BALANCE_HISTORY_LIMIT = 200
+# 告警状态持久化键名（用于避免重复通知）
+ALERT_STATE_KEY = "alert_state"
 
 
 class DeepSeekBalance(_PluginBase):
@@ -28,7 +30,7 @@ class DeepSeekBalance(_PluginBase):
     # 插件图标
     plugin_icon = "deepseek.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -50,6 +52,8 @@ class DeepSeekBalance(_PluginBase):
     _interval_unit: str = "hours"
     _threshold: float = 10.0
     _proxy: bool = False
+    # 详情页消耗明细展示天数（0 表示展示全部）
+    _display_days: int = 30
     # 最近一次余额查询结果
     _last_balance: Optional[Dict[str, Any]] = None
     # 最近一次查询时间
@@ -73,9 +77,12 @@ class DeepSeekBalance(_PluginBase):
         self._interval_unit = "hours"
         self._threshold = 10.0
         self._proxy = False
+        self._display_days = 30
         self._last_balance = None
         self._last_check_time = None
         self._last_error = ""
+        # 最近一次告警状态：True 表示当前处于告警中
+        self._alerting = False
 
         if not config:
             return
@@ -91,9 +98,19 @@ class DeepSeekBalance(_PluginBase):
         interval_unit = str(config.get("interval_unit") or "hours")
         self._interval_unit = interval_unit if interval_unit in ("minutes", "hours") else "hours"
         try:
-            self._threshold = max(0.0, float(config.get("threshold") or 10.0))
+            raw_threshold = config.get("threshold")
+            self._threshold = max(0.0, float(raw_threshold)) if raw_threshold not in (None, "") else 10.0
         except (TypeError, ValueError):
             self._threshold = 10.0
+        try:
+            raw_display_days = config.get("display_days")
+            self._display_days = max(0, int(raw_display_days)) if raw_display_days not in (None, "") else 30
+        except (TypeError, ValueError):
+            self._display_days = 30
+
+        # 恢复告警状态，避免重启后重复通知
+        alert_state = self.get_data(ALERT_STATE_KEY) or {}
+        self._alerting = bool(alert_state.get("alerting"))
 
         # 立即执行一次：执行后自动关闭开关
         if config.get("run_once"):
@@ -108,6 +125,7 @@ class DeepSeekBalance(_PluginBase):
                     "interval_value": self._interval_value,
                     "interval_unit": self._interval_unit,
                     "threshold": self._threshold,
+                    "display_days": self._display_days,
                     "run_once": False,
                 }
             )
@@ -262,6 +280,21 @@ class DeepSeekBalance(_PluginBase):
                                 "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "display_days",
+                                            "label": "明细显示天数",
+                                            "placeholder": "默认30，0表示显示全部",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "run_once",
@@ -304,6 +337,7 @@ class DeepSeekBalance(_PluginBase):
             "interval_value": 6,
             "interval_unit": "hours",
             "threshold": 10.0,
+            "display_days": 30,
             "run_once": False,
         }
 
@@ -331,6 +365,7 @@ class DeepSeekBalance(_PluginBase):
 
         # 配置概览
         interval_unit_text = "分钟" if self._interval_unit == "minutes" else "小时"
+        display_days_text = "全部" if self._display_days <= 0 else f"{self._display_days} 天"
         page_content.append(
             {
                 "component": "VRow",
@@ -346,6 +381,7 @@ class DeepSeekBalance(_PluginBase):
                                     "variant": "tonal",
                                     "text": f"检查间隔：{self._interval_value} {interval_unit_text}；"
                                             f"告警阈值：{self._threshold}；"
+                                            f"明细显示：{display_days_text}；"
                                             f"最近检查：{self._last_check_time or '尚未检查'}",
                                 },
                             }
@@ -515,6 +551,9 @@ class DeepSeekBalance(_PluginBase):
 
             # 按日统计表格（倒序，最新在前）
             daily_stats = self.__build_daily_stats(history)
+            # 按配置的显示天数过滤（0 表示显示全部）
+            if self._display_days > 0:
+                daily_stats = daily_stats[: self._display_days]
             rows = []
             for stat in daily_stats:
                 consumed = stat.get("consumed") or 0
@@ -636,19 +675,28 @@ class DeepSeekBalance(_PluginBase):
 
         logger.info(f"DeepSeek余额监控：当前余额 {'；'.join(summary_lines)}")
 
-        # 余额不足或低于阈值时通知
-        if self._notify and (low_balance or not is_available):
+        # 余额不足或低于阈值时通知（同一轮告警只通知一次，恢复后再次触发才重新通知）
+        alerting = low_balance or not is_available
+        if self._notify and alerting and not self._alerting:
             title = "【DeepSeek余额不足】" if not is_available else "【DeepSeek余额告警】"
             text = "\n".join(summary_lines)
             if not is_available:
                 text += "\n账户余额不足，已无法调用 API，请及时充值。"
             else:
                 text += f"\n当前余额已低于告警阈值 {self._threshold}，请及时充值。"
+            text += "\n（本次告警仅通知一次，余额恢复后才会重新提醒）"
             self.post_message(
                 mtype=NotificationType.SiteMessage,
                 title=title,
                 text=text,
             )
+
+        # 记录告警状态变化
+        if alerting != self._alerting:
+            self._alerting = alerting
+            self.save_data(ALERT_STATE_KEY, {"alerting": alerting})
+            if not alerting:
+                logger.info("DeepSeek余额监控：余额已恢复至阈值以上，告警状态重置")
 
     def __record_balance_history(self, balance_data: Dict[str, Any]) -> None:
         """记录余额历史，用于展示消耗明细。

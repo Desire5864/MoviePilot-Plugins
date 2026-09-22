@@ -11,6 +11,12 @@ from app.utils.http import RequestUtils
 
 # 完成记录持久化键名
 COMPLETED_DATA_KEY = "hr_completed_map"
+# HR 统计阈值：站点规则为「HR 种子下载大于等于 50% 时需完成规定保种时间」
+HR_PROGRESS_THRESHOLD = 0.5
+# UHD原盘自动下载 插件ID（用于读取副标题与种子标题）
+UHD_PLUGIN_ID = "UhdBlurayAutoDownload"
+# UHD原盘自动下载 插件的已处理记录键名
+UHD_PROCESSED_DATA_KEY = "uhd_processed_map"
 
 
 class ChdbitsHrMonitor(_PluginBase):
@@ -27,7 +33,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.8.6"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -54,6 +60,8 @@ class ChdbitsHrMonitor(_PluginBase):
     _last_error: str = ""
     # 最近一次站点 HR 任务
     _last_hr_tasks: List[Dict[str, Any]] = []
+    # 上次站点 H&R 任务数，用于检测骤降异常
+    _last_hr_count: int = 0
     # 最近一次 QB 与站点比对明细
     _last_compare_items: List[Dict[str, Any]] = []
 
@@ -77,6 +85,7 @@ class ChdbitsHrMonitor(_PluginBase):
         self._last_check_time = None
         self._last_error = ""
         self._last_hr_tasks = []
+        self._last_hr_count = 0
         self._last_compare_items = []
 
         if not config:
@@ -399,7 +408,8 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-            rows = []
+            # 使用卡片式布局，避免 VTable 单元格强制 nowrap 导致标题截断
+            card_items = []
             for task in self._last_hr_tasks:
                 # 计算做种进度与达标状态
                 cycle_hours = self.__parse_hr_cycle_hours(task.get("hr_cycle") or "")
@@ -409,24 +419,83 @@ class ChdbitsHrMonitor(_PluginBase):
                     remain_hours = max(0.0, cycle_hours - seeding_hours)
                     progress_text = f"{seeding_hours:.1f}h / {cycle_hours:.0f}h（{progress:.1f}%）"
                     if seeding_hours >= cycle_hours:
-                        status_text = "已达标"
+                        status_text = "✅ 已达标"
                     else:
-                        status_text = f"未达标，还差 {remain_hours:.1f}h"
+                        status_text = f"⏳ 未达标，还差 {remain_hours:.1f}h"
                 else:
                     progress_text = "-"
                     status_text = "-"
 
-                rows.append(
+                # 从 UHD原盘自动下载 插件读取副标题与种子标题，
+                # 记录缺失时回退到站点 H&R 页面自带的中文副标题
+                site_title = str(task.get("title") or "")
+                subtitle, seed_title = self.__get_uhd_titles(site_title)
+                if not subtitle:
+                    subtitle = str(task.get("subtitle") or "").strip()
+                # 记录缺失时，按站点标题在 QB 任务中反查实际任务名
+                if not seed_title:
+                    seed_title = self.__find_qb_name(site_title)
+
+                card_items.append(
                     {
-                        "component": "tr",
+                        "component": "div",
+                        "props": {
+                            "style": "padding: 10px 12px; margin-bottom: 8px; "
+                                     "border-radius: 10px; "
+                                     "background: rgba(var(--v-theme-surface-variant), 0.18); "
+                                     "backdrop-filter: blur(10px) saturate(150%); "
+                                     "-webkit-backdrop-filter: blur(10px) saturate(150%); "
+                                     "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
+                                     "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);",
+                        },
                         "content": [
-                            {"component": "td", "text": str(task.get("title") or "")[:60]},
-                            {"component": "td", "text": str(task.get("hr_percent") or "")},
-                            {"component": "td", "text": str(task.get("remain_time") or "")},
-                            {"component": "td", "text": str(task.get("hr_cycle") or "")},
-                            {"component": "td", "text": str(task.get("seeding_time") or "")},
-                            {"component": "td", "text": progress_text},
-                            {"component": "td", "text": status_text},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
+                                },
+                                "text": subtitle or site_title,
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
+                                },
+                                "text": f"站点标题：{site_title}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
+                                },
+                                "text": f"种子标题：{seed_title or site_title}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                },
+                                "text": f"H&R百分比：{task.get('hr_percent') or '-'}　|　"
+                                        f"剩余时间：{task.get('remain_time') or '-'}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
+                                },
+                                "text": f"H&R周期：{task.get('hr_cycle') or '-'}　|　"
+                                        f"做种时间：{task.get('seeding_time') or '-'}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
+                                },
+                                "text": f"做种进度：{progress_text}　|　{status_text}",
+                            },
                         ],
                     }
                 )
@@ -438,35 +507,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         {
                             "component": "VCol",
                             "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "标题"},
-                                                        {"component": "th", "text": "H&R百分比"},
-                                                        {"component": "th", "text": "剩余时间"},
-                                                        {"component": "th", "text": "H&R周期"},
-                                                        {"component": "th", "text": "做种时间"},
-                                                        {"component": "th", "text": "做种进度"},
-                                                        {"component": "th", "text": "达标状态"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": rows,
-                                        },
-                                    ],
-                                }
-                            ],
+                            "content": card_items,
                         }
                     ],
                 }
@@ -476,19 +517,60 @@ class ChdbitsHrMonitor(_PluginBase):
         completed_map: Dict[str, Dict[str, Any]] = self.get_data(COMPLETED_DATA_KEY) or {}
         if completed_map:
             now_ts = datetime.now().timestamp()
-            rows = []
+            card_items = []
             for torrent_hash, record in completed_map.items():
                 completed_at = record.get("completed_at") or 0
                 elapsed_hours = (now_ts - completed_at) / 3600 if completed_at else 0
                 remain_hours = max(0, self._delete_delay_hours - elapsed_hours)
-                rows.append(
+                # 从 UHD原盘自动下载 插件读取副标题与种子标题
+                task_name = str(record.get("name") or "")
+                subtitle, seed_title = self.__get_uhd_titles(task_name)
+                card_items.append(
                     {
-                        "component": "tr",
+                        "component": "div",
+                        "props": {
+                            "style": "padding: 10px 12px; margin-bottom: 8px; "
+                                     "border-radius: 10px; "
+                                     "background: rgba(var(--v-theme-surface-variant), 0.18); "
+                                     "backdrop-filter: blur(10px) saturate(150%); "
+                                     "-webkit-backdrop-filter: blur(10px) saturate(150%); "
+                                     "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
+                                     "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);",
+                        },
                         "content": [
-                            {"component": "td", "text": str(record.get("name") or "")[:60]},
-                            {"component": "td", "text": str(record.get("completed_time") or "")},
-                            {"component": "td", "text": f"{elapsed_hours:.1f} 小时"},
-                            {"component": "td", "text": f"{remain_hours:.1f} 小时"},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
+                                },
+                                "text": subtitle or task_name,
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
+                                },
+                                "text": f"QB任务标题：{task_name}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
+                                },
+                                "text": f"种子标题：{seed_title or task_name}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                },
+                                "text": f"完成时间：{record.get('completed_time') or '-'}　|　"
+                                        f"已等待：{elapsed_hours:.1f} 小时　|　"
+                                        f"剩余：{remain_hours:.1f} 小时",
+                            },
                         ],
                     }
                 )
@@ -522,32 +604,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         {
                             "component": "VCol",
                             "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "标题"},
-                                                        {"component": "th", "text": "完成时间"},
-                                                        {"component": "th", "text": "已等待"},
-                                                        {"component": "th", "text": "剩余"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": rows,
-                                        },
-                                    ],
-                                }
-                            ],
+                            "content": card_items,
                         }
                     ],
                 }
@@ -578,18 +635,60 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-            rows = []
+            card_items = []
             for item in self._last_compare_items:
-                rows.append(
+                # 从 UHD原盘自动下载 插件读取副标题，
+                # 记录缺失时回退到站点 H&R 任务的中文副标题
+                task_name = str(item.get("name") or "")
+                subtitle, _seed_title = self.__get_uhd_titles(task_name)
+                if not subtitle:
+                    subtitle = self.__find_hr_subtitle(task_name)
+                card_items.append(
                     {
-                        "component": "tr",
+                        "component": "div",
+                        "props": {
+                            "style": "padding: 10px 12px; margin-bottom: 8px; "
+                                     "border-radius: 10px; "
+                                     "background: rgba(var(--v-theme-surface-variant), 0.18); "
+                                     "backdrop-filter: blur(10px) saturate(150%); "
+                                     "-webkit-backdrop-filter: blur(10px) saturate(150%); "
+                                     "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
+                                     "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);",
+                        },
                         "content": [
-                            {"component": "td", "text": str(item.get("name") or "")[:60]},
-                            {"component": "td", "text": str(item.get("status") or "")},
-                            {"component": "td", "text": str(item.get("hr_cycle") or "")},
-                            {"component": "td", "text": str(item.get("seeding_time") or "")},
-                            {"component": "td", "text": str(item.get("remain_time") or "")},
-                            {"component": "td", "text": str(item.get("detail") or "")},
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
+                                },
+                                "text": subtitle or task_name,
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "white-space: normal; word-break: break-all; "
+                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
+                                },
+                                "text": f"种子标题：{task_name}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                },
+                                "text": f"站点状态：{item.get('status') or '-'}　|　"
+                                        f"H&R周期：{item.get('hr_cycle') or '-'}　|　"
+                                        f"做种时间：{item.get('seeding_time') or '-'}",
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
+                                },
+                                "text": f"剩余做种时间：{item.get('remain_time') or '-'}　|　"
+                                        f"说明：{item.get('detail') or '-'}",
+                            },
                         ],
                     }
                 )
@@ -601,34 +700,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         {
                             "component": "VCol",
                             "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "QB任务标题"},
-                                                        {"component": "th", "text": "站点状态"},
-                                                        {"component": "th", "text": "H&R周期"},
-                                                        {"component": "th", "text": "做种时间"},
-                                                        {"component": "th", "text": "剩余做种时间"},
-                                                        {"component": "th", "text": "说明"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": rows,
-                                        },
-                                    ],
-                                }
-                            ],
+                            "content": card_items,
                         }
                     ],
                 }
@@ -680,6 +752,25 @@ class ChdbitsHrMonitor(_PluginBase):
         self._last_error = ""
         self._last_hr_tasks = hr_tasks
         logger.info(f"彩虹岛HR监控：站点未完成 H&R 任务 {len(hr_tasks)} 个")
+
+        # 安全校验：站点任务数相比上次骤降时，视为页面异常，跳过本次比对。
+        # 站点 H&R 任务通常只会缓慢减少，若一次减少超过一半（且上次有任务），
+        # 很可能是页面解析不完整或 cookie 失效，此时比对会误判为「已完成」。
+        prev_count = self._last_hr_count
+        self._last_hr_count = len(hr_tasks)
+        if prev_count > 0 and len(hr_tasks) < prev_count / 2:
+            self._last_error = (
+                f"站点 H&R 任务数骤降（{prev_count} → {len(hr_tasks)}），"
+                f"疑似页面异常，已跳过本次比对"
+            )
+            logger.warning(f"彩虹岛HR监控：{self._last_error}")
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.SiteMessage,
+                    title="【彩虹岛HR监控】",
+                    text=f"{self._last_error}，为避免误删任务已跳过本次比对。",
+                )
+            return
 
         # 2. 获取本地 QB 任务
         downloader_obj = self.__get_downloader()
@@ -752,6 +843,29 @@ class ChdbitsHrMonitor(_PluginBase):
             if not torrent_hash:
                 continue
             title = torrent.get("name") or ""
+
+            # 安全校验：仅处理下载进度达到 HR 统计阈值的任务。
+            # 站点规则：HR 种子下载大于等于 50% 时才需要完成规定保种时间，
+            # 低于该阈值的任务不会产生 H&R 记录，若站点页面异常导致匹配失败，
+            # 会被误判为「已完成」而删除，因此这里直接跳过。
+            try:
+                progress = float(torrent.get("progress") or 0)
+            except (TypeError, ValueError):
+                progress = 0
+            if progress < HR_PROGRESS_THRESHOLD:
+                completed_map.pop(torrent_hash, None)
+                compare_items.append(
+                    {
+                        "name": title,
+                        "status": "未达阈值",
+                        "seeding_time": "",
+                        "remain_time": "",
+                        "hr_cycle": "",
+                        "detail": f"下载进度 {progress * 100:.1f}%，未达 HR 统计阈值（50%），跳过比对",
+                    }
+                )
+                continue
+
             # 查找对应的站点任务，获取做种时间与 H&R 周期
             site_task = self.__find_site_task(title, site_tasks)
             seeding_time = str(site_task.get("seeding_time") or "") if site_task else ""
@@ -774,15 +888,39 @@ class ChdbitsHrMonitor(_PluginBase):
                 )
                 continue
 
-            # 站点已无该任务，视为已完成
+            # 站点已无该任务，视为已完成。
+            # 安全校验：需连续两次检查都判定为「站点无此任务」才开始计时，
+            # 避免站点页面偶发解析不完整导致误判。
             record = completed_map.get(torrent_hash)
             if not record:
-                # 首次发现完成，记录时间
+                # 首次发现，先标记待确认，不立即计时
                 completed_map[torrent_hash] = {
                     "name": title,
-                    "completed_at": now_ts,
-                    "completed_time": now_str,
+                    "pending_confirm": True,
+                    "first_seen_at": now_ts,
+                    "first_seen_time": now_str,
                 }
+                logger.info(
+                    f"彩虹岛HR监控：站点未找到该任务，待下次确认 {title[:60]}"
+                )
+                compare_items.append(
+                    {
+                        "name": title,
+                        "status": "待确认",
+                        "seeding_time": "",
+                        "remain_time": "",
+                        "hr_cycle": "",
+                        "detail": "站点未找到该任务，等待下次检查确认",
+                    }
+                )
+                continue
+
+            # 待确认状态：本次仍判定为已完成，正式进入计时
+            if record.get("pending_confirm"):
+                record.pop("pending_confirm", None)
+                record["completed_at"] = now_ts
+                record["completed_time"] = now_str
+                logger.info(f"彩虹岛HR监控：任务已完成，开始计时 {title[:60]}")
                 logger.info(f"彩虹岛HR监控：任务已完成，开始计时 {title[:60]}")
                 compare_items.append(
                     {
@@ -912,6 +1050,13 @@ class ChdbitsHrMonitor(_PluginBase):
             if not title or title == "标题":
                 continue
 
+            # 副标题：站点在标题下方以 <br /> 分隔给出中文名与制作说明，
+            # 用于 UHD原盘自动下载 插件记录缺失时兜底显示
+            subtitle = ""
+            subtitle_match = re.search(r'<br\s*/?>(.*)$', cells[1], re.S | re.I)
+            if subtitle_match:
+                subtitle = re.sub(r'<[^>]+>', '', subtitle_match.group(1)).strip()
+
             def clean(cell: str) -> str:
                 """清理单元格文本。"""
                 return re.sub(r'<[^>]+>', '', cell).strip()
@@ -919,6 +1064,7 @@ class ChdbitsHrMonitor(_PluginBase):
             tasks.append(
                 {
                     "title": title,
+                    "subtitle": subtitle,
                     "hr_percent": clean(cells[2]),
                     "remain_time": clean(cells[3]),
                     "hr_cycle": clean(cells[4]),
@@ -977,6 +1123,119 @@ class ChdbitsHrMonitor(_PluginBase):
         elif not day_match:
             return None
         return total_hours
+
+    def __get_uhd_record(self, name: str) -> Dict[str, Any]:
+        """从 UHD原盘自动下载 插件的记录中查询任务对应的条目。
+
+        优先按 qb_name（站点「下载」字段，与 QB 任务名一致）匹配，
+        其次按归一化标题匹配，以兼容中文前缀与标点差异。
+
+        :param name: QB 任务名
+        :return: 记录字典；未找到返回空字典
+        """
+        try:
+            processed_map = self.get_data(
+                UHD_PROCESSED_DATA_KEY, plugin_id=UHD_PLUGIN_ID
+            ) or {}
+        except Exception as err:
+            logger.warning(f"彩虹岛HR监控：读取 UHD 记录失败：{err}")
+            return {}
+
+        if not processed_map:
+            return {}
+
+        target = self.__normalize_title(name)
+        for record in processed_map.values():
+            if not isinstance(record, dict):
+                continue
+            # 优先按 qb_name 精确匹配
+            qb_name = str(record.get("qb_name") or "")
+            if qb_name and qb_name == name:
+                return record
+            # 其次按归一化标题匹配
+            title = str(record.get("title") or "")
+            if title and target and self.__normalize_title(title) == target:
+                return record
+        return {}
+
+    def __get_uhd_titles(self, name: str) -> Tuple[str, str]:
+        """查询任务对应的副标题与种子标题。
+
+        :param name: QB 任务名或站点标题
+        :return: (副标题, 种子标题)；未找到返回空字符串
+        """
+        record = self.__get_uhd_record(name)
+        if not record:
+            return "", ""
+        subtitle = str(record.get("subtitle") or "").strip()
+        seed_title = str(record.get("qb_name") or "").strip()
+        return subtitle, seed_title
+
+    def __find_qb_name(self, site_title: str) -> str:
+        """在 QB 任务列表中反查站点标题对应的实际任务名。
+
+        UHD原盘自动下载 插件记录缺失时（如种子在站点已下载完成被跳过），
+        无法从记录中取到 qb_name，此处按归一化标题在 QB 任务中反查。
+
+        :param site_title: 站点种子标题
+        :return: 匹配到的 QB 任务名；未找到返回空字符串
+        """
+        if not site_title:
+            return ""
+
+        downloader_obj = self.__get_downloader()
+        if not downloader_obj:
+            return ""
+
+        try:
+            result = downloader_obj.get_torrents()
+        except Exception as err:
+            logger.warning(f"彩虹岛HR监控：获取 QB 任务失败：{err}")
+            return ""
+
+        # get_torrents 返回 (种子列表, 是否异常)
+        if isinstance(result, tuple):
+            torrents = result[0]
+        else:
+            torrents = result
+        if not torrents:
+            return ""
+
+        target = self.__normalize_title(site_title)
+        if not target:
+            return ""
+
+        # 优先精确匹配，其次包含匹配
+        contains_match = ""
+        for torrent in torrents:
+            if isinstance(torrent, dict):
+                name = str(torrent.get("name") or "")
+            else:
+                name = str(getattr(torrent, "name", "") or "")
+            if not name:
+                continue
+            norm = self.__normalize_title(name)
+            if norm == target:
+                return name
+            if not contains_match and target in norm:
+                contains_match = name
+        return contains_match
+
+    def __find_hr_subtitle(self, task_name: str) -> str:
+        """从站点 H&R 任务中反查任务对应的中文副标题。
+
+        UHD原盘自动下载 插件记录缺失时，副标题无法从记录中取到，
+        此处按 QB 任务名在站点 H&R 任务列表中匹配，取其副标题。
+
+        :param task_name: QB 任务名
+        :return: 中文副标题；未找到返回空字符串
+        """
+        if not task_name or not self._last_hr_tasks:
+            return ""
+        site_task = self.__find_site_task(task_name, self._last_hr_tasks)
+        if not site_task:
+            return ""
+        return str(site_task.get("subtitle") or "").strip()
 
     @staticmethod
     def __normalize_title(title: str) -> str:
