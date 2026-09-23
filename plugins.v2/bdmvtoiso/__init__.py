@@ -12,8 +12,10 @@ from app.utils.http import RequestUtils
 
 # 已提交打包记录的持久化键名
 SUBMITTED_DATA_KEY = "bdmv_submitted_map"
-# 已提交记录最多保留条数
-SUBMITTED_LIMIT = 500
+# 已提交记录最多保留条数（超出后自动淘汰最早的记录；保留较多用于去重判定）
+SUBMITTED_LIMIT = 20
+# 页面表格展示条数（只展示最新的若干条，控制在页面上的视觉长度）
+SUBMITTED_DISPLAY = 6
 # 默认标签
 DEFAULT_TAG = "UHD自动下载"
 # 默认分类（与 UHD原盘自动下载 插件推送 QB 时使用的分类保持一致）
@@ -37,6 +39,63 @@ CD2_STATUS_TEXT = {
     6: "等待中",
 }
 
+# CD2 备份层状态（BackupStatus.Status）中需特殊处理的取值：
+# 1 = WalkingThrough（正在扫描源目录）。此时不得评估任何阶段，
+# 否则会把「上一轮」扫描的完成时间当成本轮结果，通知早于 CD2 实际扫描完成。
+CD2_STATUS_WALKING = 1
+
+# CD2 上传任务状态（UploadFileInfo.Status）取值与文案。
+# 注意「预处理中/排队中」并不是在传数据：ISO 刚推进去时任务处于这些阶段，
+# 此时不能宣布「开始上传」（这是 2026-09-22 v1.9.0 通知过早的根因）。
+CD2_UPLOAD_STATE_TEXT = {
+    0: "等待预处理",
+    1: "预处理中",
+    2: "已取消",
+    3: "传输中",
+    4: "已暂停",
+    5: "已完成",
+    6: "已跳过",
+    7: "排队中",
+    8: "已忽略",
+    9: "出错",
+    10: "严重错误",
+}
+# 尚未开始传输的阶段（排队/预处理）
+CD2_UPLOAD_PREPARE_STATES = (0, 1, 7)
+# 已进入传输的阶段（含暂停）
+CD2_UPLOAD_TRANSFER_STATES = (3, 4)
+# 传输出错
+CD2_UPLOAD_ERROR_STATES = (9, 10)
+
+# ISO 直通（直出 ISO 的站点：跳过打包，直接触发 CD2 备份）记录持久化键名
+ISO_SUBMITTED_DATA_KEY = "bdmv_iso_map"
+# ISO 直通记录最多保留条数（同时用于去重，保留较多避免重复触发）
+ISO_SUBMITTED_LIMIT = 200
+# 页面展示的 ISO 直通记录条数
+ISO_SUBMITTED_DISPLAY = 6
+# 默认 ISO 直通分类（与 UHD原盘自动下载 插件推送天空站时使用的分类保持一致）
+DEFAULT_ISO_CATEGORY = "HDSky原盘"
+# 默认 ISO 直通备份源路径（QB 保存目录 /ISO 对应的 CD2 侧路径）
+DEFAULT_ISO_SOURCE_PATH = "/downloads/ISO"
+# CD2 待完成记录的类型标记
+CD2_KIND_BDMV = "bdmv"
+CD2_KIND_ISO = "iso"
+
+# 打包状态快通道的轮询间隔（秒）。
+# 常规检查间隔默认 300 秒，打包完成的那一刻最多要等 5 分钟才会被感知；
+# 快通道只在「确有任务在跑」时启用，用数秒级间隔盯住打包结果，
+# 把「打包完成 → 触发 CD2」的延迟压到秒级；空闲时门闸关闭，零请求。
+WATCH_INTERVAL = 10
+# 快通道关心的记录状态：已提交待打包、打包中
+PACKING_ACTIVE_STATES = ("submitted", "running")
+# 快通道门闸的过期阈值（秒）：记录挂在这些状态超过该时长仍未收敛时，
+# 不再由快通道跟踪（例如服务端任务被清理掉，状态永远等不到），
+# 交回常规检查间隔处理，避免门闸长期敞开、高频请求白白跑着。
+WATCH_STALE_SECONDS = 6 * 3600
+# 快通道连续请求失败的退避阈值：达到该次数即暂停快通道（避免服务端不可用时
+# 每轮都刷日志），等下一次常规检查重新评估后恢复。
+WATCH_FAIL_LIMIT = 5
+
 
 class BdmvToIso(_PluginBase):
     """BDMV 原盘自动打包 ISO 插件。
@@ -45,16 +104,20 @@ class BdmvToIso(_PluginBase):
     自建「BDMV to ISO」服务的资源目录比对，命中后自动触发打包，
     并轮询打包进度；打包完成后可自动触发 CloudDrive2 备份，
     将 ISO 同步上传到云端，并发送通知。
+
+    另支持「ISO 直通」：某些站点（如天空）直接下发 ISO 文件，
+    无需打包，命中直通分类的已完成任务会跳过打包环节，
+    直接触发对应源目录的 CD2 备份。
     """
 
     # 插件名称
     plugin_name = "BDMV自动打包ISO"
     # 插件描述
-    plugin_desc = "监控QB指定标签的已完成原盘，自动打包为ISO，完成后触发CD2备份同步并通知。"
+    plugin_desc = "监控QB指定标签的已完成原盘，自动打包为ISO，完成后秒级感知并触发CD2备份同步；直出ISO的站点支持跳过打包直接触发备份。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.8.1"
+    plugin_version = "1.9.3"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -99,10 +162,23 @@ class BdmvToIso(_PluginBase):
     _cd2_source_path: str = ""
     # CD2 备份目标路径（云端目录，用于校验上传是否完成）
     _cd2_destination_path: str = ""
+    # 是否启用 ISO 直通（直出 ISO 的站点跳过打包，直接触发 CD2 备份）
+    _iso_passthrough: bool = True
+    # ISO 直通分类
+    _iso_categories: List[str] = []
+    # ISO 直通备份源路径（CD2 侧，对应 QB 的 ISO 保存目录）
+    _cd2_iso_source_path: str = ""
     # 与服务端保持的登录会话
     _session: Optional[Session] = None
     # CD2 gRPC 客户端
     _cd2_client: Optional[Any] = None
+    # 打包状态快通道间隔（秒）
+    _watch_interval: int = WATCH_INTERVAL
+    # 快通道门闸：None=未知（下次运行时查一次存储判断），
+    # True=有活跃任务在跑，False=空闲（直接返回，不读存储、不发请求）
+    _watch_active: Optional[bool] = None
+    # 快通道连续失败计数（用于服务端不可用时退避）
+    _watch_fail: int = 0
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -130,8 +206,15 @@ class BdmvToIso(_PluginBase):
         self._cd2_password = ""
         self._cd2_source_path = ""
         self._cd2_destination_path = ""
+        self._iso_passthrough = True
+        self._iso_categories = []
+        self._cd2_iso_source_path = ""
         self._session = None
         self._cd2_client = None
+        self._watch_interval = WATCH_INTERVAL
+        # 门闸未知：首次运行时查一次存储，判断是否有遗留的活跃任务
+        self._watch_active = None
+        self._watch_fail = 0
 
         if not config:
             return
@@ -164,6 +247,12 @@ class BdmvToIso(_PluginBase):
         except (TypeError, ValueError):
             self._interval = 300
 
+        # 快通道间隔：5~60 秒，默认 10 秒（打包完成后的感知延迟上限）
+        try:
+            self._watch_interval = min(60, max(5, int(config.get("watch_interval") or WATCH_INTERVAL)))
+        except (TypeError, ValueError):
+            self._watch_interval = WATCH_INTERVAL
+
         self._auto_convert = bool(config.get("auto_convert", True))
         self._notify_on_done = bool(config.get("notify_on_done", True))
 
@@ -174,6 +263,20 @@ class BdmvToIso(_PluginBase):
         self._cd2_password = str(config.get("cd2_password") or "")
         self._cd2_source_path = str(config.get("cd2_source_path") or "").strip().rstrip("/")
         self._cd2_destination_path = str(config.get("cd2_destination_path") or "").strip().rstrip("/")
+
+        # ISO 直通配置（直出 ISO 的站点：跳过打包，直接触发 CD2 备份）
+        self._iso_passthrough = bool(config.get("iso_passthrough", True))
+        iso_categories_raw = config.get("iso_categories")
+        if iso_categories_raw is None:
+            iso_categories_raw = DEFAULT_ISO_CATEGORY
+        self._iso_categories = [
+            category.strip()
+            for category in str(iso_categories_raw).replace("\n", ",").split(",")
+            if category.strip()
+        ]
+        self._cd2_iso_source_path = str(
+            config.get("cd2_iso_source_path") or DEFAULT_ISO_SOURCE_PATH
+        ).strip().rstrip("/")
 
     def get_state(self) -> bool:
         """获取插件启用状态。
@@ -245,6 +348,26 @@ class BdmvToIso(_PluginBase):
                                             "model": "interval",
                                             "label": "检查间隔（秒）",
                                             "placeholder": "默认300，最小30",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "watch_interval",
+                                            "label": "完成感知间隔（秒）",
+                                            "placeholder": "默认10，最小5；仅在有任务时生效",
                                             "type": "number",
                                         },
                                     }
@@ -521,6 +644,72 @@ class BdmvToIso(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-2"},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "iso_passthrough",
+                                            "label": "启用 ISO 直通（直出 ISO 的站点跳过打包，直接触发 CD2 备份）",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "iso_categories",
+                                            "label": "ISO 直通分类",
+                                            "placeholder": f"用,分隔多个分类，默认：{DEFAULT_ISO_CATEGORY}",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cd2_iso_source_path",
+                                            "label": "ISO 直通备份源路径",
+                                            "placeholder": f"默认：{DEFAULT_ISO_SOURCE_PATH}",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
                                         "component": "VAlert",
                                         "props": {
                                             "type": "info",
@@ -529,7 +718,9 @@ class BdmvToIso(_PluginBase):
                                                     "将任务目录名与 BDMV to ISO 服务的资源目录比对，"
                                                     "命中后自动触发打包为 ISO，并轮询打包进度；"
                                                     "打包完成后自动触发 CD2 备份扫描，将 ISO 同步到云端，"
-                                                    "并发送通知。",
+                                                    "并发送通知。"
+                                                    "「ISO 直通」分类中的已完成任务会跳过打包与资源目录比对，"
+                                                    "直接触发对应源路径的 CD2 备份。",
                                         },
                                     }
                                 ],
@@ -542,6 +733,7 @@ class BdmvToIso(_PluginBase):
             "enabled": False,
             "notify": False,
             "interval": 300,
+            "watch_interval": WATCH_INTERVAL,
             "server_url": "",
             "username": "",
             "password": "",
@@ -556,6 +748,9 @@ class BdmvToIso(_PluginBase):
             "cd2_password": "",
             "cd2_source_path": "",
             "cd2_destination_path": "",
+            "iso_passthrough": True,
+            "iso_categories": DEFAULT_ISO_CATEGORY,
+            "cd2_iso_source_path": DEFAULT_ISO_SOURCE_PATH,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -569,6 +764,12 @@ class BdmvToIso(_PluginBase):
         downloaders_text = "、".join(self._downloaders) if self._downloaders else "未配置"
         tags_text = "、".join(self._tags) if self._tags else "未配置"
         categories_text = "、".join(self._categories) if self._categories else "未配置"
+        iso_categories_text = "、".join(self._iso_categories) if self._iso_categories else "未配置"
+        iso_text = (
+            f"已启用（分类：{iso_categories_text}；源：{self._cd2_iso_source_path}）"
+            if self._iso_passthrough
+            else "未启用"
+        )
 
         page_content: List[dict] = [
             {
@@ -587,8 +788,10 @@ class BdmvToIso(_PluginBase):
                                             f"监控下载器：{downloaders_text}；"
                                             f"监控分类：{categories_text}；"
                                             f"监控标签：{tags_text}；"
-                                            f"检查间隔：{self._interval} 秒；"
-                                            f"自动打包：{'已启用' if self._auto_convert else '未启用'}",
+                                            f"检查间隔：{self._interval} 秒"
+                                            f"（有任务时快通道 {self._watch_interval} 秒）；"
+                                            f"自动打包：{'已启用' if self._auto_convert else '未启用'}；"
+                                            f"ISO 直通：{iso_text}",
                                 },
                             }
                         ],
@@ -798,7 +1001,9 @@ class BdmvToIso(_PluginBase):
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": f"已提交打包记录共 {len(submitted_map)} 条",
+                                        "text": f"已提交打包记录共 {len(submitted_map)} 条"
+                                                f"（最多保留 {SUBMITTED_LIMIT} 条，"
+                                                f"显示最近 {SUBMITTED_DISPLAY} 条）",
                                     },
                                 }
                             ],
@@ -808,7 +1013,8 @@ class BdmvToIso(_PluginBase):
             )
 
             submitted_rows = []
-            for name, info in list(submitted_map.items())[-50:]:
+            # 只展示最新 SUBMITTED_DISPLAY 条（存储上限 SUBMITTED_LIMIT 更大，用于去重）
+            for name, info in list(submitted_map.items())[-SUBMITTED_DISPLAY:]:
                 submitted_rows.append(
                     {
                         "component": "tr",
@@ -857,6 +1063,138 @@ class BdmvToIso(_PluginBase):
                 }
             )
 
+        # ISO 直通：备份源状态与已触发记录
+        if self._iso_passthrough and self._iso_categories:
+            if self._cd2_enabled and self._cd2_iso_source_path:
+                iso_status = self.__get_cd2_backup_status(self._cd2_iso_source_path)
+                if iso_status:
+                    iso_status_text = (
+                        f"ISO 直通备份源 {self._cd2_iso_source_path}："
+                        f"{iso_status.get('status_text')}"
+                    )
+                    if iso_status.get("message"):
+                        iso_status_text += f"（{iso_status['message']}）"
+                    page_content.append(
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12},
+                                    "content": [
+                                        {
+                                            "component": "VAlert",
+                                            "props": {
+                                                "type": "success",
+                                                "variant": "tonal",
+                                                "text": iso_status_text,
+                                            },
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    page_content.append(
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 12},
+                                    "content": [
+                                        {
+                                            "component": "VAlert",
+                                            "props": {
+                                                "type": "warning",
+                                                "variant": "tonal",
+                                                "text": f"未能获取 ISO 直通备份源 {self._cd2_iso_source_path} "
+                                                        "的状态，请检查该源路径是否已在 CD2 中配置备份任务。",
+                                            },
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    )
+
+            iso_map: Dict[str, Any] = self.get_data(ISO_SUBMITTED_DATA_KEY) or {}
+            if iso_map:
+                page_content.append(
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": f"ISO 直通记录共 {len(iso_map)} 条"
+                                                    f"（最多保留 {ISO_SUBMITTED_LIMIT} 条，"
+                                                    f"显示最近 {ISO_SUBMITTED_DISPLAY} 条）",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+
+                iso_rows = []
+                for name, info in list(iso_map.items())[-ISO_SUBMITTED_DISPLAY:]:
+                    iso_rows.append(
+                        {
+                            "component": "tr",
+                            "content": [
+                                {"component": "td", "text": str(info.get("time") or "-")},
+                                {"component": "td", "text": str(info.get("status") or "-")},
+                                {"component": "td", "text": name},
+                            ],
+                        }
+                    )
+
+                page_content.append(
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTable",
+                                        "props": {"density": "compact"},
+                                        "content": [
+                                            {
+                                                "component": "thead",
+                                                "content": [
+                                                    {
+                                                        "component": "tr",
+                                                        "content": [
+                                                            {"component": "th", "text": "触发时间"},
+                                                            {"component": "th", "text": "状态"},
+                                                            {"component": "th", "text": "ISO 文件"},
+                                                        ],
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "tbody",
+                                                "content": iso_rows,
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+
         return page_content
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -868,8 +1206,11 @@ class BdmvToIso(_PluginBase):
         if not self._enabled:
             return services
 
-        if not self._server_url:
-            logger.warning("BDMV自动打包ISO：未配置服务地址，跳过注册定时服务")
+        # ISO 直通不依赖 BDMV to ISO 服务，服务地址缺失时仍可运行
+        iso_ready = bool(self._iso_passthrough and self._cd2_enabled)
+
+        if not self._server_url and not iso_ready:
+            logger.warning("BDMV自动打包ISO：未配置服务地址且未启用 ISO 直通，跳过注册定时服务")
             return services
 
         services.append(
@@ -882,25 +1223,371 @@ class BdmvToIso(_PluginBase):
             }
         )
 
+        # 打包状态快通道：常规检查间隔默认 300 秒，打包完成的那一刻最多要等
+        # 5 分钟才会被感知到。这条服务只在「确有任务在跑」时工作（内部有门闸，
+        # 空闲时直接返回，不读存储、不发请求），用秒级间隔盯住打包结果，
+        # 把「打包完成 → 触发 CD2 备份」的延迟压到数秒。
+        services.append(
+            {
+                "id": "BdmvToIsoWatch",
+                "name": "BDMV打包完成快通道",
+                "trigger": "interval",
+                "func": self.__watch_packing,
+                "kwargs": {"seconds": self._watch_interval},
+            }
+        )
+
         return services
 
     def check_and_convert(self) -> None:
-        """检查已完成任务并触发打包。"""
+        """检查已完成任务：ISO 直通任务直接触发 CD2 备份，其余走 BDMV 打包流程。"""
         if not self._enabled:
             return
 
+        # 1. 收集已完成任务（打包候选与 ISO 直通候选）
+        collected = self.__collect_completed_names()
+        if collected is None:
+            logger.warning("BDMV自动打包ISO：获取下载器任务失败，跳过检查")
+            return
+        candidates, iso_names, iso_hashes = collected
+
+        # 2. ISO 直通：直出 ISO 的站点跳过打包，直接触发 CD2 备份（不依赖 BDMV 服务）
+        self.__process_iso_passthrough(iso_names, iso_hashes)
+
+        # 3. BDMV 打包
+        self.__process_bdmv_packaging(candidates)
+
+        # 4. 检查已触发的 CD2 备份是否完成
+        self.__check_cd2_finished()
+
+        # 5. 重算快通道门闸。常规检查同时充当快通道的兜底心跳：
+        #    快通道在服务端连续无响应时会自行退避关闭，靠这里的重新评估恢复。
+        self.__refresh_watch_gate()
+
+    def __collect_active_packing(self) -> Tuple[List[str], Dict[str, Any]]:
+        """收集仍在打包中的记录，供快通道比对服务端状态。
+
+        过期记录（挂在打包中状态超过 `WATCH_STALE_SECONDS` 仍未收敛，
+        例如服务端任务被清理、状态永远等不到结果）不再由快通道跟踪，
+        交回常规检查间隔处理，避免门闸长期敞开白跑请求。
+
+        :return: (待比对的资源目录名列表, 已提交打包记录)
+        """
+        submitted_map = self.get_data(SUBMITTED_DATA_KEY) or {}
+        if not isinstance(submitted_map, dict):
+            submitted_map = {}
+
         if not self._server_url:
-            logger.warning("BDMV自动打包ISO：未配置服务地址，跳过检查")
+            return [], submitted_map
+
+        names = [
+            name
+            for name, record in submitted_map.items()
+            if isinstance(record, dict)
+            and str(record.get("status") or "") in PACKING_ACTIVE_STATES
+            and not self.__is_packing_stale(record)
+        ]
+        return names, submitted_map
+
+    def __is_packing_stale(self, record: Dict[str, Any]) -> bool:
+        """判断一条打包记录是否已超过快通道的跟踪时限。
+
+        :param record: 打包记录
+        :return: 是否过期
+        """
+        time_text = str((record or {}).get("time") or "")
+        if not time_text:
+            return False
+        try:
+            start = datetime.strptime(time_text, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return False
+        return (datetime.now() - start).total_seconds() > WATCH_STALE_SECONDS
+
+    def __refresh_watch_gate(self) -> None:
+        """重算快通道门闸：当前是否有需要高频跟踪的打包任务。"""
+        active_names, _ = self.__collect_active_packing()
+        self._watch_active = bool(active_names)
+
+    def __watch_packing(self) -> None:
+        """打包状态快通道：高频感知打包完成，尽快触发 CD2 备份。
+
+        它只负责「打包完成 → 立即通知并触发 CD2」这一段 —— 这一段没有任何
+        现成的事件源可用（ISO 服务是加密的、无出站回调能力，插件又看不到
+        输出目录），只能靠缩短轮询间隔来抢时间，而它后面的采集环节本身就要
+        几分钟到几十分钟，提前一点毫无意义。所以 CD2 的扫描/上传跟踪仍然
+        由常规检查按 `_interval`（默认 300 秒）进行，既不给 CD2 增加查询压力，
+        也不会把日志刷密。
+
+        它不是一套新逻辑，只是「常规检查的加速版」——打包完成的判定与处理
+        完全复用 `__advance_packing`（最终走 `__notify_done`：发通知 +
+        触发 CD2 备份 + 写待完成记录）。
+
+        门闸（`_watch_active`）是它能以秒级间隔注册的前提：
+        - `False`：上一轮已确认没有打包任务 → 直接返回，**零存储读、零网络请求**
+        - `None`：插件重载后的首跑 → 正常走一遍，自然算出真实状态
+        - `True`：有打包任务 → 推进；完成后重算门闸并自动落下
+
+        常规检查按 `_interval` 照旧运行，所以即使门闸判断有偏差，
+        最坏也只是回退到常规间隔，不会漏掉任务。
+        """
+        if not self._enabled:
+            return
+
+        # 已确认空闲：直接返回（这一句是快通道能高频注册的关键）
+        if self._watch_active is False:
+            return
+
+        active_names, submitted_map = self.__collect_active_packing()
+        if not active_names:
+            self._watch_active = False
+            return
+
+        self._watch_active = True
+
+        if self._server_url:
+            try:
+                ok = self.__advance_packing(active_names, submitted_map)
+            except Exception as err:
+                # 异常同样计入失败（快通道是高频服务，不能让它把调度日志刷爆，
+                # 也不能让它绕过退避机制无限重试）
+                ok = False
+                logger.error(f"BDMV自动打包ISO：快通道推进打包状态异常：{err}")
+
+            if ok:
+                self._watch_fail = 0
+            else:
+                # 服务端不可用：连续失败到阈值就退避，避免每轮都刷日志。
+                # 下次常规检查成功后会重新打开门闸。
+                self._watch_fail += 1
+                if self._watch_fail >= WATCH_FAIL_LIMIT:
+                    logger.warning(
+                        "BDMV自动打包ISO：服务端连续无响应，快通道退避至下次常规检查"
+                    )
+                    self._watch_active = False
+                    return
+
+        # 收尾重算：本轮可能已经打包完成，门闸应随之落下
+        self.__refresh_watch_gate()
+
+    def __advance_packing(
+        self, names: List[str], submitted_map: Dict[str, Any]
+    ) -> bool:
+        """按服务端状态推进指定打包记录（快通道用）。
+
+        与常规检查里的处理保持一致：仅在状态发生变化时落盘，
+        打包完成后走 `__notify_done`（其中含 CD2 备份触发）。
+
+        :param names: 待比对的资源目录名列表
+        :param submitted_map: 已提交打包记录（就地更新）
+        :return: 服务端状态是否取到（False 表示请求失败，调用方据此退避）
+        """
+        jobs = self.__fetch_status()
+        if jobs is None:
+            return False
+
+        changed = False
+        for name in names:
+            job = jobs.get(name)
+            if not isinstance(job, dict):
+                continue
+
+            job_status = job.get("status")
+
+            if job_status == "done":
+                if submitted_map.get(name, {}).get("status") != "done":
+                    submitted_map[name] = {
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": "done",
+                    }
+                    changed = True
+                    logger.info(f"BDMV自动打包ISO：打包完成（快通道）{name}")
+                    if self._notify and self._notify_on_done:
+                        self.__notify_done(name, job)
+                continue
+
+            if job_status in ("running", "queued"):
+                if submitted_map.get(name, {}).get("status") != "running":
+                    submitted_map[name] = {
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": "running",
+                    }
+                    changed = True
+
+        if changed:
+            self.save_data(SUBMITTED_DATA_KEY, submitted_map)
+        return True
+
+    def __process_iso_passthrough(
+        self, iso_names: List[str], iso_hashes: Optional[Dict[str, str]] = None
+    ) -> None:
+        """处理 ISO 直通任务：命中直通分类的已完成任务直接触发 CD2 备份。
+
+        这些站点的种子本身就是 ISO 文件，无需经过 BDMV to ISO 服务打包，
+        只需触发对应源目录的 CD2 备份扫描即可同步到云端。
+
+        :param iso_names: 命中 ISO 直通分类的已完成任务名列表
+        :param iso_hashes: {任务名: 种子 hash}，用于去重（REPACK 重制版文件名相同、
+            hash 不同，必须用 hash 区分，否则会被误判为「已提交」而漏触发）
+        """
+        if not iso_names:
+            return
+
+        if not self._iso_passthrough:
+            logger.info(
+                f"BDMV自动打包ISO：检测到 {len(iso_names)} 个 ISO 直通任务，但未启用 ISO 直通"
+            )
+            return
+
+        if not self._cd2_enabled:
+            logger.warning("BDMV自动打包ISO：检测到 ISO 直通任务，但未启用 CD2 备份，跳过")
+            return
+
+        if not self._cd2_iso_source_path:
+            logger.warning("BDMV自动打包ISO：检测到 ISO 直通任务，但未配置 ISO 直通备份源路径，跳过")
+            return
+
+        iso_map: Dict[str, Any] = self.get_data(ISO_SUBMITTED_DATA_KEY) or {}
+        if not isinstance(iso_map, dict):
+            iso_map = {}
+
+        iso_hashes = iso_hashes or {}
+
+        # 过滤出尚未触发过的任务。
+        #
+        # 🔴 去重 key 用「种子 hash」而非「文件名」：
+        # 站点的 REPACK 重制版会保留与原始版完全相同的 ISO 文件名（REPACK 只标在
+        # 文件夹名上），若按文件名判重，重制版会被误判为「已提交」而漏触发 CD2。
+        # hash 是种子的唯一指纹，REPACK = 新种子 = 新 hash，绝不会撞。
+        # 取不到 hash 时回退文件名（兼容存量老记录 + 兜底）。
+        pending_names = []
+        for name in iso_names:
+            hash_val = (iso_hashes.get(name) or "").strip()
+            # 优先用 hash 判重：新记录 key = hash，老记录 key = 文件名，两者都查
+            if hash_val:
+                if (iso_map.get(hash_val) or {}).get("status") in ("submitted", "done"):
+                    continue
+                # 兼容：老记录可能仍以文件名做 key，且未存 hash，此时也视为已提交
+                legacy = iso_map.get(name)
+                if isinstance(legacy, dict) and not legacy.get("torrent_hash") \
+                        and legacy.get("status") in ("submitted", "done"):
+                    continue
+            else:
+                if (iso_map.get(name) or {}).get("status") in ("submitted", "done"):
+                    continue
+            pending_names.append(name)
+        if not pending_names:
+            return
+
+        # 记录 ISO 文件名与大小（一次扫描即可同步整个源目录，故只触发一次）
+        targets = self.__collect_iso_targets(pending_names)
+
+        if not self.__trigger_cd2_backup(self._cd2_iso_source_path):
+            logger.error(
+                f"BDMV自动打包ISO：触发 ISO 直通 CD2 备份失败，本轮不记录："
+                f"{'、'.join(pending_names)}"
+            )
+            return
+
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for name in pending_names:
+            iso_name, iso_size = targets.get(name, (name, 0))
+            hash_val = (iso_hashes.get(name) or "").strip()
+            # 新记录统一用 hash 做 key（无 hash 回退文件名）；value 里冗余存 name，
+            # 供 CD2 上传校验与详情页展示继续按文件名工作。
+            record_key = hash_val or name
+            iso_map[record_key] = {
+                "time": now_text,
+                "status": "submitted",
+                "iso_name": iso_name,
+                "iso_size": iso_size,
+                "torrent_hash": hash_val,
+                "name": name,
+            }
+            # 记录触发时间与 ISO 信息，供后续校验上传是否完成
+            self.__record_cd2_trigger(
+                name,
+                iso_name=iso_name,
+                iso_size=iso_size,
+                source_path=self._cd2_iso_source_path,
+                kind=CD2_KIND_ISO,
+            )
+            logger.info(f"BDMV自动打包ISO：已触发 ISO 直通 CD2 备份 {name} -> {self._cd2_iso_source_path}")
+
+        # 限制记录条数
+        if len(iso_map) > ISO_SUBMITTED_LIMIT:
+            keys = list(iso_map.keys())
+            for key in keys[: len(iso_map) - ISO_SUBMITTED_LIMIT]:
+                iso_map.pop(key, None)
+        self.save_data(ISO_SUBMITTED_DATA_KEY, iso_map)
+
+        if self._notify:
+            self.__notify_iso_submitted(pending_names, targets)
+
+    def __collect_iso_targets(self, names: List[str]) -> Dict[str, Tuple[str, int]]:
+        """收集 ISO 直通任务的 ISO 文件名与字节数，用于后续校验云端文件。
+
+        :param names: 需要收集的任务名列表
+        :return: {任务名: (ISO 文件名, 字节数)}
+        """
+        targets: Dict[str, Tuple[str, int]] = {}
+        if not names or not self._downloaders:
+            return targets
+
+        wanted = set(names)
+        services = DownloaderHelper().get_services(name_filters=self._downloaders)
+        for _service_name, service_info in (services or {}).items():
+            if not DownloaderHelper().is_downloader(
+                service_type="qbittorrent", service=service_info
+            ):
+                continue
+            downloader_obj = service_info.instance
+            if not downloader_obj or downloader_obj.is_inactive():
+                continue
+            try:
+                result = downloader_obj.get_torrents()
+            except Exception:
+                continue
+            torrents = result[0] if isinstance(result, tuple) else result
+            for torrent in torrents or []:
+                content_path = str(self.__torrent_field(torrent, "content_path", "") or "")
+                if not content_path:
+                    continue
+                name = content_path.rstrip("/").split("/")[-1]
+                if name not in wanted or name in targets:
+                    continue
+                try:
+                    size = int(float(self.__torrent_field(torrent, "size", 0) or 0))
+                except (TypeError, ValueError):
+                    size = 0
+                targets[name] = (name, size)
+
+        # 未采集到的任务回退为任务名本身
+        for name in names:
+            if name not in targets:
+                targets[name] = (name, 0)
+        return targets
+
+    def __process_bdmv_packaging(self, names: List[str]) -> None:
+        """将命中的已完成原盘任务提交到 BDMV to ISO 服务打包。
+
+        :param names: 待打包的资源目录名列表
+        """
+        if not names:
+            return
+
+        if not self._server_url:
+            logger.warning("BDMV自动打包ISO：未配置服务地址，跳过打包检查")
             return
 
         # 1. 获取服务端资源目录
         resources = self.__fetch_resources()
         if resources is None:
-            logger.warning("BDMV自动打包ISO：获取服务端资源目录失败，跳过检查")
+            logger.warning("BDMV自动打包ISO：获取服务端资源目录失败，跳过打包检查")
             return
 
         if not resources:
-            logger.info("BDMV自动打包ISO：服务端资源目录为空，跳过检查")
+            logger.info("BDMV自动打包ISO：服务端资源目录为空，跳过打包检查")
             return
 
         resource_set = set(resources)
@@ -908,20 +1595,14 @@ class BdmvToIso(_PluginBase):
         # 2. 获取服务端当前任务状态
         jobs = self.__fetch_status()
         if jobs is None:
-            logger.warning("BDMV自动打包ISO：获取服务端任务状态失败，跳过检查")
+            logger.warning("BDMV自动打包ISO：获取服务端任务状态失败，跳过打包检查")
             return
 
-        # 3. 收集待打包的目录名
-        candidates = self.__collect_completed_names()
-        if candidates is None:
-            logger.warning("BDMV自动打包ISO：获取下载器任务失败，跳过检查")
-            return
-
-        # 4. 处理已完成任务
+        # 3. 处理已完成任务
         submitted_map: Dict[str, Any] = self.get_data(SUBMITTED_DATA_KEY) or {}
         changed = False
 
-        for name in candidates:
+        for name in names:
             # 未命中服务端资源目录
             if name not in resource_set:
                 continue
@@ -969,16 +1650,13 @@ class BdmvToIso(_PluginBase):
                 if self._notify:
                     self.__notify_submitted(name)
 
-        # 5. 清理超量记录
+        # 4. 清理超量记录
         if changed:
             if len(submitted_map) > SUBMITTED_LIMIT:
                 keys = list(submitted_map.keys())
                 for key in keys[: len(submitted_map) - SUBMITTED_LIMIT]:
                     submitted_map.pop(key, None)
             self.save_data(SUBMITTED_DATA_KEY, submitted_map)
-
-        # 6. 检查已触发的 CD2 备份是否完成
-        self.__check_cd2_finished()
 
     @staticmethod
     def __torrent_field(torrent: Any, key: str, default: Any = None) -> Any:
@@ -993,10 +1671,13 @@ class BdmvToIso(_PluginBase):
             return torrent.get(key, default)
         return getattr(torrent, key, default)
 
-    def __collect_completed_names(self) -> Optional[List[str]]:
-        """收集下载器中带指定标签的已完成任务目录名。
+    def __collect_completed_names(self) -> Optional[Tuple[List[str], List[str], Dict[str, str]]]:
+        """收集下载器中的已完成任务，分为打包候选与 ISO 直通候选。
 
-        :return: 目录名列表，获取失败返回 None
+        命中 ISO 直通分类的任务只进入 ISO 直通候选，不再参与打包匹配。
+
+        :return: (待打包目录名列表, ISO 直通任务名列表, {ISO 任务名: 种子 hash})，
+            获取失败返回 None
         """
         if not self._downloaders:
             logger.warning("BDMV自动打包ISO：未配置下载器，跳过检查")
@@ -1008,6 +1689,8 @@ class BdmvToIso(_PluginBase):
             return None
 
         names: List[str] = []
+        iso_names: List[str] = []
+        iso_hashes: Dict[str, str] = {}
         for service_name, service_info in services.items():
             # 仅处理 QB 下载器
             if not DownloaderHelper().is_downloader(service_type="qbittorrent", service=service_info):
@@ -1043,13 +1726,33 @@ class BdmvToIso(_PluginBase):
                 if progress < 1:
                     continue
 
+                torrent_category = str(self.__torrent_field(torrent, "category", None) or "").strip()
+
+                # ISO 直通优先：命中直通分类则不参与打包匹配
+                if (
+                    self._iso_passthrough
+                    and self._iso_categories
+                    and torrent_category
+                    and torrent_category in self._iso_categories
+                ):
+                    content_path = self.__torrent_field(torrent, "content_path", None) or ""
+                    if not content_path:
+                        continue
+                    iso_name = str(content_path).rstrip("/").split("/")[-1]
+                    if iso_name and iso_name not in iso_names:
+                        iso_names.append(iso_name)
+                        # 记录种子 hash，供去重（REPACK 重制版文件名相同、hash 不同）
+                        iso_hashes[iso_name] = str(
+                            self.__torrent_field(torrent, "hash", "") or ""
+                        )
+                    continue
+
                 # 分类与标签双重匹配（两者都需命中）
                 torrent_tags = self.__torrent_field(torrent, "tags", None) or []
                 if isinstance(torrent_tags, str):
                     torrent_tags = [tag.strip() for tag in torrent_tags.split(",") if tag.strip()]
                 tag_matched = any(tag in torrent_tags for tag in self._tags)
 
-                torrent_category = str(self.__torrent_field(torrent, "category", None) or "").strip()
                 category_matched = bool(torrent_category) and torrent_category in self._categories
 
                 if not (tag_matched and category_matched):
@@ -1063,7 +1766,7 @@ class BdmvToIso(_PluginBase):
                 if name and name not in names:
                     names.append(name)
 
-        return names
+        return names, iso_names, iso_hashes
 
     def __login(self) -> bool:
         """登录 BDMV to ISO 服务并保持会话。
@@ -1302,14 +2005,16 @@ class BdmvToIso(_PluginBase):
         logger.info("BDMV自动打包ISO：CD2 认证已失效，正在重新认证")
         return self.__create_cd2_client()
 
-    def __trigger_cd2_backup(self) -> bool:
+    def __trigger_cd2_backup(self, source_path: str = "") -> bool:
         """触发 CloudDrive2 备份扫描，将新生成的 ISO 同步到云端。
 
         认证失效时自动重新认证并重试一次。
 
+        :param source_path: 备份源路径，缺省使用打包输出目录
         :return: 是否触发成功
         """
-        if not self._cd2_source_path:
+        path = str(source_path or self._cd2_source_path or "").strip().rstrip("/")
+        if not path:
             logger.warning("BDMV自动打包ISO：未配置 CD2 备份源路径，跳过备份触发")
             return False
 
@@ -1323,7 +2028,7 @@ class BdmvToIso(_PluginBase):
 
                 metadata = client._create_authorized_metadata()
                 client.stub.BackupRestartWalkingThrough(
-                    pb.StringValue(value=self._cd2_source_path),
+                    pb.StringValue(value=path),
                     metadata=metadata,
                 )
             except Exception as err:
@@ -1338,17 +2043,26 @@ class BdmvToIso(_PluginBase):
                 self.__close_cd2_client()
                 return False
 
-            logger.info(f"BDMV自动打包ISO：已触发 CD2 备份扫描 {self._cd2_source_path}")
+            logger.info(f"BDMV自动打包ISO：已触发 CD2 备份扫描 {path}")
             return True
 
         return False
 
-    def __record_cd2_trigger(self, name: str, iso_name: str = "", iso_size: int = 0) -> None:
+    def __record_cd2_trigger(
+        self,
+        name: str,
+        iso_name: str = "",
+        iso_size: int = 0,
+        source_path: str = "",
+        kind: str = CD2_KIND_BDMV,
+    ) -> None:
         """记录 CD2 备份触发信息，用于后续检测同步是否完成。
 
-        :param name: 资源目录名
+        :param name: 资源目录名或 ISO 文件名
         :param iso_name: 输出 ISO 文件名（用于校验云端文件是否已存在）
         :param iso_size: 输出 ISO 字节数（用于校验云端文件大小是否一致）
+        :param source_path: 本次触发的 CD2 备份源路径（缺省为打包输出目录）
+        :param kind: 记录类型，打包（bdmv）或 ISO 直通（iso）
         """
         pending = self.get_data(CD2_PENDING_DATA_KEY) or {}
         if not isinstance(pending, dict):
@@ -1358,6 +2072,8 @@ class BdmvToIso(_PluginBase):
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "iso_name": iso_name,
             "iso_size": int(iso_size or 0),
+            "source_path": str(source_path or self._cd2_source_path or "").strip().rstrip("/"),
+            "kind": kind,
         }
         # 限制记录条数
         if len(pending) > CD2_PENDING_LIMIT:
@@ -1416,12 +2132,15 @@ class BdmvToIso(_PluginBase):
 
         return None
 
-    def __get_cd2_cloud_file_size(self, iso_name: str) -> Optional[int]:
+    def __get_cd2_cloud_file_size(self, iso_name: str, expect_size: int = 0) -> Optional[int]:
         """查询云端目标目录中指定文件的大小。
 
         用于校验 ISO 是否已完整上传到云端（CD2 的 BackupStatus 不提供上传进度）。
+        按文件名匹配不到时，若提供了 expect_size，则退化为查找大小一致的 `.iso`
+        文件（兼容云端文件名与本地不完全一致的情况）。
 
         :param iso_name: ISO 文件名
+        :param expect_size: 期望字节数，用于文件名匹配失败时的兜底匹配
         :return: 文件字节数；文件不存在返回 None
         """
         if not iso_name or not self._cd2_destination_path:
@@ -1431,6 +2150,7 @@ class BdmvToIso(_PluginBase):
         if client is None:
             return None
 
+        fallback: Optional[int] = None
         try:
             from clouddrive2_client.proto import clouddrive_pb2 as pb
 
@@ -1445,6 +2165,14 @@ class BdmvToIso(_PluginBase):
                         continue
                     if item.name == iso_name:
                         return int(item.size)
+                    # 兜底：大小一致且扩展名为 .iso 的文件
+                    if (
+                        expect_size
+                        and fallback is None
+                        and str(item.name).lower().endswith(".iso")
+                        and int(item.size) == int(expect_size)
+                    ):
+                        fallback = int(item.size)
         except Exception as err:
             if self.__is_cd2_auth_error(err):
                 logger.warning(f"BDMV自动打包ISO：查询云端目录认证失效：{err}")
@@ -1453,7 +2181,7 @@ class BdmvToIso(_PluginBase):
                 logger.warning(f"BDMV自动打包ISO：查询云端目录失败：{err}")
             return None
 
-        return None
+        return fallback
 
     def __check_cd2_finished(self) -> None:
         """检查已触发的 CD2 备份进度，并在关键阶段发送通知。
@@ -1461,105 +2189,162 @@ class BdmvToIso(_PluginBase):
         CD2 的 BackupStatus 只提供 lastFinishTime，其语义为「扫描完成时间」，
         并非「上传完成时间」，扫描结束后文件仍可能长时间上传中。
 
+        两个层次的状态必须分开看（2026-09-22 修正，v1.9.0 通知过早的根因）：
+
+        **备份层**（`BackupStatus.status`）：
+        - `WalkingThrough(1)`：源目录正在扫描 → 本轮不评估任何阶段。
+          注意「源目录 walker」可能只花几百毫秒就结束（毕竟只读元数据），
+          但它**不代表 CD2 已经开始传数据**。
+        - `Scanned(4)` / `Finished(5)`：源目录扫描完成。
+
+        **传输层**（`UploadFileInfo.statusEnum`，经 GetUploadFileList 查询）：
+        - `等待预处理(0)` / `预处理中(1)` / `排队中(7)`：CD2 还没开始传数据，
+          任务在自己的准备阶段 → **不发任何通知**，继续等待。
+          （v1.9.0 之前把这些阶段和「传输中」混为一谈，于是源目录 walker
+          一结束就立刻宣称「源目录已扫描、正在上传」，而 CD2 侧任务仍显示准备中。）
+        - `传输中(3)` / `已暂停(4)`：已进入传输。**且已传输字节 > 0** 时，
+          才发送「扫描完成」通知（带上真实进度），每个任务只发一次。
+        - `出错(9)` / `严重错误(10)`：只告警，保留记录等待重试或人工处理。
+        - 其余（已完成/已跳过/已取消/已忽略）或查询不到任务：交给云端校验。
+
         判断顺序：
-        1. 扫描完成（lastFinishTime 晚于触发时间）时发送「扫描完成」通知；
-        2. 通过 GetUploadFileList 查询该 ISO 的上传任务，首次检测到传输中时
-           发送「上传中」通知（含进度），之后继续等待；
-        3. 上传任务已结束（或查询不到）时，校验云端目标目录中文件是否已存在
+        1. 通过 GetUploadFileList 查询该 ISO 的传输任务，处于传输中且已动数据时
+           发送「扫描完成」通知；
+        2. 传输任务已结束（或查询不到）时，校验云端目标目录中文件是否已存在
            且大小与本地一致，确认后才发送「同步完成」通知。
+
+        待完成记录按「CD2 备份源路径」分组，逐源查询扫描状态，
+        以同时支持打包输出目录与 ISO 直通源目录。
         """
-        if not self._cd2_enabled or not self._cd2_source_path:
+        if not self._cd2_enabled:
             return
 
         pending = self.get_data(CD2_PENDING_DATA_KEY) or {}
         if not isinstance(pending, dict) or not pending:
             return
 
-        status = self.__get_cd2_backup_status()
-        if not status:
-            return
-
-        last_finish_ts = int(status.get("last_finish_ts") or 0)
-        if not last_finish_ts:
-            return
-
-        destination = status.get("destination") or self._cd2_destination_path
-
-        finished = []
+        # 按备份源路径分组（旧记录无 source_path 时回退为打包输出目录）
+        groups: Dict[str, List[str]] = {}
         changed = False
         for name, record in list(pending.items()):
             if not isinstance(record, dict):
                 pending.pop(name, None)
                 changed = True
                 continue
-            trigger_ts = int(record.get("trigger_ts") or 0)
-            # 扫描完成时间需晚于触发时间，说明本次扫描已结束
-            if not trigger_ts or last_finish_ts < trigger_ts:
+            source = str(
+                record.get("source_path") or self._cd2_source_path or ""
+            ).strip().rstrip("/")
+            if not source:
+                continue
+            groups.setdefault(source, []).append(name)
+
+        finished: List[Tuple[str, Dict[str, Any], str]] = []
+        for source, names in groups.items():
+            status = self.__get_cd2_backup_status(source)
+            if not status:
                 continue
 
-            # 扫描完成通知（每个任务只发一次）
-            if not record.get("scan_notified"):
-                record["scan_notified"] = True
-                changed = True
-                if self._notify:
-                    self.__notify_cd2_scan_done(name, destination, last_finish_ts)
-
-            iso_name = str(record.get("iso_name") or "")
-            iso_size = int(record.get("iso_size") or 0)
-            if not iso_name:
-                # 旧记录缺少文件名，无法校验，直接清理避免长期滞留
-                pending.pop(name, None)
-                changed = True
-                logger.info(f"BDMV自动打包ISO：CD2 记录缺少 ISO 文件名，跳过校验 {name}")
-                continue
-
-            # 优先查询上传任务状态：任务仍在传输中则继续等待
-            progress = self.__get_cd2_upload_progress(iso_name)
-            if progress is not None:
-                status_enum = int(progress.get("status_enum") or 0)
-                transfered = int(progress.get("transfered") or 0)
-                total = int(progress.get("size") or 0)
-                # 3=Transfer 传输中，0/1=预处理，4=暂停，7=排队
-                if status_enum in (0, 1, 3, 4, 7):
-                    # CD2 的 transferedBytes 偶发异常（如任务重建后计数重置），
-                    # 用云端实际文件大小交叉校验，取两者较小值作为可信进度
-                    cloud_size = self.__get_cd2_cloud_file_size(iso_name) or 0
-                    if cloud_size > 0 and cloud_size < transfered:
-                        logger.info(
-                            f"BDMV自动打包ISO：上传进度异常，改用云端文件大小 "
-                            f"({cloud_size} < {transfered})"
-                        )
-                        transfered = cloud_size
-                    percent = (transfered / total * 100) if total else 0
-                    logger.info(
-                        f"BDMV自动打包ISO：云端上传进行中 {iso_name} "
-                        f"({transfered}/{total} 字节, {percent:.1f}%)"
-                    )
-                    # 上传中不发送通知，仅记录日志，避免进度不准造成误导
-                    continue
-                # 9/10=错误，保留记录等待下次重试或人工处理
-                if status_enum in (9, 10):
-                    logger.warning(
-                        f"BDMV自动打包ISO：云端上传出错 {iso_name} - {progress.get('status')}"
-                    )
-                    continue
-
-            # 上传任务已结束（或查询不到），再校验云端文件是否已完整上传
-            cloud_size = self.__get_cd2_cloud_file_size(iso_name)
-            if cloud_size is None:
-                # 文件尚未出现在云端，继续等待
-                continue
-            if iso_size and cloud_size != iso_size:
-                # 文件存在但大小不一致，说明仍在上传中
+            # 备份层：源目录正在扫描时本轮不做任何评估。
+            # 「源目录 walker」可能只跑几百毫秒，但它不等于 CD2 已开始传数据，
+            # 更不能用上一轮的 lastFinishTime 当作本轮结果。
+            if int(status.get("status") or 0) == CD2_STATUS_WALKING:
                 logger.info(
-                    f"BDMV自动打包ISO：云端文件仍在上传 {iso_name} "
-                    f"({cloud_size}/{iso_size} 字节)"
+                    f"BDMV自动打包ISO：CD2 正在扫描源目录 {source}，本轮不评估"
                 )
                 continue
 
-            finished.append((name, record))
-            pending.pop(name, None)
-            changed = True
+            last_finish_ts = int(status.get("last_finish_ts") or 0)
+            if not last_finish_ts:
+                continue
+
+            destination = status.get("destination") or self._cd2_destination_path
+
+            for name in names:
+                record = pending.get(name)
+                if not isinstance(record, dict):
+                    continue
+
+                trigger_ts = int(record.get("trigger_ts") or 0)
+                # 扫描完成时间需晚于触发时间，说明本次扫描已结束
+                if not trigger_ts or last_finish_ts < trigger_ts:
+                    continue
+
+                iso_name = str(record.get("iso_name") or "")
+                iso_size = int(record.get("iso_size") or 0)
+                if not iso_name:
+                    # 旧记录缺少文件名，无法校验，直接清理避免长期滞留
+                    pending.pop(name, None)
+                    changed = True
+                    logger.info(f"BDMV自动打包ISO：CD2 记录缺少 ISO 文件名，跳过校验 {name}")
+                    continue
+
+                # 先查传输任务：源目录扫描完成 ≠ CD2 已开始传输。
+                # 任务处于「预处理中/排队中」时依旧不能发「扫描完成」通知，
+                # 否则 CD2 侧还显示准备中，通知却已经宣称开始上传了。
+                progress = self.__get_cd2_upload_progress(iso_name)
+                if progress is not None:
+                    status_enum = int(progress.get("status_enum") or 0)
+                    transfered = int(progress.get("transfered") or 0)
+                    total = int(progress.get("size") or 0)
+                    state_text = CD2_UPLOAD_STATE_TEXT.get(status_enum, "未知状态")
+
+                    if status_enum in CD2_UPLOAD_PREPARE_STATES:
+                        logger.info(
+                            f"BDMV自动打包ISO：CD2 尚未开始传输 {iso_name}"
+                            f"（{state_text}），继续等待"
+                        )
+                        continue
+
+                    if status_enum in CD2_UPLOAD_ERROR_STATES:
+                        logger.warning(
+                            f"BDMV自动打包ISO：云端上传出错 {iso_name} - {progress.get('status')}"
+                        )
+                        continue
+
+                    if status_enum in CD2_UPLOAD_TRANSFER_STATES:
+                        # CD2 的 transferedBytes 偶发异常（如任务重建后计数重置），
+                        # 用云端实际文件大小交叉校验，取两者较小值作为可信进度
+                        cloud_size = self.__get_cd2_cloud_file_size(iso_name, iso_size) or 0
+                        if cloud_size > 0 and cloud_size < transfered:
+                            logger.info(
+                                f"BDMV自动打包ISO：上传进度异常，改用云端文件大小 "
+                                f"({cloud_size} < {transfered})"
+                            )
+                            transfered = cloud_size
+                        percent = (transfered / total * 100) if total else 0
+                        logger.info(
+                            f"BDMV自动打包ISO：云端上传进行中 {iso_name} "
+                            f"({state_text}, {transfered}/{total} 字节, {percent:.1f}%)"
+                        )
+                        # 已传输字节仍是 0：任务只是建好了，CD2 还没真的动数据
+                        if transfered <= 0:
+                            continue
+                        # 确认 CD2 真的在传，此时宣布「正在上传」才成立
+                        if not record.get("scan_notified"):
+                            record["scan_notified"] = True
+                            changed = True
+                            if self._notify:
+                                self.__notify_cd2_scan_done(
+                                    name, destination, last_finish_ts, record, progress
+                                )
+                        continue
+
+                # 上传任务已结束（或查询不到），再校验云端文件是否已完整上传
+                cloud_size = self.__get_cd2_cloud_file_size(iso_name, iso_size)
+                if cloud_size is None:
+                    # 文件尚未出现在云端，继续等待
+                    continue
+                if iso_size and cloud_size != iso_size:
+                    # 文件存在但大小不一致，说明仍在上传中
+                    logger.info(
+                        f"BDMV自动打包ISO：云端文件仍在上传 {iso_name} "
+                        f"({cloud_size}/{iso_size} 字节)"
+                    )
+                    continue
+
+                finished.append((name, record, destination))
+                pending.pop(name, None)
+                changed = True
 
         # 保存通知标记与清理结果
         if changed:
@@ -1568,18 +2353,22 @@ class BdmvToIso(_PluginBase):
         if not finished:
             return
 
-        for name, _record in finished:
+        for name, record, destination in finished:
             finish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"BDMV自动打包ISO：CD2 备份已完成 {name} - {finish_time}")
             if not self._notify:
                 continue
 
+            kind = str(record.get("kind") or CD2_KIND_BDMV)
             cn_title = self.__get_cn_title(name)
             en_title = self.__get_en_title(name)
             site_name = self.__get_site_name(name)
             seed_title = self.__get_seed_title(name)
 
-            lines = ["☁️ BDMV 原盘云端同步完成", ""]
+            if kind == CD2_KIND_ISO:
+                lines = ["☁️ UHD 原盘 ISO 云端同步完成", ""]
+            else:
+                lines = ["☁️ BDMV 原盘云端同步完成", ""]
             lines.append("▎✅ 已同步到云端")
             lines.append(f"▎中文标题：{cn_title or name}")
             if en_title:
@@ -1599,14 +2388,16 @@ class BdmvToIso(_PluginBase):
                 text="\n".join(lines),
             )
 
-    def __get_cd2_backup_status(self) -> Optional[Dict[str, Any]]:
+    def __get_cd2_backup_status(self, source_path: str = "") -> Optional[Dict[str, Any]]:
         """查询 CD2 备份的当前状态。
 
         认证失效时自动重新认证并重试一次。
 
+        :param source_path: 备份源路径，缺省使用打包输出目录
         :return: 状态字典，失败返回 None
         """
-        if not self._cd2_source_path:
+        path = str(source_path or self._cd2_source_path or "").strip().rstrip("/")
+        if not path:
             return None
 
         status = None
@@ -1620,7 +2411,7 @@ class BdmvToIso(_PluginBase):
 
                 metadata = client._create_authorized_metadata()
                 status = client.stub.BackupGetStatus(
-                    pb.StringValue(value=self._cd2_source_path),
+                    pb.StringValue(value=path),
                     metadata=metadata,
                 )
             except Exception as err:
@@ -1905,6 +2696,53 @@ class BdmvToIso(_PluginBase):
             text="\n".join(lines),
         )
 
+    def __notify_iso_submitted(
+        self, names: List[str], targets: Dict[str, Tuple[str, int]]
+    ) -> None:
+        """发送 ISO 直通已触发 CD2 备份的通知。
+
+        :param names: 本轮触发 CD2 备份的任务名列表
+        :param targets: {任务名: (ISO 文件名, 字节数)}
+        """
+        iso_files = [str((targets.get(n) or (n, 0))[0]) for n in names]
+        total_size = 0
+        for name in names:
+            try:
+                total_size += int((targets.get(name) or (name, 0))[1] or 0)
+            except (TypeError, ValueError):
+                continue
+
+        lines = ["☁️ UHD 原盘 ISO 直通（跳过打包）", ""]
+        lines.append("▎🚀 已触发 CD2 备份")
+        if len(iso_files) == 1:
+            name = names[0]
+            lines.append(f"▎中文标题：{self.__get_cn_title(name) or name}")
+            en_title = self.__get_en_title(name)
+            if en_title:
+                lines.append(f"▎英文标题：{en_title}")
+            site_name = self.__get_site_name(name)
+            if site_name:
+                lines.append(f"▎站点：{site_name}")
+            if total_size:
+                lines.append(f"▎体积：{total_size / 1024 / 1024 / 1024:.2f} GB")
+        else:
+            lines.append(f"▎数量：{len(iso_files)} 个")
+            shown = "、".join(iso_files[:3])
+            if len(iso_files) > 3:
+                shown += f" 等共 {len(iso_files)} 个"
+            lines.append(f"▎ISO 文件：{shown}")
+
+        lines.append("")
+        lines.append("☁️ 云端同步")
+        lines.append(f"　　📂 {self._cd2_iso_source_path}")
+        lines.append(f"　　➡ {self._cd2_destination_path or '未配置'}")
+
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title="【BDMV自动打包ISO】",
+            text="\n".join(lines),
+        )
+
     def __notify_done(self, name: str, job: Dict[str, Any]) -> None:
         """发送打包完成通知，并按需触发 CD2 备份。
 
@@ -1984,21 +2822,47 @@ class BdmvToIso(_PluginBase):
             text="\n".join(lines),
         )
 
-    def __notify_cd2_scan_done(self, name: str, destination: str, scan_ts: int) -> None:
+    def __notify_cd2_scan_done(
+        self,
+        name: str,
+        destination: str,
+        scan_ts: int,
+        record: Optional[Dict[str, Any]] = None,
+        progress: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """发送 CD2 扫描完成通知。
 
-        :param name: 资源目录名
+        只在 CD2 的传输任务确实已进入传输阶段（且已传输字节 > 0）时调用，
+        因此通知里的「开始上传」与进度都是 CD2 的真实状态，而不是推测。
+
+        :param name: 资源目录名或 ISO 文件名
         :param destination: 云端目标目录
-        :param scan_ts: 扫描完成时间戳
+        :param scan_ts: CD2 扫描完成时间戳（BackupDestination.lastFinishTime）
+        :param record: CD2 待完成记录（用于区分打包与 ISO 直通）
+        :param progress: CD2 传输任务信息（含 size / transfered / status_enum）
         """
+        kind = str((record or {}).get("kind") or CD2_KIND_BDMV)
         cn_title = self.__get_cn_title(name)
         en_title = self.__get_en_title(name)
         site_name = self.__get_site_name(name)
         seed_title = self.__get_seed_title(name)
         scan_time = datetime.fromtimestamp(scan_ts).strftime("%Y-%m-%d %H:%M:%S")
 
-        lines = ["☁️ BDMV 原盘云端扫描完成", ""]
-        lines.append("▎🔍 已扫描源目录，开始上传")
+        if kind == CD2_KIND_ISO:
+            lines = ["☁️ UHD 原盘 ISO 云端扫描完成", ""]
+        else:
+            lines = ["☁️ BDMV 原盘云端扫描完成", ""]
+        lines.append("▎🔍 源目录已扫描，CD2 正在上传")
+        total = int((progress or {}).get("size") or 0)
+        transfered = int((progress or {}).get("transfered") or 0)
+        if total > 0 and transfered >= 0:
+            lines.append(
+                "▎上传进度：%.1f%%（%.2f GB / %.2f GB）" % (
+                    transfered / total * 100,
+                    transfered / 1024 / 1024 / 1024,
+                    total / 1024 / 1024 / 1024,
+                )
+            )
         lines.append(f"▎中文标题：{cn_title or name}")
         if en_title:
             lines.append(f"▎英文标题：{en_title}")

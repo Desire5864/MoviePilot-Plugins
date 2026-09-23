@@ -11,12 +11,367 @@ from app.utils.http import RequestUtils
 
 # 完成记录持久化键名
 COMPLETED_DATA_KEY = "hr_completed_map"
+# H&R 周期记录键名：记录每个任务最近一次在站点 H&R 页面看到的保种周期。
+# 站点「未列出某任务」并不等于「该任务已完成保种」——站点从下载达标到登记
+# H&R 记录存在延迟，因此必须用保种周期作为删除前的硬闸门。
+HR_CYCLE_DATA_KEY = "hr_cycle_map"
 # HR 统计阈值：站点规则为「HR 种子下载大于等于 50% 时需完成规定保种时间」
 HR_PROGRESS_THRESHOLD = 0.5
+# 兜底 H&R 周期（小时）：站点从未给出周期时使用，默认 5 天。
+# 宁可多保种，也不要在保种未达标时误删任务。
+HR_DEFAULT_CYCLE_HOURS = 120.0
+# 保种时长闸门的安全余量：闸门要求「周期 + 余量」才放行，兜住站点登记延迟与
+# 标题匹配瞬时失败两类风险。实测本站点 H&R 计数仅比 QB 的 seeding_time 慢约
+# 2 小时，故余量取固定 2 小时即可，对 5 天周期即 122 小时。
+# （v1.9.1/v1.9.2 曾按周期的 5% 追加余量，5 天周期要拖到 126 小时才删，过于保守。）
+HR_CYCLE_MARGIN_RATIO = 0.0
+HR_CYCLE_MARGIN_MIN_HOURS = 2.0
 # UHD原盘自动下载 插件ID（用于读取副标题与种子标题）
 UHD_PLUGIN_ID = "UhdBlurayAutoDownload"
 # UHD原盘自动下载 插件的已处理记录键名
 UHD_PROCESSED_DATA_KEY = "uhd_processed_map"
+
+# ─────────────────────── 通知正文长度控制 ───────────────────────
+# 单条通知里最多列出的任务数
+NOTIFY_NAME_LIMIT = 20
+# 通知正文长度上限：各通知渠道上限不一（Telegram 为 4096），此处留出余量。
+# 正常情况下任务名**完整展示、不做单条截断**；只有整体超长时才减少列出条数。
+NOTIFY_TEXT_MAX = 3600
+
+# ── 删除保险 ②：匹配失效冻结 ──────────────────────────────────────
+# 「已完成」只能靠「站点 H&R 页面查无」反推，一旦站点与本地的标题匹配失效
+# （站点改版／标题格式变化），所有任务会同时变成「查无」并成批进入删除流程，
+# 而「解析 0 条」「条数骤降」两道保护只看站点条数，拦不住这种情况。
+# 判据：上一轮还能正常匹配到若干任务，本轮参与比对的任务一个都匹配不上。
+MATCH_STATS_DATA_KEY = "hr_match_stats"
+MATCH_FAIL_MIN_PREV = 2      # 上一轮至少匹配到 N 个，才说明「此前匹配是正常的」
+MATCH_FAIL_MIN_LOCAL = 2     # 本轮参与比对的本地任务至少 N 个，判定才有意义
+
+# ── 删除保险 ⑤：删除留档 ─────────────────────────────────────────
+DELETE_LOG_DATA_KEY = "hr_deleted_log"
+DELETE_LOG_LIMIT = 50        # 存储条数（保证事后可追溯）
+DELETE_LOG_DISPLAY = 5       # 页面展示条数
+
+
+def format_name_list_text(names: List[str]) -> str:
+    """把任务名列表渲染成通知正文。
+
+    优先完整展示每个任务名（不再按 60 字截断）；仅当整体长度超过
+    NOTIFY_TEXT_MAX 时，才从末尾递减列出条数，并追加「…等 N 个」说明。
+    """
+    total = len(names)
+    shown = list(names[:NOTIFY_NAME_LIMIT])
+    while shown:
+        hidden = total - len(shown)
+        body = "\n".join(f"- {name}" for name in shown)
+        if hidden > 0:
+            body += f"\n…等 {hidden} 个"
+        if len(body) <= NOTIFY_TEXT_MAX:
+            return body
+        shown.pop()
+    return f"（共 {total} 个任务，名称过长未逐条列出）"
+
+# ─────────────────────── 详情页卡片样式（清爽风） ───────────────────────
+# 状态色：与明暗主题均有足够对比度的中间调
+COLOR_OK = "#2e9e5b"      # 达标 / 已完成
+COLOR_WARN = "#e08a00"    # 进行中 / 未达标
+COLOR_DANGER = "#e5484d"  # 紧急 / 即将删除 / 失败
+COLOR_INFO = "#3b82f6"    # 提示
+COLOR_IDLE = "#8a8f98"    # 无数据 / 已跳过
+# 待复核（站点首次未列出、尚未开始计时）。用靛紫而非蓝：进度环的 0% 端就是蓝色，
+# 同色会让「刚下载完」和「等待复核」两种完全不同的状态撞色。
+COLOR_PENDING = "#7c5cff"
+
+# 完成度环形配色（方案 ⑥ · 莫兰迪 雾蓝 → 雾青 → 橄榄绿）
+# 越接近完成越绿；红色不再用于进度，只留给「即将删除」的倒计时那类真紧急。
+# 整条色阶统一低饱和（30%~34%）：相邻完成度仍可分辨，但不会像高饱和色那样抢眼，
+# 与 Vuetify 明暗主题都比较协调，长时间盯着不刺眼。
+# 每档为 (完成度%, 色相, 饱和度%, 明度%)，区间内线性插值。
+RING_COLOR_STOPS = (
+    (0.0, 205.0, 30.0, 58.0),    # 雾蓝：刚起步
+    (55.0, 170.0, 30.0, 52.0),   # 雾青：过半
+    (100.0, 135.0, 34.0, 44.0),  # 橄榄绿：达标
+)
+
+# 卡片外壳：浅描边 + 低饱和底，去掉重度毛玻璃与投影
+CARD_STYLE = (
+    "padding: 12px 14px; margin-bottom: 10px; border-radius: 12px; "
+    "background: rgba(var(--v-theme-surface-variant), 0.10); "
+    "border: 1px solid rgba(var(--v-theme-on-surface), 0.08);"
+)
+# 卡片标题：允许换行，但不在单词中间断开
+CARD_TITLE_STYLE = (
+    "flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 600; "
+    "line-height: 1.45; word-break: break-word; overflow-wrap: anywhere;"
+)
+# 卡片次级说明行
+CARD_CAPTION_STYLE = (
+    "margin-top: 4px; font-size: 12px; line-height: 1.5; opacity: 0.6; "
+    "word-break: break-word; overflow-wrap: anywhere;"
+)
+# 底部指标胶囊容器
+CARD_PILLS_STYLE = "margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """把秒数格式化为便于阅读的时长文本（如 "3天04:30"、"5.2h"）。"""
+    try:
+        total = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "-"
+    if total < 3600:
+        return f"{total / 60:.0f}分钟"
+    hours = total / 3600
+    if hours < 24:
+        return f"{hours:.1f}h"
+    days = int(hours // 24)
+    return f"{days}天{hours - days * 24:04.1f}h"
+
+
+def _parse_duration_hours(text: Any) -> Optional[float]:
+    """把时长文本尽力解析为小时数，**仅用于排序**，解析失败返回 None。
+
+    比 `__parse_seeding_hours` 更宽松，因为同一处「做种」字段有两种来源：
+      1. 站点 H&R 页面原文 —— `"3天02:48:29"`、`"14:38:16"`；
+      2. 插件自身的 `_fmt_duration()` 输出 —— `"3天04.5h"`、`"5.2h"`、`"42分钟"`。
+    后者中的 `h` / `分钟` 形式原解析器不认，若沿用会导致「保种中」这类记录
+    被误判成数据缺失而全部沉底，排序结果与直觉不符。
+
+    :param text: 时长文本（可为 None / 数字 / 字符串）
+    :return: 小时数；无法解析返回 None
+    """
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw or raw == "-":
+        return None
+    rest = raw
+    total = 0.0
+    matched = False
+    # 天
+    match = re.search(r'([\d.]+)\s*天', rest)
+    if match:
+        total += float(match.group(1)) * 24
+        rest = rest[match.end():]
+        matched = True
+    # 小时
+    match = re.search(r'([\d.]+)\s*(?:小时|h|H)', rest)
+    if match:
+        total += float(match.group(1))
+        rest = rest[match.end():]
+        matched = True
+    # 分钟
+    match = re.search(r'([\d.]+)\s*分钟?', rest)
+    if match:
+        total += float(match.group(1)) / 60
+        rest = rest[match.end():]
+        matched = True
+    # 时:分[:秒]
+    match = re.search(r'(\d+):(\d+)(?::(\d+))?', rest)
+    if match:
+        total += int(match.group(1))
+        total += int(match.group(2)) / 60
+        if match.group(3):
+            total += int(match.group(3)) / 3600
+        matched = True
+    return total if matched else None
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    """把 #RRGGBB 转成 rgba() 字符串。"""
+    value = hex_color.lstrip("#")
+    if len(value) != 6:
+        return hex_color
+    red, green, blue = (int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({red}, {green}, {blue}, {alpha})"
+
+
+def _hsl_to_hex(hue: float, saturation: float, lightness: float) -> str:
+    """HSL → #RRGGBB。
+
+    环形配色在 HSL 空间插值最自然（色相单调推进），但最终要输出 hex，
+    因为 `_rgba()` 只解析 6 位 hex，chip / pill 的半透明底色都依赖它。
+
+    :param hue: 色相 0-360
+    :param saturation: 饱和度 0-100
+    :param lightness: 明度 0-100
+    :return: `#rrggbb`
+    """
+    h = (hue % 360) / 360.0
+    s = max(0.0, min(100.0, saturation)) / 100.0
+    l = max(0.0, min(100.0, lightness)) / 100.0
+
+    def hue2rgb(p: float, q: float, t: float) -> float:
+        if t < 0:
+            t += 1
+        elif t > 1:
+            t -= 1
+        if t < 1.0 / 6.0:
+            return p + (q - p) * 6.0 * t
+        if t < 0.5:
+            return q
+        if t < 2.0 / 3.0:
+            return p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        return p
+
+    if s <= 0:
+        red = green = blue = l
+    else:
+        q = l * (1 + s) if l < 0.5 else l + s - l * s
+        p = 2 * l - q
+        red = hue2rgb(p, q, h + 1.0 / 3.0)
+        green = hue2rgb(p, q, h)
+        blue = hue2rgb(p, q, h - 1.0 / 3.0)
+    return "#%02x%02x%02x" % (round(red * 255), round(green * 255), round(blue * 255))
+
+
+def _ring_color(percent: float) -> str:
+    """完成度 → 环形颜色（方案 ⑥ · 莫兰迪 雾蓝 → 雾青 → 橄榄绿）。
+
+    连续插值，不做分档：相邻进度的颜色差异肉眼可辨，也不会出现
+    「24% 与 26% 差一档」这类边界争议。
+
+    :param percent: 完成度 0-100
+    :return: `#rrggbb`
+    """
+    try:
+        pct = float(percent)
+    except (TypeError, ValueError):
+        pct = 0.0
+    pct = max(0.0, min(100.0, pct))
+    for i in range(len(RING_COLOR_STOPS) - 1):
+        p0, h0, s0, l0 = RING_COLOR_STOPS[i]
+        p1, h1, s1, l1 = RING_COLOR_STOPS[i + 1]
+        if p0 <= pct <= p1:
+            t = 0.0 if p1 == p0 else (pct - p0) / (p1 - p0)
+            return _hsl_to_hex(h0 + (h1 - h0) * t,
+                               s0 + (s1 - s0) * t,
+                               l0 + (l1 - l0) * t)
+    last = RING_COLOR_STOPS[-1]
+    return _hsl_to_hex(last[1], last[2], last[3])
+
+
+def _status_chip(text: str, color: str) -> dict:
+    """卡片右上角状态徽标。"""
+    return {
+        "component": "div",
+        "props": {
+            "style": "flex: 0 0 auto; padding: 2px 10px; border-radius: 999px; "
+                     "font-size: 11px; line-height: 18px; font-weight: 600; "
+                     "white-space: nowrap; "
+                     f"color: {color}; background: {_rgba(color, 0.15)};",
+        },
+        "text": text,
+    }
+
+
+def _caption(text: str) -> dict:
+    """卡片次级说明行。"""
+    return {
+        "component": "div",
+        "props": {"style": CARD_CAPTION_STYLE},
+        "text": text,
+    }
+
+
+def _pill(text: str, color: str = "", strong: bool = False) -> dict:
+    """底部指标胶囊；传 color 则高亮，传 strong 则加粗。"""
+    style = ("padding: 2px 9px; border-radius: 999px; font-size: 11px; "
+             "line-height: 16px; white-space: nowrap; ")
+    if color:
+        style += (f"font-weight: 600; color: {color}; "
+                  f"background: {_rgba(color, 0.14)};")
+    elif strong:
+        style += ("font-weight: 600; "
+                  "background: rgba(var(--v-theme-on-surface), 0.10);")
+    else:
+        style += ("opacity: 0.8; "
+                  "background: rgba(var(--v-theme-on-surface), 0.06);")
+    return {"component": "div", "props": {"style": style}, "text": text}
+
+
+def _ring(percent: float, color: str, text: str, size: int = 46) -> dict:
+    """完成度／倒计时环形。
+
+    纯 div + conic-gradient 实现，不依赖 SVG 组件（MP 详情页只渲染
+    Vuetify 组件名，自定义 SVG 标签无法渲染）。外圈画环带，内圈用
+    主题背景色遮出「甜甜圈」空心，中心显示数字。
+
+    :param percent: 环带填充比例，自动裁剪到 0-100
+    :param color: 环带颜色
+    :param text: 中心文字（如 "85%" / "1.2h"）
+    :param size: 外径（px）
+    :return: 环形组件结构
+    """
+    ratio = max(0.0, min(100.0, float(percent)))
+    inner = size - 10
+    return {
+        "component": "div",
+        "props": {
+            "style": f"flex: 0 0 {size}px; width: {size}px; height: {size}px; "
+                     f"margin-top: 2px; border-radius: 50%; "
+                     f"background: conic-gradient({color} 0 {ratio:.1f}%, "
+                     f"rgba(var(--v-theme-on-surface), 0.10) {ratio:.1f}% 100%);",
+        },
+        "content": [
+            {
+                "component": "div",
+                "props": {
+                    "style": f"margin: 5px; height: {inner}px; border-radius: 50%; "
+                             f"background: rgb(var(--v-theme-surface)); "
+                             f"display: flex; align-items: center; "
+                             f"justify-content: center; font-size: 11px; "
+                             f"font-weight: 700; color: {color}; line-height: 1;",
+                },
+                "text": text,
+            }
+        ],
+    }
+
+
+def _ring_card(ring: dict, title: str, chip: Optional[dict] = None,
+               captions: Optional[List[str]] = None,
+               pills: Optional[List[dict]] = None) -> dict:
+    """环形卡片：左侧环形 + 右侧（标题 + 状态徽标 / 次级说明 / 指标胶囊）。"""
+    header = [{"component": "div", "props": {"style": CARD_TITLE_STYLE}, "text": title}]
+    if chip:
+        header.append(chip)
+
+    body: List[dict] = [
+        {
+            "component": "div",
+            "props": {"style": "display: flex; align-items: flex-start; gap: 8px;"},
+            "content": header,
+        }
+    ]
+    for text in captions or []:
+        body.append(_caption(text))
+    if pills:
+        body.append({
+            "component": "div",
+            "props": {"style": CARD_PILLS_STYLE},
+            "content": pills,
+        })
+
+    return {
+        "component": "div",
+        "props": {"style": CARD_STYLE},
+        "content": [
+            {
+                "component": "div",
+                "props": {"style": "display: flex; gap: 12px; align-items: flex-start;"},
+                "content": [
+                    ring,
+                    {
+                        "component": "div",
+                        "props": {"style": "flex: 1 1 auto; min-width: 0;"},
+                        "content": body,
+                    },
+                ],
+            }
+        ],
+    }
+
 
 
 class ChdbitsHrMonitor(_PluginBase):
@@ -33,7 +388,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "1.8.6"
+    plugin_version = "1.9.9"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -52,6 +407,7 @@ class ChdbitsHrMonitor(_PluginBase):
     _category: str = "彩虹岛&HR"
     _hr_url: str = ""
     _delete_delay_hours: int = 4
+    _fallback_cycle_hours: float = HR_DEFAULT_CYCLE_HOURS
     _interval_minutes: int = 30
     _run_once: bool = False
     # 最近一次检查时间
@@ -80,6 +436,7 @@ class ChdbitsHrMonitor(_PluginBase):
         self._category = "彩虹岛&HR"
         self._hr_url = ""
         self._delete_delay_hours = 4
+        self._fallback_cycle_hours = HR_DEFAULT_CYCLE_HOURS
         self._interval_minutes = 30
         self._run_once = False
         self._last_check_time = None
@@ -101,6 +458,11 @@ class ChdbitsHrMonitor(_PluginBase):
         except (TypeError, ValueError):
             self._delete_delay_hours = 4
         try:
+            fallback = float(config.get("fallback_cycle_hours") or HR_DEFAULT_CYCLE_HOURS)
+            self._fallback_cycle_hours = fallback if fallback > 0 else HR_DEFAULT_CYCLE_HOURS
+        except (TypeError, ValueError):
+            self._fallback_cycle_hours = HR_DEFAULT_CYCLE_HOURS
+        try:
             self._interval_minutes = max(5, int(config.get("interval_minutes") or 30))
         except (TypeError, ValueError):
             self._interval_minutes = 30
@@ -118,6 +480,7 @@ class ChdbitsHrMonitor(_PluginBase):
                     "category": self._category,
                     "hr_url": self._hr_url,
                     "delete_delay_hours": self._delete_delay_hours,
+                    "fallback_cycle_hours": self._fallback_cycle_hours,
                     "interval_minutes": self._interval_minutes,
                     "run_once": False,
                 }
@@ -258,7 +621,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -273,7 +636,22 @@ class ChdbitsHrMonitor(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "fallback_cycle_hours",
+                                            "label": "兜底保种周期（小时）",
+                                            "placeholder": "默认120（5天）",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -303,7 +681,12 @@ class ChdbitsHrMonitor(_PluginBase):
                                             "text": "插件会定时抓取彩虹岛 H&R 页面，与本地 QB 指定分类的任务比对。"
                                                     "站点 H&R 页面已不存在（即已完成保种要求）的任务，"
                                                     "在等待设定时间后自动从 QB 删除，并同时删除本地文件。"
-                                                    "H&R 周期 5 天对应 120 小时，3 天对应 72 小时。",
+                                                    "H&R 周期 5 天对应 120 小时，3 天对应 72 小时。"
+                                                    "安全闸门：站点从下载达标到登记 H&R 记录存在延迟，"
+                                                    "因此「站点未列出」不等于「已完成保种」——"
+                                                    "插件会先用本地做种时长与该任务的 H&R 周期比对，"
+                                                    "保种时长未达标（周期 + 2 小时安全余量）前绝不进入删除流程；"
+                                                    "站点从未给出周期时，以「兜底保种周期」为准。",
                                         },
                                     }
                                 ],
@@ -319,9 +702,367 @@ class ChdbitsHrMonitor(_PluginBase):
             "category": "彩虹岛&HR",
             "hr_url": "",
             "delete_delay_hours": 4,
+            "fallback_cycle_hours": 120,
             "interval_minutes": 30,
             "run_once": False,
         }
+
+    def __build_display_items(self) -> List[Dict[str, Any]]:
+        """把三份数据源合成一个统一展示清单（一个种子只保留一条）。
+
+        数据源：
+          1. ``self._last_compare_items`` —— 本地 QB 任务比对结果（本地视角，带 hash）
+          2. ``self._last_hr_tasks``       —— 站点 H&R 页面未完成任务（站点视角）
+          3. ``hr_completed_map``          —— 已完成／待复核记录（持久化，reload 后仍在）
+
+        同一个种子在 1 与 2 中都会出现（片名一一对应），这里合并成一条，
+        两侧的字段都保留：站点做种时间与本地做种时间分列，站点任务消失后
+        站点侧显示「已移除」，本地时长依旧可读。
+
+        :return: 展示项列表，已按「待删除 → 待复核 → 保种中 → 未达阈值 → 本地缺失」排序
+        """
+        completed_map: Dict[str, Dict[str, Any]] = self.get_data(COMPLETED_DATA_KEY) or {}
+        cycle_map: Dict[str, Dict[str, Any]] = self.get_data(HR_CYCLE_DATA_KEY) or {}
+        now_ts = datetime.now().timestamp()
+        delay_hours = self._delete_delay_hours or 0
+
+        items: List[Dict[str, Any]] = []
+        matched_site: set = set()
+        used_hashes: set = set()
+
+        # ── 1) 本地视角：每个本地任务一条 ──────────────────────────────
+        for cmp_item in self._last_compare_items or []:
+            name = str(cmp_item.get("name") or "")
+            torrent_hash = str(cmp_item.get("hash") or "")
+            if torrent_hash:
+                used_hashes.add(torrent_hash)
+            status_raw = str(cmp_item.get("status") or "").strip() or "-"
+            site_seeding = str(cmp_item.get("seeding_time") or "").strip()
+            local_seeding = str(cmp_item.get("local_seeding") or "").strip()
+            hr_cycle = str(cmp_item.get("hr_cycle") or "").strip()
+            remain_time = str(cmp_item.get("remain_time") or "").strip()
+            detail = str(cmp_item.get("detail") or "").strip()
+
+            subtitle, seed_title = self.__get_uhd_titles(name)
+            if not subtitle:
+                subtitle = self.__find_hr_subtitle(name)
+
+            # 站点任务（存在则说明仍在保种考核中）
+            site_task, site_idx = self.__match_site_task(name)
+            if site_idx >= 0:
+                matched_site.add(site_idx)
+            site_title = str(site_task.get("title") or "") if site_task else ""
+            if site_task:
+                site_seeding = site_seeding or str(site_task.get("seeding_time") or "").strip()
+                hr_cycle = hr_cycle or str(site_task.get("hr_cycle") or "").strip()
+            hr_percent = str(site_task.get("hr_percent") or "").strip() if site_task else ""
+            site_remain = str(site_task.get("remain_time") or "").strip() if site_task else ""
+
+            record = completed_map.get(torrent_hash) or {}
+
+            if record.get("pending_confirm"):
+                # ── 待复核：站点首次未列出，尚未开始删除计时 ──
+                items.append({
+                    "state": "pending",
+                    "title": subtitle or name or "(无标题)",
+                    "site_title": site_title,
+                    "seed_title": seed_title or name,
+                    "site_seeding": site_seeding,
+                    "local_seeding": local_seeding,
+                    "pct": 100.0,
+                    "ring_text": "✓",
+                    "color": COLOR_PENDING,
+                    "chip": "待复核",
+                    "sort_extra": 0.0,
+                    "captions": [c for c in (
+                        "站点已移除该任务，但需下次检查仍判定为已完成，"
+                        "才会进入 %g 小时删除倒计时" % delay_hours,
+                    ) if c],
+                    "pills": [
+                        _pill(f"首次发现 {record.get('first_seen_time') or '-'}", strong=True),
+                    ],
+                })
+                continue
+
+            if record.get("completed_at"):
+                # ── 待删除：已连续两次判定完成，进入删除倒计时 ──
+                completed_at = float(record.get("completed_at") or 0)
+                elapsed_hours = max(0.0, (now_ts - completed_at) / 3600)
+                remain_hours = max(0.0, delay_hours - elapsed_hours)
+                if remain_hours <= 1:
+                    color = COLOR_DANGER
+                elif remain_hours <= 6:
+                    color = COLOR_WARN
+                else:
+                    color = COLOR_OK
+                ratio = (elapsed_hours / delay_hours * 100) if delay_hours else 0.0
+                items.append({
+                    "state": "deleting",
+                    "title": subtitle or name or "(无标题)",
+                    "site_title": site_title,
+                    "seed_title": seed_title or name,
+                    "site_seeding": site_seeding,
+                    "local_seeding": local_seeding,
+                    "pct": min(100.0, ratio),
+                    "ring_text": f"{remain_hours:.1f}h",
+                    "color": color,
+                    "chip": f"{remain_hours:.1f}h 后删除",
+                    "sort_extra": remain_hours,
+                    "captions": [c for c in (
+                        f"站点已连续两次未列出该任务，判定已完成保种；"
+                        f"{delay_hours:g} 小时后删除 QB 任务与本地文件",
+                    ) if c],
+                    "pills": [
+                        _pill(f"完成 {record.get('completed_time') or '-'}", strong=True),
+                        _pill(f"已等待 {elapsed_hours:.1f}h"),
+                        _pill(f"剩余 {remain_hours:.1f}h", color=color),
+                    ],
+                })
+                continue
+
+            # ── 保种中／未达阈值 ──
+            cycle_hours = self.__parse_hr_cycle_hours(hr_cycle)
+            # 站点仍列出该任务时，完成度按站点口径（站点做种 ÷ 周期）
+            seeding_hours = self.__parse_seeding_hours(site_seeding)
+            if seeding_hours is None:
+                # 站点已移除，退回本地做种时长 ÷ 保种要求（cycle_map 中带余量）
+                seeding_hours = _parse_duration_hours(local_seeding)
+                if not cycle_hours and torrent_hash:
+                    cycle_hours = _parse_duration_hours(
+                        str((cycle_map.get(torrent_hash) or {}).get("hr_cycle") or "")
+                    )
+
+            if status_raw == "已冻结":
+                # 匹配失效被冻结：站点查无不可信，本轮不推进任何删除判定
+                items.append({
+                    "state": "frozen",
+                    "title": subtitle or name or "(无标题)",
+                    "site_title": site_title,
+                    "seed_title": seed_title or name,
+                    "site_seeding": site_seeding,
+                    "local_seeding": local_seeding,
+                    "pct": 0.0,
+                    "ring_text": "!",
+                    "color": COLOR_WARN,
+                    "chip": "已冻结",
+                    "sort_extra": 0.0,
+                    "captions": [c for c in (detail, self._last_error) if c],
+                    "pills": [_pill("本轮不推进删除", color=COLOR_WARN)],
+                })
+                continue
+
+            if status_raw == "未见记录":
+                # 从未在站点 H&R 页面出现过：查无 ≠ 已完成，永久排除在删除流程外
+                items.append({
+                    "state": "unseen",
+                    "title": subtitle or name or "(无标题)",
+                    "site_title": site_title,
+                    "seed_title": seed_title or name,
+                    "site_seeding": site_seeding,
+                    "local_seeding": local_seeding,
+                    "pct": 0.0,
+                    "ring_text": "?",
+                    "color": COLOR_IDLE,
+                    "chip": "未判定",
+                    "sort_extra": 0.0,
+                    "captions": [c for c in (detail,) if c],
+                    "pills": [_pill(f"周期 {hr_cycle or '-'}")],
+                })
+                continue
+
+            if status_raw == "未达阈值":
+                items.append({
+                    "state": "threshold",
+                    "title": subtitle or name or "(无标题)",
+                    "site_title": site_title,
+                    "seed_title": seed_title or name,
+                    "site_seeding": site_seeding,
+                    "local_seeding": local_seeding,
+                    "pct": 0.0,
+                    "ring_text": "–",
+                    "color": COLOR_IDLE,
+                    "chip": "未达阈值",
+                    "sort_extra": 0.0,
+                    "captions": [c for c in (detail,) if c],
+                    "pills": [],
+                })
+                continue
+
+            if cycle_hours and cycle_hours > 0 and seeding_hours is not None:
+                pct = min(100.0, seeding_hours / cycle_hours * 100)
+                remain = max(0.0, cycle_hours - seeding_hours)
+                # 颜色按完成度连续映射（蓝 → 青 → 绿），与「还差多少」解耦：
+                # 越接近完成越绿，不再用红色表达「快完成了」
+                color = _ring_color(pct)
+                if seeding_hours >= cycle_hours:
+                    chip = "已达标"
+                else:
+                    chip = f"未达标 · 还差 {remain:.1f}h"
+            else:
+                pct, chip, color = 0.0, "数据缺失", COLOR_IDLE
+
+            pills = [
+                _pill(f"{pct:.1f}%", color=color),
+                _pill(f"周期 {hr_cycle or '-'}"),
+            ]
+            if hr_percent:
+                pills.append(_pill(f"H&R {hr_percent}"))
+            if site_remain and site_remain != "-":
+                pills.append(_pill(f"站点剩余 {site_remain}"))
+            if remain_time and remain_time != "-":
+                pills.append(_pill(f"还差 {remain_time}"))
+            if not site_task and detail:
+                pills.append(_pill("站点已移除", color=COLOR_INFO))
+
+            items.append({
+                "state": "seeding",
+                "title": subtitle or name or "(无标题)",
+                "site_title": site_title,
+                "seed_title": seed_title or name,
+                "site_seeding": site_seeding,
+                "local_seeding": local_seeding,
+                "pct": pct,
+                "ring_text": f"{pct:.0f}%",
+                "color": color,
+                "chip": chip,
+                "sort_extra": 0.0,
+                "captions": [c for c in (detail,) if c] if not site_task else [],
+                "pills": pills,
+            })
+
+        # ── 2) 站点列出、本地没有的任务（不丢站点侧信息） ──────────────
+        for idx, task in enumerate(self._last_hr_tasks or []):
+            if idx in matched_site:
+                continue
+            site_title = str(task.get("title") or "")
+            subtitle, seed_title = self.__get_uhd_titles(site_title)
+            if not subtitle:
+                subtitle = str(task.get("subtitle") or "").strip()
+            if not seed_title:
+                seed_title = self.__find_qb_name(site_title)
+            site_seeding = str(task.get("seeding_time") or "").strip()
+            hr_cycle = str(task.get("hr_cycle") or "").strip()
+            cycle_hours = self.__parse_hr_cycle_hours(hr_cycle)
+            seeding_hours = self.__parse_seeding_hours(site_seeding)
+            if cycle_hours and cycle_hours > 0 and seeding_hours is not None:
+                pct = min(100.0, seeding_hours / cycle_hours * 100)
+                remain = max(0.0, cycle_hours - seeding_hours)
+                # 与保种中同一口径：颜色只表达完成度
+                color = _ring_color(pct)
+            else:
+                pct, color = 0.0, COLOR_IDLE
+            pills = [_pill(f"{pct:.1f}%", color=color)]
+            if hr_cycle:
+                pills.append(_pill(f"周期 {hr_cycle}"))
+            hr_percent = str(task.get("hr_percent") or "").strip()
+            if hr_percent:
+                pills.append(_pill(f"H&R {hr_percent}"))
+            site_remain = str(task.get("remain_time") or "").strip()
+            if site_remain and site_remain != "-":
+                pills.append(_pill(f"站点剩余 {site_remain}"))
+            items.append({
+                "state": "siteonly",
+                "title": subtitle or site_title or "(无标题)",
+                "site_title": site_title,
+                "seed_title": seed_title,
+                "site_seeding": site_seeding,
+                "local_seeding": "",
+                "pct": pct,
+                "ring_text": f"{pct:.0f}%",
+                "color": color,
+                "chip": "本地未找到",
+                "sort_extra": 0.0,
+                "captions": [f"本地 QB 分类「{self._category}」中没有对应任务，无法比对"],
+                "pills": pills,
+            })
+
+        # ── 3) 持久化记录里、本轮未覆盖的（reload 后内存态为空时仍要可见） ──
+        for torrent_hash, record in completed_map.items():
+            if torrent_hash in used_hashes:
+                continue
+            name = str(record.get("name") or "")
+            subtitle, seed_title = self.__get_uhd_titles(name)
+            display_title = subtitle or name or "(无标题)"
+            if record.get("pending_confirm"):
+                items.append({
+                    "state": "pending",
+                    "title": display_title,
+                    "site_title": "",
+                    "seed_title": seed_title or name,
+                    "site_seeding": "",
+                    "local_seeding": "",
+                    "pct": 100.0,
+                    "ring_text": "✓",
+                    "color": COLOR_PENDING,
+                    "chip": "待复核",
+                    "sort_extra": 0.0,
+                    "captions": [
+                        "站点已移除该任务，但需下次检查仍判定为已完成，"
+                        "才会进入 %g 小时删除倒计时" % delay_hours,
+                    ],
+                    "pills": [
+                        _pill(f"首次发现 {record.get('first_seen_time') or '-'}", strong=True),
+                    ],
+                })
+                continue
+            completed_at = float(record.get("completed_at") or 0)
+            elapsed_hours = max(0.0, (now_ts - completed_at) / 3600)
+            remain_hours = max(0.0, delay_hours - elapsed_hours)
+            if remain_hours <= 1:
+                color = COLOR_DANGER
+            elif remain_hours <= 6:
+                color = COLOR_WARN
+            else:
+                color = COLOR_OK
+            ratio = (elapsed_hours / delay_hours * 100) if delay_hours else 0.0
+            items.append({
+                "state": "deleting",
+                "title": display_title,
+                "site_title": "",
+                "seed_title": seed_title or name,
+                "site_seeding": "",
+                "local_seeding": "",
+                "pct": min(100.0, ratio),
+                "ring_text": f"{remain_hours:.1f}h",
+                "color": color,
+                "chip": f"{remain_hours:.1f}h 后删除",
+                "sort_extra": remain_hours,
+                "captions": [
+                    f"站点已连续两次未列出该任务，判定已完成保种；"
+                    f"{delay_hours:g} 小时后删除 QB 任务与本地文件",
+                ],
+                "pills": [
+                    _pill(f"完成 {record.get('completed_time') or '-'}", strong=True),
+                    _pill(f"已等待 {elapsed_hours:.1f}h"),
+                    _pill(f"剩余 {remain_hours:.1f}h", color=color),
+                ],
+            })
+
+        # ── 排序：待删除（剩余少的在前）→ 待复核 → 保种中（完成度降序）→ 其它 ──
+        order = {"deleting": 0, "pending": 1, "frozen": 2, "seeding": 3,
+                 "threshold": 4, "unseen": 5, "siteonly": 6}
+        items.sort(key=lambda it: (
+            order.get(it.get("state"), 9),
+            it.get("sort_extra") or 0.0,
+            -(it.get("pct") or 0.0),
+        ))
+        return items
+
+    def __match_site_task(self, local_title: str) -> Tuple[Optional[Dict[str, Any]], int]:
+        """在本地任务标题对应的站点 H&R 任务中查找，同时返回其索引。
+
+        :param local_title: 本地任务标题
+        :return: (站点任务, 索引)；未匹配返回 (None, -1)
+        """
+        if not local_title or not self._last_hr_tasks:
+            return None, -1
+        task = self.__find_site_task(local_title, self._last_hr_tasks)
+        if task is None:
+            return None, -1
+        for idx, item in enumerate(self._last_hr_tasks):
+            if item is task:
+                return task, idx
+        return task, -1
 
     def get_page(self) -> Optional[List[dict]]:
         """返回插件详情页面。
@@ -350,6 +1091,7 @@ class ChdbitsHrMonitor(_PluginBase):
                                     "text": f"下载器：{self._downloader or '未配置'}；"
                                             f"QB分类：{self._category}；"
                                             f"延迟删除：{self._delete_delay_hours} 小时；"
+                                            f"兜底保种周期：{self._fallback_cycle_hours:g} 小时；"
                                             f"检查间隔：{self._interval_minutes} 分钟；"
                                             f"最近检查：{self._last_check_time or '尚未检查'}",
                                 },
@@ -384,8 +1126,51 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-        # 站点未完成的 HR 任务
-        if self._last_hr_tasks:
+        # ── 统一任务清单 ──────────────────────────────────────────
+        # 站点视角 / 本地 QB 视角 / 已完成待删除 三份数据源合成一个列表，
+        # 同一个种子只保留一条；站点做种时间与本地做种时间分列显示，
+        # 站点任务消失后站点侧显示「已移除」，本地时长依旧可读。
+        display_items = self.__build_display_items()
+
+        counts: Dict[str, int] = {}
+        for item in display_items:
+            counts[item["state"]] = counts.get(item["state"], 0) + 1
+
+        if display_items:
+            # 插件重载后内存态被清空，此时只有持久化的完成态记录可显示，
+            # 需要显式说明，避免被误读成「保种中的任务都消失了」
+            if not self._last_check_time:
+                page_content.append(
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "warning",
+                                            "variant": "tonal",
+                                            "text": "本轮检查尚未执行（插件重载会清空内存态），"
+                                                    "以下仅显示已持久化的待删除／待复核记录；"
+                                                    "保种中的任务将在下一轮检查后恢复显示。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+
+            summary = [f"共 {len(display_items)} 个任务"]
+            for state, label in (("deleting", "待删除"), ("pending", "待复核"),
+                                 ("frozen", "已冻结"), ("seeding", "保种中"),
+                                 ("threshold", "未达阈值"), ("unseen", "未判定"),
+                                 ("siteonly", "本地未找到")):
+                if counts.get(state):
+                    summary.append(f"{label} {counts[state]}")
             page_content.append(
                 {
                     "component": "VRow",
@@ -397,9 +1182,9 @@ class ChdbitsHrMonitor(_PluginBase):
                                 {
                                     "component": "VAlert",
                                     "props": {
-                                        "type": "warning",
+                                        "type": "warning" if counts.get("deleting") else "info",
                                         "variant": "tonal",
-                                        "text": f"站点未完成 H&R 任务：{len(self._last_hr_tasks)} 个",
+                                        "text": " · ".join(summary),
                                     },
                                 }
                             ],
@@ -408,96 +1193,36 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-            # 使用卡片式布局，避免 VTable 单元格强制 nowrap 导致标题截断
             card_items = []
-            for task in self._last_hr_tasks:
-                # 计算做种进度与达标状态
-                cycle_hours = self.__parse_hr_cycle_hours(task.get("hr_cycle") or "")
-                seeding_hours = self.__parse_seeding_hours(task.get("seeding_time") or "")
-                if cycle_hours and seeding_hours is not None:
-                    progress = min(100.0, seeding_hours / cycle_hours * 100)
-                    remain_hours = max(0.0, cycle_hours - seeding_hours)
-                    progress_text = f"{seeding_hours:.1f}h / {cycle_hours:.0f}h（{progress:.1f}%）"
-                    if seeding_hours >= cycle_hours:
-                        status_text = "✅ 已达标"
-                    else:
-                        status_text = f"⏳ 未达标，还差 {remain_hours:.1f}h"
-                else:
-                    progress_text = "-"
-                    status_text = "-"
+            for item in display_items:
+                # 三个名字全部保留：主标题（中文名）+ 站点标题（英文原名）+ 种子标题（QB 任务名）
+                captions: List[str] = []
+                if item.get("site_title") and item["site_title"] != item["title"]:
+                    captions.append(f"站点标题：{item['site_title']}")
+                if item.get("seed_title") and item["seed_title"] not in (
+                        item["title"], item.get("site_title")):
+                    captions.append(f"种子标题：{item['seed_title']}")
+                captions.extend(item.get("captions") or [])
 
-                # 从 UHD原盘自动下载 插件读取副标题与种子标题，
-                # 记录缺失时回退到站点 H&R 页面自带的中文副标题
-                site_title = str(task.get("title") or "")
-                subtitle, seed_title = self.__get_uhd_titles(site_title)
-                if not subtitle:
-                    subtitle = str(task.get("subtitle") or "").strip()
-                # 记录缺失时，按站点标题在 QB 任务中反查实际任务名
-                if not seed_title:
-                    seed_title = self.__find_qb_name(site_title)
+                # 做种时间两个来源都列出来：站点计数与本地 QB 计数存在偏差，
+                # 站点任务消失后站点侧显示「已移除」
+                site_text = item.get("site_seeding") or (
+                    "已移除" if item["state"] in ("pending", "deleting") else "-")
+                local_text = item.get("local_seeding") or "-"
+                pills = [
+                    _pill(f"站点做种 {site_text}"),
+                    _pill(f"本地做种 {local_text}", strong=True),
+                ]
+                pills.extend(item.get("pills") or [])
 
                 card_items.append(
-                    {
-                        "component": "div",
-                        "props": {
-                            "style": "padding: 10px 12px; margin-bottom: 8px; "
-                                     "border-radius: 10px; "
-                                     "background: rgba(var(--v-theme-surface-variant), 0.18); "
-                                     "backdrop-filter: blur(10px) saturate(150%); "
-                                     "-webkit-backdrop-filter: blur(10px) saturate(150%); "
-                                     "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
-                                     "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);",
-                        },
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
-                                },
-                                "text": subtitle or site_title,
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
-                                },
-                                "text": f"站点标题：{site_title}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
-                                },
-                                "text": f"种子标题：{seed_title or site_title}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
-                                },
-                                "text": f"H&R百分比：{task.get('hr_percent') or '-'}　|　"
-                                        f"剩余时间：{task.get('remain_time') or '-'}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
-                                },
-                                "text": f"H&R周期：{task.get('hr_cycle') or '-'}　|　"
-                                        f"做种时间：{task.get('seeding_time') or '-'}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
-                                },
-                                "text": f"做种进度：{progress_text}　|　{status_text}",
-                            },
-                        ],
-                    }
+                    _ring_card(
+                        ring=_ring(item.get("pct") or 0.0, item["color"], item["ring_text"]),
+                        title=item["title"],
+                        chip=_status_chip(item["chip"], item["color"]),
+                        captions=captions,
+                        pills=pills,
+                    )
                 )
 
             page_content.append(
@@ -513,105 +1238,23 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-        # 已完成待删除任务
-        completed_map: Dict[str, Dict[str, Any]] = self.get_data(COMPLETED_DATA_KEY) or {}
-        if completed_map:
-            now_ts = datetime.now().timestamp()
-            card_items = []
-            for torrent_hash, record in completed_map.items():
-                completed_at = record.get("completed_at") or 0
-                elapsed_hours = (now_ts - completed_at) / 3600 if completed_at else 0
-                remain_hours = max(0, self._delete_delay_hours - elapsed_hours)
-                # 从 UHD原盘自动下载 插件读取副标题与种子标题
-                task_name = str(record.get("name") or "")
-                subtitle, seed_title = self.__get_uhd_titles(task_name)
-                card_items.append(
-                    {
-                        "component": "div",
-                        "props": {
-                            "style": "padding: 10px 12px; margin-bottom: 8px; "
-                                     "border-radius: 10px; "
-                                     "background: rgba(var(--v-theme-surface-variant), 0.18); "
-                                     "backdrop-filter: blur(10px) saturate(150%); "
-                                     "-webkit-backdrop-filter: blur(10px) saturate(150%); "
-                                     "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
-                                     "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);",
-                        },
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
-                                },
-                                "text": subtitle or task_name,
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
-                                },
-                                "text": f"QB任务标题：{task_name}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
-                                },
-                                "text": f"种子标题：{seed_title or task_name}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
-                                },
-                                "text": f"完成时间：{record.get('completed_time') or '-'}　|　"
-                                        f"已等待：{elapsed_hours:.1f} 小时　|　"
-                                        f"剩余：{remain_hours:.1f} 小时",
-                            },
-                        ],
-                    }
-                )
-
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "success",
-                                        "variant": "tonal",
-                                        "text": f"已完成待删除任务：{len(completed_map)} 个"
-                                                f"（延迟 {self._delete_delay_hours} 小时后删除）",
-                                    },
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": card_items,
-                        }
-                    ],
-                }
-            )
-
-        # QB 与站点比对明细
-        if self._last_compare_items:
+        # ── 最近删除留档（保险闸门 ⑤：删了什么，事后可追溯） ────────────
+        deleted_log: Dict[str, Dict[str, Any]] = self.get_data(DELETE_LOG_DATA_KEY) or {}
+        if deleted_log:
+            rows = sorted(
+                deleted_log.items(),
+                key=lambda kv: float(kv[1].get("deleted_at") or 0),
+                reverse=True,
+            )[:DELETE_LOG_DISPLAY]
+            lines = [
+                "· %s｜删除 %s｜本地做种 %s｜周期 %s"
+                % (rec.get("name") or "-", rec.get("deleted_time") or "-",
+                   rec.get("local_seeding") or "-", rec.get("hr_cycle") or "-")
+                for _, rec in rows
+            ]
+            head = f"最近删除 {len(deleted_log)} 个任务"
+            if len(deleted_log) > len(rows):
+                head += f"（留档上限 {DELETE_LOG_LIMIT} 条，仅显示最新 {len(rows)} 条）"
             page_content.append(
                 {
                     "component": "VRow",
@@ -625,82 +1268,11 @@ class ChdbitsHrMonitor(_PluginBase):
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": f"QB 分类「{self._category}」与站点比对明细："
-                                                f"{len(self._last_compare_items)} 个任务",
+                                        "style": "white-space: pre-line;",
+                                        "text": head + "：\n" + "\n".join(lines),
                                     },
                                 }
                             ],
-                        }
-                    ],
-                }
-            )
-
-            card_items = []
-            for item in self._last_compare_items:
-                # 从 UHD原盘自动下载 插件读取副标题，
-                # 记录缺失时回退到站点 H&R 任务的中文副标题
-                task_name = str(item.get("name") or "")
-                subtitle, _seed_title = self.__get_uhd_titles(task_name)
-                if not subtitle:
-                    subtitle = self.__find_hr_subtitle(task_name)
-                card_items.append(
-                    {
-                        "component": "div",
-                        "props": {
-                            "style": "padding: 10px 12px; margin-bottom: 8px; "
-                                     "border-radius: 10px; "
-                                     "background: rgba(var(--v-theme-surface-variant), 0.18); "
-                                     "backdrop-filter: blur(10px) saturate(150%); "
-                                     "-webkit-backdrop-filter: blur(10px) saturate(150%); "
-                                     "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
-                                     "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);",
-                        },
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 14px; font-weight: 600; line-height: 1.5;",
-                                },
-                                "text": subtitle or task_name,
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 12px; opacity: 0.75; line-height: 1.5; margin-top: 2px;",
-                                },
-                                "text": f"种子标题：{task_name}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
-                                },
-                                "text": f"站点状态：{item.get('status') or '-'}　|　"
-                                        f"H&R周期：{item.get('hr_cycle') or '-'}　|　"
-                                        f"做种时间：{item.get('seeding_time') or '-'}",
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "style": "font-size: 12px; opacity: 0.85; margin-top: 2px;",
-                                },
-                                "text": f"剩余做种时间：{item.get('remain_time') or '-'}　|　"
-                                        f"说明：{item.get('detail') or '-'}",
-                            },
-                        ],
-                    }
-                )
-
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": card_items,
                         }
                     ],
                 }
@@ -821,6 +1393,7 @@ class ChdbitsHrMonitor(_PluginBase):
         :param site_tasks: 站点未完成 H&R 任务列表
         """
         completed_map: Dict[str, Dict[str, Any]] = self.get_data(COMPLETED_DATA_KEY) or {}
+        cycle_map: Dict[str, Dict[str, Any]] = self.get_data(HR_CYCLE_DATA_KEY) or {}
         now_ts = datetime.now().timestamp()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         delay_seconds = self._delete_delay_hours * 3600
@@ -833,9 +1406,56 @@ class ChdbitsHrMonitor(_PluginBase):
         for torrent_hash in list(completed_map.keys()):
             if torrent_hash not in local_hashes:
                 completed_map.pop(torrent_hash, None)
+        for torrent_hash in list(cycle_map.keys()):
+            if torrent_hash not in local_hashes:
+                cycle_map.pop(torrent_hash, None)
+
+        # ── 保险闸门 ②：匹配失效冻结 ────────────────────────────────
+        # 站点与本地的标题一旦整体匹配不上，所有任务会同时变成「站点查无」，
+        # 而 check_hr 里的「解析 0 条」「条数骤降」两道保护只看站点条数，
+        # 拦不住这种情况。这里用「上一轮匹配正常、本轮一个都匹配不上」判定。
+        compared_local = 0
+        matched_local = 0
+        for torrent in local_torrents:
+            try:
+                progress = float(torrent.get("progress") or 0)
+            except (TypeError, ValueError):
+                progress = 0
+            if progress < HR_PROGRESS_THRESHOLD:
+                continue
+            compared_local += 1
+            if self.__find_site_task(torrent.get("name") or "", site_tasks):
+                matched_local += 1
+
+        stats = self.get_data(MATCH_STATS_DATA_KEY) or {}
+        try:
+            prev_matched = int(stats.get("matched") or 0)
+        except (TypeError, ValueError):
+            prev_matched = 0
+        frozen = bool(
+            site_tasks
+            and compared_local >= MATCH_FAIL_MIN_LOCAL
+            and matched_local == 0
+            and prev_matched >= MATCH_FAIL_MIN_PREV
+        )
+        if frozen:
+            self._last_error = (
+                f"站点与本地标题匹配失效（上轮匹配 {prev_matched} 个，本轮 0 个），"
+                f"已冻结本次删除判定"
+            )
+            logger.warning(f"彩虹岛HR监控：{self._last_error}")
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.SiteMessage,
+                    title="【彩虹岛HR监控】",
+                    text=f"{self._last_error}。\n站点 H&R 页面仍有 {len(site_tasks)} 个任务，"
+                         f"但本轮没有一条能与本地任务匹配上，疑似站点改版或标题格式变化；"
+                         f"为避免误删，本轮不推进任何删除倒计时。",
+                )
 
         delete_hashes: List[str] = []
         delete_names: List[str] = []
+        countdown_items: List[Tuple[str, str, str]] = []
         compare_items: List[Dict[str, Any]] = []
 
         for torrent in local_torrents:
@@ -843,6 +1463,12 @@ class ChdbitsHrMonitor(_PluginBase):
             if not torrent_hash:
                 continue
             title = torrent.get("name") or ""
+
+            # 本地做种时长（秒），保种时长闸门与页面展示共用。
+            # 注意：站点任务消失后（已完成）站点做种时间不可得，本地时长仍然可读，
+            # 因此这里在判定分支之前统一取值。
+            seeding_seconds = self.__get_seeding_seconds(torrent, now_ts)
+            local_seeding = _fmt_duration(seeding_seconds)
 
             # 安全校验：仅处理下载进度达到 HR 统计阈值的任务。
             # 站点规则：HR 种子下载大于等于 50% 时才需要完成规定保种时间，
@@ -857,8 +1483,10 @@ class ChdbitsHrMonitor(_PluginBase):
                 compare_items.append(
                     {
                         "name": title,
+                        "hash": torrent_hash,
                         "status": "未达阈值",
                         "seeding_time": "",
+                        "local_seeding": local_seeding,
                         "remain_time": "",
                         "hr_cycle": "",
                         "detail": f"下载进度 {progress * 100:.1f}%，未达 HR 统计阈值（50%），跳过比对",
@@ -876,14 +1504,121 @@ class ChdbitsHrMonitor(_PluginBase):
             # 站点 H&R 页面仍存在该任务，说明未完成，跳过
             if site_task:
                 completed_map.pop(torrent_hash, None)
+                # 记录该任务的 H&R 周期，供「保种时长闸门」使用
+                cycle_hours = self.__parse_hr_cycle_hours(hr_cycle)
+                if cycle_hours and cycle_hours > 0:
+                    prev_req = cycle_map.get(torrent_hash) or {}
+                    cycle_map[torrent_hash] = {
+                        "name": title,
+                        "hr_cycle": hr_cycle,
+                        "hr_cycle_hours": cycle_hours,
+                        "first_seen_at": prev_req.get("first_seen_at") or now_ts,
+                        "first_seen_time": prev_req.get("first_seen_time") or now_str,
+                        "updated_at": now_ts,
+                        "updated_time": now_str,
+                    }
                 compare_items.append(
                     {
                         "name": title,
+                        "hash": torrent_hash,
                         "status": "未完成",
+                        # seeding_time 语义统一为「站点做种时间」；
+                        # 本地做种时长单独放在 local_seeding，两者在页面上一并显示
                         "seeding_time": seeding_time,
+                        "local_seeding": local_seeding,
                         "remain_time": remain_time,
                         "hr_cycle": hr_cycle,
                         "detail": "站点 H&R 页面仍存在，保种中",
+                    }
+                )
+                continue
+
+            # ── 保种时长闸门（核心安全校验） ──────────────────────────────
+            # 站点规则是「HR 种子下载 ≥ 50% 才产生 H&R 记录」，且从下载达标到
+            # 页面登记存在延迟。因此「站点未列出该任务」并不等于「已完成保种」：
+            # 新下载完成的种子在登记延迟期内会被判定为完成，再等 delete_delay
+            # 小时就被连文件一起删除——既丢文件，又直接违反 H&R。
+            # 硬闸门：本地做种时长必须已达该任务的 H&R 周期 + 固定余量，才允许
+            # 判定完成；周期未知（从未在站点见到）时，以「兜底保种周期」为准。
+            req = cycle_map.get(torrent_hash) or {}
+            try:
+                known_cycle_hours = float(req.get("hr_cycle_hours") or 0)
+            except (TypeError, ValueError):
+                known_cycle_hours = 0.0
+            if known_cycle_hours > 0:
+                base_hours = known_cycle_hours
+                label = "保种要求"
+            else:
+                base_hours = float(self._fallback_cycle_hours or HR_DEFAULT_CYCLE_HOURS)
+                label = "保种要求（兜底周期）"
+            # 闸门在周期之上再加一段固定的安全余量（默认 2 小时）
+            margin_hours = max(
+                HR_CYCLE_MARGIN_MIN_HOURS, base_hours * HR_CYCLE_MARGIN_RATIO
+            )
+            required_seconds = (base_hours + margin_hours) * 3600
+            cycle_text = _fmt_duration(required_seconds)
+
+            if seeding_seconds + 60 < required_seconds:
+                completed_map.pop(torrent_hash, None)
+                logger.info(
+                    f"彩虹岛HR监控：站点未列出该任务，本地做种 "
+                    f"{_fmt_duration(seeding_seconds)} 未达{label} {cycle_text}，"
+                    f"暂不删除 {title[:60]}"
+                )
+                compare_items.append(
+                    {
+                        "name": title,
+                        "hash": torrent_hash,
+                        "status": "保种中",
+                        # 站点已无该任务，站点做种时间不可得，只填本地做种时长
+                        "seeding_time": "",
+                        "local_seeding": local_seeding,
+                        "remain_time": _fmt_duration(required_seconds - seeding_seconds),
+                        "hr_cycle": cycle_text,
+                        "detail": f"站点未列出该任务，本地做种 "
+                                  f"{_fmt_duration(seeding_seconds)} 未达{label} "
+                                  f"{cycle_text}，不进入删除流程",
+                    }
+                )
+                continue
+
+            # ── 保险闸门 ③：必须有「曾在站点出现过」的证据 ──────────────
+            # 站点从未列出过该任务时，「现在查无」根本不构成「已完成」的证据
+            # （可能是登记延迟、下载未达阈值、或标题一直匹配不上），此时只靠
+            # 兜底周期判断就删除风险过大，这里直接排除在删除流程之外。
+            if torrent_hash not in cycle_map:
+                completed_map.pop(torrent_hash, None)
+                logger.info(
+                    f"彩虹岛HR监控：站点从未列出过该任务，不判定完成 {title[:60]}"
+                )
+                compare_items.append(
+                    {
+                        "name": title,
+                        "hash": torrent_hash,
+                        "status": "未见记录",
+                        "seeding_time": "",
+                        "local_seeding": local_seeding,
+                        "remain_time": "",
+                        "hr_cycle": cycle_text,
+                        "detail": "从未在站点 H&R 页面出现过，「站点查无」不能作为完成证据，"
+                                  "不进入删除流程",
+                    }
+                )
+                continue
+
+            # ── 保险闸门 ②（生效）：本轮整体冻结 ──────────────────────
+            # 冻结期间保持记录原样：不新增待复核、不推进倒计时、不执行删除。
+            if frozen:
+                compare_items.append(
+                    {
+                        "name": title,
+                        "hash": torrent_hash,
+                        "status": "已冻结",
+                        "seeding_time": "",
+                        "local_seeding": local_seeding,
+                        "remain_time": "",
+                        "hr_cycle": cycle_text,
+                        "detail": "站点与本地标题匹配疑似失效，本次不推进删除判定",
                     }
                 )
                 continue
@@ -906,8 +1641,10 @@ class ChdbitsHrMonitor(_PluginBase):
                 compare_items.append(
                     {
                         "name": title,
+                        "hash": torrent_hash,
                         "status": "待确认",
                         "seeding_time": "",
+                        "local_seeding": local_seeding,
                         "remain_time": "",
                         "hr_cycle": "",
                         "detail": "站点未找到该任务，等待下次检查确认",
@@ -921,14 +1658,16 @@ class ChdbitsHrMonitor(_PluginBase):
                 record["completed_at"] = now_ts
                 record["completed_time"] = now_str
                 logger.info(f"彩虹岛HR监控：任务已完成，开始计时 {title[:60]}")
-                logger.info(f"彩虹岛HR监控：任务已完成，开始计时 {title[:60]}")
+                countdown_items.append((title, local_seeding, cycle_text))
                 compare_items.append(
                     {
                         "name": title,
+                        "hash": torrent_hash,
                         "status": "已完成",
-                        "seeding_time": "-",
-                        "remain_time": "-",
-                        "hr_cycle": "-",
+                        "seeding_time": "",
+                        "local_seeding": local_seeding,
+                        "remain_time": "",
+                        "hr_cycle": "",
                         "detail": f"站点已无该任务，开始计时（{self._delete_delay_hours} 小时后删除）",
                     }
                 )
@@ -943,10 +1682,12 @@ class ChdbitsHrMonitor(_PluginBase):
                 compare_items.append(
                     {
                         "name": title,
+                        "hash": torrent_hash,
                         "status": "待删除",
-                        "seeding_time": "-",
-                        "remain_time": "-",
-                        "hr_cycle": "-",
+                        "seeding_time": "",
+                        "local_seeding": local_seeding,
+                        "remain_time": "",
+                        "hr_cycle": "",
                         "detail": f"已完成 {elapsed_hours:.1f} 小时，本次删除",
                     }
                 )
@@ -955,28 +1696,81 @@ class ChdbitsHrMonitor(_PluginBase):
                 compare_items.append(
                     {
                         "name": title,
+                        "hash": torrent_hash,
                         "status": "已完成",
-                        "seeding_time": "-",
-                        "remain_time": "-",
-                        "hr_cycle": "-",
+                        "seeding_time": "",
+                        "local_seeding": local_seeding,
+                        "remain_time": "",
+                        "hr_cycle": "",
                         "detail": f"已完成 {elapsed_hours:.1f} 小时，剩余 {remain_hours:.1f} 小时删除",
                     }
                 )
 
         self._last_compare_items = compare_items
 
+        # ── 保险闸门 ①：进入删除倒计时立刻通知 ────────────────────────
+        # 倒计时期间是唯一的抢救窗口，删完再通知等于没有窗口。
+        if countdown_items and self._notify:
+            eta_str = datetime.fromtimestamp(now_ts + delay_seconds).strftime("%m-%d %H:%M")
+            shown = list(countdown_items[:NOTIFY_NAME_LIMIT])
+            while shown:
+                hidden = len(countdown_items) - len(shown)
+                body = "\n".join(
+                    "- %s\n  本地做种 %s ／ 保种要求 %s" % (name, seeding or "-", cycle or "-")
+                    for name, seeding, cycle in shown
+                )
+                if hidden > 0:
+                    body += f"\n…等 {hidden} 个"
+                if len(body) <= NOTIFY_TEXT_MAX:
+                    break
+                shown.pop()
+            else:
+                body = f"（共 {len(countdown_items)} 个任务，名称过长未逐条列出）"
+            logger.info(f"彩虹岛HR监控：{len(countdown_items)} 个任务进入删除倒计时")
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title="【彩虹岛HR监控】",
+                text=f"{len(countdown_items)} 个任务已完成保种，进入删除倒计时：\n{body}\n\n"
+                     f"将于 {self._delete_delay_hours:g} 小时后（约 {eta_str}）"
+                     f"删除 QB 任务并连本地文件一起删除。\n"
+                     f"如需保留：把这些种子移出 QB 分类「{self._category}」即可终止。",
+            )
+
         # 执行删除
         if delete_hashes:
             logger.info(f"彩虹岛HR监控：删除 {len(delete_hashes)} 个已完成任务（含文件）")
+            seeding_by_hash = {
+                str(item.get("hash") or ""): str(item.get("local_seeding") or "")
+                for item in compare_items
+            }
+            deleted_log: Dict[str, Dict[str, Any]] = self.get_data(DELETE_LOG_DATA_KEY) or {}
             if downloader_obj.delete_torrents(delete_file=True, ids=delete_hashes):
-                for torrent_hash in delete_hashes:
+                for torrent_hash, name in zip(delete_hashes, delete_names):
+                    # ── 保险闸门 ⑤：删除留档，事后可追溯 ──────────────
+                    deleted_log[torrent_hash] = {
+                        "name": name,
+                        "deleted_at": now_ts,
+                        "deleted_time": now_str,
+                        "local_seeding": seeding_by_hash.get(torrent_hash, ""),
+                        "hr_cycle": str((cycle_map.get(torrent_hash) or {}).get("hr_cycle") or ""),
+                    }
                     completed_map.pop(torrent_hash, None)
+                    cycle_map.pop(torrent_hash, None)
+                # 只保留最近若干条，避免无限增长
+                if len(deleted_log) > DELETE_LOG_LIMIT:
+                    keep = sorted(
+                        deleted_log.items(),
+                        key=lambda kv: float(kv[1].get("deleted_at") or 0),
+                        reverse=True,
+                    )[:DELETE_LOG_LIMIT]
+                    deleted_log = dict(keep)
+                self.save_data(DELETE_LOG_DATA_KEY, deleted_log)
                 if self._notify:
                     self.post_message(
                         mtype=NotificationType.SiteMessage,
                         title="【彩虹岛HR监控】",
                         text=f"已删除 {len(delete_hashes)} 个已完成 H&R 任务（含本地文件）：\n"
-                             + "\n".join(f"- {name[:60]}" for name in delete_names[:20]),
+                             + format_name_list_text(delete_names),
                     )
             else:
                 logger.error("彩虹岛HR监控：删除任务失败")
@@ -987,7 +1781,47 @@ class ChdbitsHrMonitor(_PluginBase):
                         text="删除已完成任务失败，请检查下载器状态。",
                     )
 
+        # 匹配统计只在未冻结时刷新：冻结期间保持「此前匹配正常」的记忆，
+        # 否则下一轮 prev_matched 变成 0，闸门会自行失效。
+        if not frozen:
+            self.save_data(
+                MATCH_STATS_DATA_KEY,
+                {
+                    "matched": matched_local,
+                    "compared": compared_local,
+                    "site_count": len(site_tasks),
+                    "updated_at": now_ts,
+                    "updated_time": now_str,
+                },
+            )
+
         self.save_data(COMPLETED_DATA_KEY, completed_map)
+        self.save_data(HR_CYCLE_DATA_KEY, cycle_map)
+
+    @staticmethod
+    def __get_seeding_seconds(torrent: Dict[str, Any], now_ts: float) -> float:
+        """取本地做种时长（秒），用于 H&R 保种时长闸门。
+
+        QB 的 seeding_time 单位为秒；个别下载器不提供该字段时，
+        退回用「当前时间 - 完成时间」估算。
+
+        :param torrent: QB 任务字典
+        :param now_ts: 当前时间戳
+        :return: 做种时长（秒）
+        """
+        try:
+            value = float(torrent.get("seeding_time") or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+        try:
+            completion_on = float(torrent.get("completion_on") or 0)
+        except (TypeError, ValueError):
+            completion_on = 0.0
+        if completion_on > 0:
+            return max(0.0, now_ts - completion_on)
+        return 0.0
 
     def __fetch_hr_tasks(self) -> Tuple[List[Dict[str, Any]], str]:
         """抓取并解析站点 H&R 页面。
