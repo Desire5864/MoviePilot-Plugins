@@ -79,6 +79,16 @@ HR_BADGE_RADIUS = 2            # 徽章圆角
 HR_BADGE_FONT = 8              # 徽章字号
 HR_BADGE_OFFSET_Y = 1          # 垂直微调：行高居中后再下移 1px（视觉居中，用户确认）
 
+# 详情页「站点分类胶囊」的站点配色（键为站点中文名，值为胶囊圆点颜色）。
+# 配色沿用 H&R 徽章原则「同站点配色」：彩虹岛蓝 #1E90FF、我堡黑 #060619；
+# 天空站列表页无 H&R 徽章可参照，取站点头部主题蓝 #2bb24c（与站点 logo 一致）。
+# 未在映射里的站点（如「未知站点」）回退灰色 #888888。
+_SITE_COLORS = {
+    "彩虹岛": "#1E90FF",
+    "我堡": "#060619",
+    "天空": "#2bb24c",
+}
+
 # 详情页字段缓存最多保留条数（超出后按写入时间淘汰最旧的）
 DETAIL_CACHE_LIMIT = 800
 # 影片简介缓存最多保留条数
@@ -192,7 +202,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.9.8"
+    plugin_version = "2.9.9"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -686,19 +696,60 @@ class UhdBlurayAutoDownload(_PluginBase):
                 }
             )
 
-        # 最近发现的种子明细（按站点分组显示）
+        # 最近发现的种子明细（顶部站点胶囊 + 分类内容，CSS :has() 联动切换）
         if self._last_items:
             # 实时读取 QB 任务列表，用于展示本地真实进度
             # （与「站点进度」区分：站点进度是站点侧统计值，本地进度才是下载器实际进度）
             # 读取失败返回 None，此时不展示误导性的进度
             qb_torrents = self.__list_qb_torrents()
-            # 按站点分组
+            # 按站点分组（顺序 = _last_items 中站点出现顺序，即站点配置顺序）
             site_groups: Dict[str, List[Dict[str, Any]]] = {}
             for item in self._last_items:
                 site_name = str(item.get("site") or "未知站点")
                 site_groups.setdefault(site_name, []).append(item)
 
-            for site_name, group_items in site_groups.items():
+            sites = list(site_groups.keys())
+
+            # 顶部站点胶囊：VChipGroup 的选中态由组件内部自维护（PageRender 不解析
+            # model，但 group 内部状态可用）；内容区切换靠 CSS :has() 联动 data-*
+            # 属性，完全绕开 model 绑定（机理见 merge 技能「详情页点击切换第二条路」）。
+            chips: List[Dict[str, Any]] = []
+            for i, site_name in enumerate(sites):
+                key = f"site{i}"
+                color = _SITE_COLORS.get(site_name, "#888888")
+                chips.append(
+                    {
+                        "component": "VChip",
+                        "props": {
+                            "value": key,
+                            "data-site": key,
+                            "variant": "outlined",
+                            "link": True,
+                        },
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": f"width:10px; height:10px; "
+                                             f"border-radius:50%; "
+                                             f"background:{color}; "
+                                             f"margin-right:6px;",
+                                },
+                            },
+                            {
+                                "component": "span",
+                                "text": f"{site_name}（{len(site_groups[site_name])}）",
+                            },
+                        ],
+                    }
+                )
+
+            # 每个站点的内容 pane + CSS 联动规则
+            panes: List[Dict[str, Any]] = []
+            css_rules: List[str] = [".uhd-site-pane { display: none; }"]
+            for i, site_name in enumerate(sites):
+                key = f"site{i}"
+                group_items = site_groups[site_name]
                 # 「本次推送」只统计**本轮新推**（action 恰好为「已推送」）；
                 # 历史轮次推过的条目，action 是「已推送，下载中/已完成」。
                 # 两者共用「推送」二字，只报前者时会与卡片上的「已推送…」看起来
@@ -714,7 +765,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                 )
                 if prior_pushed > 0:
                     summary_text += f"，其中 {prior_pushed} 条此前已推送"
-                page_content.append(
+
+                # 该站点 pane 内容 = 汇总 Alert（置顶）+ 卡片列表
+                pane_content: List[Dict[str, Any]] = [
                     {
                         "component": "VRow",
                         "content": [
@@ -734,7 +787,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             }
                         ],
                     }
-                )
+                ]
 
                 # 使用卡片式布局，避免 VTable 单元格强制 nowrap 导致标题截断
                 card_items = []
@@ -878,7 +931,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                         }
                     )
 
-                page_content.append(
+                pane_content.append(
                     {
                         "component": "VRow",
                         "content": [
@@ -890,6 +943,48 @@ class UhdBlurayAutoDownload(_PluginBase):
                         ],
                     }
                 )
+                panes.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "uhd-site-pane", "data-pane": key},
+                        "content": pane_content,
+                    }
+                )
+                css_rules.append(
+                    f'.uhd-site-root:has(.v-chip--selected[data-site="{key}"]) '
+                    f'.uhd-site-pane[data-pane="{key}"] {{ display: block; }}'
+                )
+
+            # 兜底：不支持 :has() 的浏览器退回「全展开」，保证内容不丢
+            css_rules.append(
+                "@supports not (selector(:has(*))) { "
+                ".uhd-site-pane { display: block; } }"
+            )
+
+            # 组装：注入 <style> + 顶部胶囊组 + 各站点 pane
+            page_content.append(
+                {
+                    "component": "div",
+                    "props": {"class": "uhd-site-root"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"style": "display:none"},
+                            "html": "<style>" + "\n".join(css_rules) + "</style>",
+                        },
+                        {
+                            "component": "VChipGroup",
+                            "props": {
+                                "mandatory": True,
+                                "modelValue": "site0",
+                                "density": "comfortable",
+                            },
+                            "content": chips,
+                        },
+                        *panes,
+                    ],
+                }
+            )
 
         return page_content
 
