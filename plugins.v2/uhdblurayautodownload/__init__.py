@@ -27,7 +27,21 @@ DOWNLOAD_TAG = "UHD自动下载"
 # 站点阀门配置键（v2.11.0 起）：单个数组键取代「每站点一个布尔键」。
 # 元素沿用 _site_switch_key() 生成的站点键名（如 enable_ptchdbits_co），
 # 这样旧配置里的布尔键与新数组元素同名，迁移时无需映射表。
+#
+# v2.12.0 语义微调：本键管的是「**采集**」（抓不抓），不再等同于「推送」。
+# 是否推送由下面三个表格键单独控制。
 SITE_VALVE_KEY = "enable_sites"
+
+# 下载分类 / 路径 / 推送开关的配置键前缀（v2.12.0 起）。
+# 每个站点一组，后缀为 _site_conf_alias(domain)（域名里的 '.' 换成 '_'）：
+#   dw_cat_<alias>    QB 分类名（空 = 不归类）
+#   dw_path_<alias>   保存路径（空 = 用下载器默认目录）
+#   dw_push_<alias>   是否推送该站点抓到的种子（False = 只采集展示，不推送）
+# 三者任一缺失时回退到 _site_configs 里写死的默认值，
+# 因此老配置（没有这些键）行为与 v2.11.0 完全一致。
+DW_CATEGORY_PREFIX = "dw_cat_"
+DW_PATH_PREFIX = "dw_path_"
+DW_PUSH_PREFIX = "dw_push_"
 
 # 推送模式（push_mode）可选值
 PUSH_MODE_ALL = "all"               # 全部推送：不筛促销（现状）
@@ -203,11 +217,11 @@ class UhdBlurayAutoDownload(_PluginBase):
 
     # 插件名称
     plugin_name = "UHD原盘自动下载"
-    plugin_desc = "监控彩虹岛/我堡/天空最新4K UHD BluRay原盘，站点阀门按需勾选，支持免费优先/只推免费，未下载的自动推送QB。"
+    plugin_desc = "监控彩虹岛/我堡/天空/家园最新4K UHD BluRay原盘，采集站点按需勾选，下载分类与路径逐站点可配并带推送开关，支持免费优先/只推免费，未下载的自动推送QB。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.11.0"
+    plugin_version = "2.12.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -318,8 +332,11 @@ class UhdBlurayAutoDownload(_PluginBase):
     _enabled: bool = False
     _notify: bool = False
     _downloader: str = ""
-    # 各站点开关状态：域名 -> 是否启用
+    # 各站点开关状态：域名 -> 是否启用（采集）
     _site_enabled: Dict[str, bool] = {}
+    # 下载分类 / 路径 / 推送开关的表单覆盖值（v2.12.0 起）：域名 -> {category/save_path/push_enabled}
+    # 只存「表单里显式配过」的项，其余由 __site_effective_conf() 回退到 _site_configs 默认值
+    _dw_override: Dict[str, Dict[str, Any]] = {}
     _interval_minutes: int = 15
     # 每个站点只采集最新 N 条
     _latest_count: int = 5
@@ -395,6 +412,28 @@ class UhdBlurayAutoDownload(_PluginBase):
                     self._site_enabled[domain] = bool(config.get(key))
                 else:
                     self._site_enabled[domain] = bool(site_conf.get("default_enabled", True))
+
+        # 下载分类 / 路径 / 推送开关（v2.12.0 起）：
+        #   表单表格里逐站点可编辑，缺键时回退到 _site_configs 的写死默认值，
+        #   因此老配置（没有这三个前缀的键）行为与 v2.11.0 保持一致。
+        # 注意：只把「配置里有显式键」的值写进覆盖表，
+        #       不预先铺满全部站点 —— __site_conf() 里按需回退，避免脏值扩散。
+        self._dw_override = {}
+        for domain, site_conf in self._site_configs.items():
+            alias = self._site_conf_alias(domain)
+            override: Dict[str, Any] = {}
+            cat_key = DW_CATEGORY_PREFIX + alias
+            path_key = DW_PATH_PREFIX + alias
+            push_key = DW_PUSH_PREFIX + alias
+            if cat_key in config:
+                override["category"] = str(config.get(cat_key) or "").strip()
+            if path_key in config:
+                override["save_path"] = str(config.get(path_key) or "").strip()
+            if push_key in config:
+                override["push_enabled"] = bool(config.get(push_key))
+            if override:
+                self._dw_override[domain] = override
+
         try:
             self._interval_minutes = max(5, int(config.get("interval_minutes") or 15))
         except (TypeError, ValueError):
@@ -462,6 +501,13 @@ class UhdBlurayAutoDownload(_PluginBase):
             "run_once": False,
             SITE_VALVE_KEY: self.__default_enabled_keys(),
         }
+        # 下载分类 / 路径 / 推送开关（v2.12.0 起）：逐站点生成默认值，
+        # 取值 = _site_configs 里写死的 category / save_path / push_enabled。
+        for domain, site_conf in self._site_configs.items():
+            alias = self._site_conf_alias(domain)
+            default_config[DW_CATEGORY_PREFIX + alias] = str(site_conf.get("category") or "")
+            default_config[DW_PATH_PREFIX + alias] = str(site_conf.get("save_path") or "")
+            default_config[DW_PUSH_PREFIX + alias] = bool(site_conf.get("push_enabled", True))
 
         return [
             {
@@ -523,18 +569,20 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "站点阀门：在「推送站点」里勾选的站点才会被抓取与推送，"
+                                            "text": "采集站点：在「采集站点」里勾选的站点才会被抓取，"
                                                     "可多选、也可点标签上的 × 单独移除；"
                                                     "未保存过配置时，彩虹岛、我堡、家园默认勾选，"
-                                                    "天空默认不勾（需手动勾选后才开始推送）。"
-                                                    "家园当前仅抓取展示、暂不推送。",
+                                                    "天空默认不勾选（需手动勾选后才会抓取）。"
+                                                    "抓到的种子是否推送到下载器，"
+                                                    "由下方「下载分类与路径」表格里的「推送」开关逐站点决定。",
                                         },
                                     }
                                 ],
                             }
                         ],
                     },
-                    # 站点阀门：一个多选下拉取代原先每站点一个开关（v2.11.0）
+                    # 站点阀门（v2.11.0 引入，v2.12.0 起语义收窄为「采集」）：
+                    # 一个多选下拉取代原先每站点一个开关；是否推送另由下方表格的开关控制。
                     {
                         "component": "VRow",
                         "content": [
@@ -546,7 +594,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "component": "VSelect",
                                         "props": {
                                             "model": SITE_VALVE_KEY,
-                                            "label": "推送站点",
+                                            "label": "采集站点",
                                             "multiple": True,
                                             "chips": True,
                                             "closableChips": True,
@@ -559,8 +607,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                 for domain, site_conf
                                                 in self._site_configs.items()
                                             ],
-                                            "placeholder": "点击展开勾选要启用的站点",
-                                            "hint": "只有勾选的站点才会被抓取与推送",
+                                            "placeholder": "点击展开勾选要采集的站点",
+                                            "hint": "只有勾选的站点才会被抓取；是否推送由下方「推送」开关单独控制",
                                             "persistentHint": True,
                                         },
                                     }
@@ -671,15 +719,303 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "插件会定时抓取「已勾选站点」的 UHD BluRay 原盘列表，"
+                                            "text": "下载分类与路径：一行一个站点，直接编辑分类与保存路径。"
+                                                    "最后一列「推送」控制该站点抓到的种子是否推送到下载器 —— "
+                                                    "关掉后该站点照常采集并在详情页展示，但不会推送（适合先观望一阵）。",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"class": "text-caption text-medium-emphasis"},
+                        "content": [
+                            {"component": "VCol", "props": {"cols": 2}, "content": ["站点"]},
+                            {"component": "VCol", "props": {"cols": 3}, "content": ["QB 分类"]},
+                            {"component": "VCol", "props": {"cols": 3}, "content": ["保存路径"]},
+                            {"component": "VCol", "props": {"cols": 4}, "content": ["是否推送"]},
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True, "align": "center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "content": ["彩虹岛"],
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_CATEGORY_PREFIX}ptchdbits_co",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_PATH_PREFIX}ptchdbits_co",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": f"{DW_PUSH_PREFIX}ptchdbits_co",
+                                            "label": "推送",
+                                            "color": "primary",
+                                            "density": "comfortable",
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True, "align": "center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "content": ["我堡"],
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_CATEGORY_PREFIX}ourbits_club",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_PATH_PREFIX}ourbits_club",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": f"{DW_PUSH_PREFIX}ourbits_club",
+                                            "label": "推送",
+                                            "color": "primary",
+                                            "density": "comfortable",
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True, "align": "center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "content": ["天空"],
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_CATEGORY_PREFIX}hdsky_me",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_PATH_PREFIX}hdsky_me",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": f"{DW_PUSH_PREFIX}hdsky_me",
+                                            "label": "推送",
+                                            "color": "primary",
+                                            "density": "comfortable",
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "props": {"dense": True, "align": "center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "content": ["家园"],
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_CATEGORY_PREFIX}hdhome_org",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_PATH_PREFIX}hdhome_org",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": f"{DW_PUSH_PREFIX}hdhome_org",
+                                            "label": "推送",
+                                            "color": "primary",
+                                            "density": "comfortable",
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "插件会定时抓取「已勾选采集站点」的 UHD BluRay 原盘列表，"
                                                     "每站只处理列表页最新的 N 条（默认 5 条），"
                                                     "筛选出进度列表示「尚无下载记录」的种子，"
-                                                    "自动推送到 QB 下载器。"
-                                                    "彩虹岛：分类「彩虹岛&HR」/ 路径「/原盘」/ 标签「UHD自动下载」；"
-                                                    "我堡：分类「OurBits原盘」/ 路径「/原盘」/ 标签「UHD自动下载」；"
-                                                    "天空：分类「HDSky原盘」/ 路径「/ISO」/ 标签「UHD原盘下载」；"
-                                                    "家园：按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤，"
-                                                    "当前仅抓取展示、暂不推送。",
+                                                    "对「推送」开关已打开的站点自动推送到 QB 下载器"
+                                                    "（分类与路径取自上方表格）。"
+                                                    "家园：按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤。",
                                         },
                                     }
                                 ],
@@ -716,7 +1052,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                     "variant": "tonal",
                                     "text": f"下载器：{self._downloader or '未配置'}；"
                                             f"检查间隔：{self._interval_minutes} 分钟；"
-                                            f"启用站点：{self.__enabled_site_text()}；"
+                                            f"采集站点：{self.__enabled_site_text()}；"
+                                            f"推送站点：{self.__push_site_text()}；"
                                             f"最近检查：{self._last_check_time or '尚未检查'}",
                                 },
                             }
@@ -1088,10 +1425,12 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         for domain, site_conf in self._site_configs.items():
             if not self._site_enabled.get(domain, True):
-                logger.info(f"UHD原盘自动下载：站点 {site_conf.get('name')} 已关闭，跳过")
+                logger.info(f"UHD原盘自动下载：站点 {site_conf.get('name')} 未勾选采集，跳过")
                 continue
+            # 合并表单里的「下载分类 / 路径 / 推送开关」覆盖值（v2.12.0 起）
+            eff_conf = self.__site_effective_conf(domain, site_conf)
             try:
-                items = self.__process_site(domain, site_conf, downloader_obj, processed_map)
+                items = self.__process_site(domain, eff_conf, downloader_obj, processed_map)
                 all_items.extend(items)
                 downloaded_items.extend([item for item in items if item.get("action") == "已推送"])
             except Exception as err:
@@ -1648,11 +1987,11 @@ class UhdBlurayAutoDownload(_PluginBase):
                 items.append(item)
                 continue
 
-            # 站点未启用推送（如家园「先只上架抓取展示」）：
+            # 站点未开启推送（表单表格里「推送」开关关掉，或站点常量 push_enabled=False）：
             # 走到这里说明该种子「该推了」（站点侧无下载记录、本插件也未推送过），
-            # 但按站点配置不执行推送 —— 仅展示、不下载种子、不写已处理记录。
+            # 但按站点配置不执行推送 —— 仅采集展示、不下载种子、不写已处理记录。
             if not site_conf.get("push_enabled", True):
-                item["action"] = "未推送（该站点暂不推送）"
+                item["action"] = "未推送（该站点的推送开关已关闭）"
                 items.append(item)
                 continue
 
@@ -2390,6 +2729,18 @@ class UhdBlurayAutoDownload(_PluginBase):
         """
         return "enable_" + re.sub(r'[^0-9a-z]+', '_', str(domain or '').lower()).strip('_')
 
+    @staticmethod
+    def _site_conf_alias(domain: str) -> str:
+        """把站点域名转换为「下载配置」键的后缀（v2.12.0 起）。
+
+        与 _site_switch_key 的区别：不带 enable_ 前缀，
+        用于拼 dw_cat_ / dw_path_ / dw_push_ 三个表格键。
+
+        :param domain: 站点域名（如 hdsky.me）
+        :return: 键后缀（如 hdsky_me）
+        """
+        return re.sub(r'[^0-9a-z]+', '_', str(domain or '').lower()).strip('_')
+
     @classmethod
     def __default_enabled_keys(cls) -> List[str]:
         """返回默认勾上的站点键名列表，用于表单默认值。
@@ -2403,16 +2754,34 @@ class UhdBlurayAutoDownload(_PluginBase):
         ]
 
     def __enabled_site_text(self) -> str:
-        """返回已启用站点的名称文本，用于详情页概览。
+        """返回「已勾选采集」的站点名称文本，用于详情页概览。
 
-        :return: 形如 "彩虹岛、天空"；全部关闭时返回 "无（全部关闭）"
+        :return: 形如 "彩虹岛、天空"；全部未勾选时返回 "无（全部未勾选）"
         """
         names = [
             str(site_conf.get("name") or domain)
             for domain, site_conf in self._site_configs.items()
             if self._site_enabled.get(domain, True)
         ]
-        return "、".join(names) if names else "无（全部关闭）"
+        return "、".join(names) if names else "无（全部未勾选）"
+
+    def __push_site_text(self) -> str:
+        """返回「采集且推送开关为开」的站点名称文本，用于详情页概览（v2.12.0 起）。
+
+        与 __enabled_site_text 的区别：这里额外要求 push_enabled 为真，
+        所以「采集了但不推送」的站点不会出现在这段里 —— 详情页一眼能看出
+        哪些站点是「只看不推」的状态。
+
+        :return: 形如 "彩虹岛、天空"；无此类站点时返回 "无（均仅采集）"
+        """
+        names = []
+        for domain, site_conf in self._site_configs.items():
+            if not self._site_enabled.get(domain, True):
+                continue
+            eff = self.__site_effective_conf(domain, site_conf)
+            if eff.get("push_enabled", True):
+                names.append(str(site_conf.get("name") or domain))
+        return "、".join(names) if names else "无（均仅采集）"
 
     def __get_downloader(self) -> Optional[Any]:
         """获取下载器实例。
@@ -2432,6 +2801,31 @@ class UhdBlurayAutoDownload(_PluginBase):
                 continue
             return downloader_obj
         return None
+
+    def __site_effective_conf(self, domain: str, site_conf: Dict[str, Any]) -> Dict[str, Any]:
+        """把表单里的「下载分类 / 路径 / 推送开关」覆盖到站点配置上（v2.12.0 起）。
+
+        改造前：category / save_path / push_enabled 写死在 _site_configs 常量里，
+                配置页上只以说明文字出现，用户改不了。
+        改造后：三个键均可在表单表格里逐站点编辑；
+                配置里没有对应键时（老配置 / 未保存过）**原样返回**，
+                行为与 v2.11.0 完全一致。
+
+        只做浅拷贝 + 局部覆盖，不修改 _site_configs 本身（类级共享，改了会污染其它实例）。
+
+        :param domain: 站点域名
+        :param site_conf: _site_configs 里的站点配置
+        :return: 覆盖后的站点配置（新字典）
+        """
+        override = self._dw_override.get(domain)
+        if not override:
+            return site_conf
+        merged = dict(site_conf)
+        for key, value in override.items():
+            # 分类 / 路径允许「显式留空 = 不归类 / 用下载器默认目录」，
+            # 故空字符串也要覆盖，不能用 `if value:` 判断。
+            merged[key] = value
+        return merged
 
     def __get_site_config(self, domain: str) -> Optional[dict]:
         """获取站点配置（同一轮内复用，避免同一条记录反复查库）。
