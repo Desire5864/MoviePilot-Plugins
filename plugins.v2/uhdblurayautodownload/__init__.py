@@ -223,7 +223,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.13.0"
+    plugin_version = "2.13.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -722,11 +722,11 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "component": "VRow",
                         "props": {"class": "text-caption text-medium-emphasis"},
                         "content": [
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "站点"}}]},
-                            {"component": "VCol", "props": {"cols": 3}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "分类"}}]},
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "标签"}}]},
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "保存路径"}}]},
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "推送开关"}}]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "站点"}]},
+                            {"component": "VCol", "props": {"cols": 3}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "分类"}]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "标签"}]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "保存路径"}]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "推送开关"}]},
                         ],
                     },
                     {
@@ -739,7 +739,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "彩虹岛"},
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "text": "彩虹岛",
                                     }
                                 ],
                             },
@@ -819,7 +820,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "我堡"},
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "text": "我堡",
                                     }
                                 ],
                             },
@@ -899,7 +901,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "天空"},
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "text": "天空",
                                     }
                                 ],
                             },
@@ -979,7 +982,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "家园"},
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
+                                        "text": "家园",
                                     }
                                 ],
                             },
