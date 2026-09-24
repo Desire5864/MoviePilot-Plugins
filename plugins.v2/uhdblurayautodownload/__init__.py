@@ -38,6 +38,47 @@ _FREE_MARK_RE = re.compile(
     r'(?:class=["\'](?:pro_)?free["\']|alt=["\']Free["\'])', re.I
 )
 
+# 站点「H&R（Hit & Run）」标记在列表页里的形态（两站各有一套，需同时覆盖）：
+#   我堡    <img class="hitandrun" src="pic/trans.gif" alt="H&amp;R" title="H&amp;R" />
+#           站点同款外观（styles/sprites.css）：
+#             img.hitandrun{width:35px;height:12px;
+#               background:url(icons.gif?2) no-repeat -100px -171px}
+#           —— 即 35x12 深色底(#060619)白字「H&R」图标（2026-09-24 抠图确证）
+#   彩虹岛  <div class="circle"><div class="circle-text" ...>h5</div></div>
+#           站点同款外观（include/css/hnr3.css）：
+#             .circle{width:14px;height:14px;border-radius:50%;
+#               background-color:#1E90FF;border:1px solid #1e90ff}
+#             .circle-text{width:14px;height:14px;line-height:14px;
+#               text-align:center;font-size:10px;color:white}
+#           —— 即 14x14 蓝色圆标 + 白色 10px 字，圆内文字为 h+数字
+#           （2026-09-24 实测 h5 / h3；站内 H&R 页即 hnr.php，「hnr」= Hit aNd Run）
+# 天空列表页不渲染任何 H&R 标记（2026-09-24 实测 0 处）。
+# 命中即视为「该种子带 H&R 考核」——**仅用于详情页展示与推送通知提示**，
+# 绝不参与「该不该推送」的判定。
+_HR_MARK_RE = re.compile(
+    r'(?:class=["\']hitandrun["\']'                     # 我堡：图标 class
+    r'|(?:alt|title)=["\']H(?:&amp;|&)?R["\']'          # 通用：alt / title 文本
+    r'|class=["\']circle-text["\'][^>]*>\s*[hH]\d)',    # 彩虹岛：圆形 H&R 徽章
+    re.I
+)
+# 彩虹岛圆标内的文字（h+数字），供详情页复刻**站点同款**蓝色圆标时取用
+_HR_CIRCLE_RE = re.compile(
+    r'class=["\']circle-text["\'][^>]*>\s*([hH]\d+)', re.I
+)
+# 「站点同款」徽章形态判据：彩虹岛圆标文字形如 h5 / h3，其余（我堡）走图标形态
+_HR_CIRCLE_TEXT_RE = re.compile(r'^[hH]\d+$')
+
+# 详情页 H&R 徽章尺寸（v2.9.8 起为「小巧」档，按用户确认的效果图定稿）。
+# 🔴 徽章高度与副标题行高**必须分开定义**：副标题是 14px 字、需要 20px 行高，
+#    徽章只要 12px。早期把两者绑成同一个常量（HR_BADGE_HEIGHT 既当副标题行高
+#    又当徽章高度），一旦把徽章缩小，副标题行高会被一起压扁 —— 现拆成两个常量。
+HR_SUBTITLE_LINE_HEIGHT = 20   # 副标题 line-height（固定，不随徽章尺寸变化）
+HR_BADGE_HEIGHT = 12           # 徽章高度（彩虹岛与我堡一致）
+HR_BADGE_PAD_X = 4             # 徽章左右内边距（宽度随标识文字自适应）
+HR_BADGE_RADIUS = 2            # 徽章圆角
+HR_BADGE_FONT = 8              # 徽章字号
+HR_BADGE_OFFSET_Y = 1          # 垂直微调：行高居中后再下移 1px（视觉居中，用户确认）
+
 # 详情页字段缓存最多保留条数（超出后按写入时间淘汰最旧的）
 DETAIL_CACHE_LIMIT = 800
 # 影片简介缓存最多保留条数
@@ -151,7 +192,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.9.2"
+    plugin_version = "2.9.8"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -712,14 +753,71 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 )
                             )
 
+                    # 副标题行：副标题文本 + 可选 H&R 徽章。徽章紧跟在副标题之后
+                    # （flex 布局：空间够就并排在同一行，副标题过长时自动换行）。
+                    # 徽章沿用**站点同款配色**（彩虹岛蓝底 #1E90FF、我堡黑底 #060619，
+                    # 均白字），尺寸见 HR_BADGE_* 常量（现为小巧档：12px 高 / 8px 字 /
+                    # 内边距 4px / 圆角 2px），宽度随标识文字自适应；副标题行高固定
+                    # HR_SUBTITLE_LINE_HEIGHT(20px)，徽章行高居中后再下移
+                    # HR_BADGE_OFFSET_Y(1px) 做视觉微调（该位置经效果图与用户确认）。
+                    # 彩虹岛徽章文字取站点圆标原值（h5 / h3），我堡固定「H&R」；
+                    # 字体跟随站点行内 SimHei（Arial 的小写 h 过于纤细，不像站点标识）。
+                    # 早期记录只存了 is_hr 布尔值、没有标识文本 → 回退我堡形态。
+                    subtitle_row: List[Dict[str, Any]] = [
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": "min-width: 0; white-space: normal; "
+                                         "word-break: break-all; font-size: 14px; "
+                                         "font-weight: 600; "
+                                         f"line-height: {HR_SUBTITLE_LINE_HEIGHT}px;",
+                            },
+                            "text": str(item.get("subtitle") or ""),
+                        },
+                    ]
+                    hr_mark = str(item.get("hr_mark") or
+                                  ("H&R" if item.get("is_hr") else ""))
+                    if hr_mark:
+                        if _HR_CIRCLE_TEXT_RE.match(hr_mark):
+                            # 彩虹岛：蓝底白字，文字为站点圆标原值（h5 / h3）
+                            hr_bg = "#1E90FF"
+                            hr_text = hr_mark
+                        else:
+                            # 我堡：黑底白字「H&R」
+                            hr_bg = "#060619"
+                            hr_text = "H&R"
+                        subtitle_row.append(
+                            {
+                                "component": "div",
+                                "props": {
+                                    "style": (
+                                        "flex: none; align-self: center; "
+                                        f"position: relative; "
+                                        f"top: {HR_BADGE_OFFSET_Y}px; "
+                                        "margin-left: 6px; box-sizing: border-box; "
+                                        f"height: {HR_BADGE_HEIGHT}px; "
+                                        f"line-height: {HR_BADGE_HEIGHT}px; "
+                                        f"padding: 0 {HR_BADGE_PAD_X}px; "
+                                        f"border-radius: {HR_BADGE_RADIUS}px; "
+                                        f"background: {hr_bg}; color: #ffffff; "
+                                        f"font-size: {HR_BADGE_FONT}px; "
+                                        "font-weight: 700; letter-spacing: 0.5px; "
+                                        "font-family: SimHei, 'Microsoft YaHei', "
+                                        "Arial, sans-serif;"
+                                    ),
+                                },
+                                "text": hr_text,
+                            }
+                        )
+
                     card_lines: List[Dict[str, Any]] = [
                         {
                             "component": "div",
                             "props": {
-                                "style": "white-space: normal; word-break: break-all; "
-                                         "font-size: 14px; font-weight: 600; line-height: 1.5;",
+                                "style": "display: flex; align-items: center; "
+                                         "flex-wrap: wrap;",
                             },
-                            "text": str(item.get("subtitle") or ""),
+                            "content": subtitle_row,
                         },
                         {
                             "component": "div",
@@ -737,6 +835,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             "text": f"大小：{item.get('size') or '-'}　|　"
                                     f"站点进度：{item.get('progress') or '-'}　|　"
                                     f"促销：{'免费' if item.get('is_free') else '收费'}　|　"
+                                    f"H&R：{'是' if item.get('is_hr') else '否'}　|　"
                                     f"处理结果：{item.get('action') or '-'}",
                         },
                     ]
@@ -871,7 +970,11 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         # 发送通知
         if self._notify and downloaded_items:
-            lines = [f"🎬 已推送 {len(downloaded_items)} 个 UHD 原盘到 QB", ""]
+            hr_count = len([i for i in downloaded_items if i.get("is_hr")])
+            head = f"🎬 已推送 {len(downloaded_items)} 个 UHD 原盘到 QB"
+            if hr_count:
+                head += f"（其中 {hr_count} 个带 H&R 考核）"
+            lines = [head, ""]
             for item in downloaded_items[:20]:
                 subtitle = item.get("subtitle") or ""
                 title = item.get("title") or ""
@@ -898,6 +1001,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                 # 体积
                 if size:
                     lines.append(f"▎体积：{size}")
+                # H&R 考核提示：带考核的种子单独提一行，避免下载后忘保种被站点处罚
+                if item.get("is_hr"):
+                    lines.append("▎H&R：⚠️ 该种子带 Hit & Run 考核，请勿删种，注意保种达标")
                 # 影片简介（TMDB）
                 if intro:
                     lines.append(f"▎简介：{intro}")
@@ -1300,6 +1406,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                 "size": torrent.get("size") or "",
                 "progress": progress,
                 "is_free": bool(torrent.get("is_free")),
+                "is_hr": bool(torrent.get("is_hr")),
+                "hr_mark": str(torrent.get("hr_mark") or ""),
                 "action": "",
             }
 
@@ -1313,6 +1421,16 @@ class UhdBlurayAutoDownload(_PluginBase):
 
             need_detail = True
             if record:
+                # H&R 标识以「记录里有就保留」为准：站点改版导致本轮解析不到
+                # hitandrun 图标时，历史记录的标识不至于凭空消失。
+                # 标识文本同样补全：本轮没解析到就沿用记录里的；早期记录只存了
+                # is_hr 布尔值，此时回退成「H&R」以便详情页仍有徽章可渲染。
+                if not item.get("hr_mark"):
+                    item["hr_mark"] = str(record.get("hr_mark") or "")
+                if record.get("is_hr"):
+                    item["is_hr"] = True
+                    if not item.get("hr_mark"):
+                        item["hr_mark"] = "H&R"
                 cached_subtitle = str(record.get("subtitle") or "")
                 cached_name = str(record.get("qb_name") or "")
                 # 两项都在记录里才可跳过抓取（缺任一项仍需回源补齐）
@@ -1421,6 +1539,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                     "intro": item.get("intro") or "",
                     "cn_title": self.__extract_cn_title(item.get("subtitle") or ""),
                     "site": site_name,
+                    # H&R 标识一并落库：历史轮次也能展示，站点改版时标识不丢
+                    "is_hr": bool(item.get("is_hr")),
+                    "hr_mark": str(item.get("hr_mark") or ""),
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 self._map_dirty = True
@@ -1455,6 +1576,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                     "intro": item.get("intro") or "",
                     "cn_title": self.__extract_cn_title(item.get("subtitle") or ""),
                     "site": site_name,
+                    # H&R 标识一并落库：历史轮次也能展示，站点改版时标识不丢
+                    "is_hr": bool(item.get("is_hr")),
+                    "hr_mark": str(item.get("hr_mark") or ""),
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 self._map_dirty = True
@@ -1913,15 +2037,28 @@ class UhdBlurayAutoDownload(_PluginBase):
                     download_url = picked.get('action') or ""
                     download_method = (picked.get('method') or "post").lower()
 
-            # 免费促销标记：对该行 HTML 做正则识别（class="pro_free" /
-            # class="free" / alt="Free"）。仅用于「只推免费 / 免费优先」的
-            # 行级复核，不改变取数顺序与现有字段。
-            is_free = False
+            # 行级标记：对该行 HTML 做正则识别，一次序列化供多个标记复用。
+            #   - 免费促销（class="pro_free" / class="free" / alt="Free"）：
+            #     仅用于「只推免费 / 免费优先」的行级复核，不改变取数顺序。
+            #   - H&R 考核（我堡 class="hitandrun" / 彩虹岛 class="circle-text"）：
+            #     仅用于详情页展示与推送通知提示，不参与推送判定
+            #     （是否带 H&R 由站点自行考核，插件不做取舍）。
+            row_html = ""
             try:
                 row_html = etree.tostring(row, encoding="unicode")
-                is_free = bool(_FREE_MARK_RE.search(row_html))
             except Exception:
-                is_free = False
+                row_html = ""
+            is_free = bool(_FREE_MARK_RE.search(row_html)) if row_html else False
+            # 站点同款 H&R 标识文本：彩虹岛取圆标里的 h+数字（如 h5），
+            # 我堡取图标语义「H&R」。详情页据此复刻各自站点的同款徽章。
+            hr_mark = ""
+            if row_html:
+                circle_match = _HR_CIRCLE_RE.search(row_html)
+                if circle_match:
+                    hr_mark = circle_match.group(1)
+                elif _HR_MARK_RE.search(row_html):
+                    hr_mark = "H&R"
+            is_hr = bool(hr_mark)
 
             torrents.append(
                 {
@@ -1934,6 +2071,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                     "download_url": download_url,
                     "download_method": download_method,
                     "is_free": is_free,
+                    "is_hr": is_hr,
+                    "hr_mark": hr_mark,
                 }
             )
         return torrents
