@@ -32,14 +32,16 @@ DOWNLOAD_TAG = "UHD自动下载"
 # 是否推送由下面三个表格键单独控制。
 SITE_VALVE_KEY = "enable_sites"
 
-# 下载分类 / 路径 / 推送开关的配置键前缀（v2.12.0 起）。
+# 下载分类 / 标签 / 路径 / 推送开关的配置键前缀（v2.12.0 起，v2.13.0 增标签）。
 # 每个站点一组，后缀为 _site_conf_alias(domain)（域名里的 '.' 换成 '_'）：
 #   dw_cat_<alias>    QB 分类名（空 = 不归类）
+#   dw_tag_<alias>    QB 标签（空 = 回退到 DOWNLOAD_TAG 默认标签）
 #   dw_path_<alias>   保存路径（空 = 用下载器默认目录）
 #   dw_push_<alias>   是否推送该站点抓到的种子（False = 只采集展示，不推送）
-# 三者任一缺失时回退到 _site_configs 里写死的默认值，
+# 四者任一缺失时回退到 _site_configs 里写死的默认值，
 # 因此老配置（没有这些键）行为与 v2.11.0 完全一致。
 DW_CATEGORY_PREFIX = "dw_cat_"
+DW_TAG_PREFIX = "dw_tag_"
 DW_PATH_PREFIX = "dw_path_"
 DW_PUSH_PREFIX = "dw_push_"
 
@@ -217,11 +219,11 @@ class UhdBlurayAutoDownload(_PluginBase):
 
     # 插件名称
     plugin_name = "UHD原盘自动下载"
-    plugin_desc = "监控彩虹岛/我堡/天空/家园最新4K UHD BluRay原盘，采集站点按需勾选，下载分类与路径逐站点可配并带推送开关，支持免费优先/只推免费，未下载的自动推送QB。"
+    plugin_desc = "监控彩虹岛/我堡/天空/家园最新4K UHD BluRay原盘，采集站点按需勾选，下载分类/标签/路径逐站点可配并带推送开关，支持免费优先/只推免费，未下载的自动推送QB。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.12.0"
+    plugin_version = "2.13.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -413,9 +415,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                 else:
                     self._site_enabled[domain] = bool(site_conf.get("default_enabled", True))
 
-        # 下载分类 / 路径 / 推送开关（v2.12.0 起）：
+        # 下载分类 / 标签 / 路径 / 推送开关（v2.12.0 起，v2.13.0 增标签）：
         #   表单表格里逐站点可编辑，缺键时回退到 _site_configs 的写死默认值，
-        #   因此老配置（没有这三个前缀的键）行为与 v2.11.0 保持一致。
+        #   因此老配置（没有这些前缀的键）行为与 v2.11.0 保持一致。
         # 注意：只把「配置里有显式键」的值写进覆盖表，
         #       不预先铺满全部站点 —— __site_conf() 里按需回退，避免脏值扩散。
         self._dw_override = {}
@@ -423,10 +425,13 @@ class UhdBlurayAutoDownload(_PluginBase):
             alias = self._site_conf_alias(domain)
             override: Dict[str, Any] = {}
             cat_key = DW_CATEGORY_PREFIX + alias
+            tag_key = DW_TAG_PREFIX + alias
             path_key = DW_PATH_PREFIX + alias
             push_key = DW_PUSH_PREFIX + alias
             if cat_key in config:
                 override["category"] = str(config.get(cat_key) or "").strip()
+            if tag_key in config:
+                override["tag"] = str(config.get(tag_key) or "").strip()
             if path_key in config:
                 override["save_path"] = str(config.get(path_key) or "").strip()
             if push_key in config:
@@ -506,6 +511,7 @@ class UhdBlurayAutoDownload(_PluginBase):
         for domain, site_conf in self._site_configs.items():
             alias = self._site_conf_alias(domain)
             default_config[DW_CATEGORY_PREFIX + alias] = str(site_conf.get("category") or "")
+            default_config[DW_TAG_PREFIX + alias] = str(site_conf.get("tag") or "")
             default_config[DW_PATH_PREFIX + alias] = str(site_conf.get("save_path") or "")
             default_config[DW_PUSH_PREFIX + alias] = bool(site_conf.get("push_enabled", True))
 
@@ -673,7 +679,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12},
                                 "content": [
                                     {
                                         "component": "VSelect",
@@ -685,22 +691,6 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                 {"title": "免费优先（先推免费，收费排后）", "value": PUSH_MODE_FREE_FIRST},
                                                 {"title": "只推免费（收费直接跳过）", "value": PUSH_MODE_FREE_ONLY},
                                             ],
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "抓取始终按列表页原样取最新 N 条（不做免费过滤）；"
-                                                    "「只推免费」在推送时逐行判断免费标记，收费种子直接跳过；"
-                                                    "「免费优先」先推免费、收费种子排后照常推送。",
                                         },
                                     }
                                 ],
@@ -719,7 +709,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "下载分类与路径：一行一个站点，直接编辑分类与保存路径。"
+                                            "text": "下载配置：一行一个站点，直接编辑分类、标签与保存路径。"
                                                     "最后一列「推送」控制该站点抓到的种子是否推送到下载器 —— "
                                                     "关掉后该站点照常采集并在详情页展示，但不会推送（适合先观望一阵）。",
                                         },
@@ -732,10 +722,11 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "component": "VRow",
                         "props": {"class": "text-caption text-medium-emphasis"},
                         "content": [
-                            {"component": "VCol", "props": {"cols": 2}, "content": ["站点"]},
-                            {"component": "VCol", "props": {"cols": 3}, "content": ["QB 分类"]},
-                            {"component": "VCol", "props": {"cols": 3}, "content": ["保存路径"]},
-                            {"component": "VCol", "props": {"cols": 4}, "content": ["是否推送"]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "站点"}}]},
+                            {"component": "VCol", "props": {"cols": 3}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "分类"}}]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "标签"}}]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "保存路径"}}]},
+                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text", "text": "推送开关"}}]},
                         ],
                     },
                     {
@@ -748,8 +739,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "content": ["彩虹岛"],
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "彩虹岛"},
                                     }
                                 ],
                             },
@@ -771,7 +761,23 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 3},
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_TAG_PREFIX}ptchdbits_co",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -787,7 +793,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 4},
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -813,8 +819,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "content": ["我堡"],
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "我堡"},
                                     }
                                 ],
                             },
@@ -836,7 +841,23 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 3},
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_TAG_PREFIX}ourbits_club",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -852,7 +873,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 4},
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -878,8 +899,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "content": ["天空"],
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "天空"},
                                     }
                                 ],
                             },
@@ -901,7 +921,23 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 3},
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_TAG_PREFIX}hdsky_me",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -917,7 +953,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 4},
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -943,8 +979,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "content": ["家园"],
+                                        "props": {"size": "small", "variant": "tonal", "color": "primary", "text": "家园"},
                                     }
                                 ],
                             },
@@ -966,7 +1001,23 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 3},
+                                "props": {"cols": 2},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": f"{DW_TAG_PREFIX}hdhome_org",
+                                            "density": "compact",
+                                            "variant": "solo",
+                                            "flat": True,
+                                            "hideDetails": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -982,7 +1033,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 4},
+                                "props": {"cols": 2},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -1014,7 +1065,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                     "每站只处理列表页最新的 N 条（默认 5 条），"
                                                     "筛选出进度列表示「尚无下载记录」的种子，"
                                                     "对「推送」开关已打开的站点自动推送到 QB 下载器"
-                                                    "（分类与路径取自上方表格）。"
+                                                    "（分类、标签与路径取自上方表格）。"
                                                     "家园：按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤。",
                                         },
                                     }
@@ -2734,7 +2785,7 @@ class UhdBlurayAutoDownload(_PluginBase):
         """把站点域名转换为「下载配置」键的后缀（v2.12.0 起）。
 
         与 _site_switch_key 的区别：不带 enable_ 前缀，
-        用于拼 dw_cat_ / dw_path_ / dw_push_ 三个表格键。
+        用于拼 dw_cat_ / dw_tag_ / dw_path_ / dw_push_ 四个表格键。
 
         :param domain: 站点域名（如 hdsky.me）
         :return: 键后缀（如 hdsky_me）
