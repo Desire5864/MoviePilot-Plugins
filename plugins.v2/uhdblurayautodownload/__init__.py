@@ -223,7 +223,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.15.0"
+    plugin_version = "2.16.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -529,7 +529,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
                     {
                         "component": "VRow",
-                        "props": {"dense": True, "align": "center"},
+                        "props": {"dense": True, "align": "center", "class": "mb-2"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -585,7 +585,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     # 一个多选下拉取代原先每站点一个开关；是否推送另由下方卡片组的开关控制。
                     {
                         "component": "VRow",
-                        "props": {"dense": True},
+                        "props": {"align": "center", "class": "mb-1"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -599,7 +599,6 @@ class UhdBlurayAutoDownload(_PluginBase):
                                             "multiple": True,
                                             "chips": True,
                                             "closableChips": True,
-                                            "density": "compact",
                                             "items": [
                                                 {
                                                     "title": f"{site_conf.get('name') or domain}"
@@ -610,18 +609,19 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                 in self._site_configs.items()
                                             ],
                                             "placeholder": "点击展开勾选要采集的站点",
-                                            "hint": "只有勾选的站点才会被抓取；是否推送由下方「推送」开关单独控制",
                                             "persistentHint": True,
+                                            "hint": "只有勾选的站点才会被抓取",
                                         },
                                     }
                                 ],
                             }
                         ],
                     },
+                    {"component": "div", "props": {"class": "py-3"}},
                     # 下载器 / 间隔 / 条数 / 推送模式：2×2 两列对齐
                     {
                         "component": "VRow",
-                        "props": {"dense": True},
+                        "props": {"class": "mb-2"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -661,7 +661,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
                     {
                         "component": "VRow",
-                        "props": {"dense": True},
+                        "props": {"class": "mb-2"},
                         "content": [
                             {
                                 "component": "VCol",
