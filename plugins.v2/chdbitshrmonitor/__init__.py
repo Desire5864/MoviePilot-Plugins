@@ -112,6 +112,25 @@ CARD_CAPTION_STYLE = (
 # 底部指标胶囊容器
 CARD_PILLS_STYLE = "margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;"
 
+# 「待删除」专属卡片外壳：整卡红色描边 + 淡红底。
+# 待删除是唯一「会真正删除本地文件、且只剩抢救窗口」的状态，只让右上角 chip
+# 变色不足以在长列表里被一眼扫到；这里把整张卡片染红，滚屏时余光即可发现。
+# 透明度刻意压低（底色 7%、描边 42%），保证醒目但不刺眼，明暗主题都成立。
+# 注：此处写死 rgba 字面量而非调用 _rgba()，因为 _rgba 定义在本常量之后。
+CARD_STYLE_DANGER = (
+    "padding: 12px 14px; margin-bottom: 10px; border-radius: 12px; "
+    "background: rgba(229, 72, 77, 0.07); "
+    "border: 1px solid rgba(229, 72, 77, 0.42);"
+)
+# 「待删除」标题：跟随卡片转浅红，与普通卡片的默认色标题区分开。
+# 用偏亮的浅红（#ffd9da）而非纯 #e5484d：纯红字压在淡红底上会发闷，
+# 浅红既有警示意味又保证可读性。
+CARD_TITLE_STYLE_DANGER = (
+    "flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 600; "
+    "line-height: 1.45; word-break: break-word; overflow-wrap: anywhere; "
+    "color: #ffd9da;"
+)
+
 
 def _fmt_duration(seconds: float) -> str:
     """把秒数格式化为便于阅读的时长文本（如 "3天04:30"、"5.2h"）。"""
@@ -251,16 +270,27 @@ def _ring_color(percent: float) -> str:
     return _hsl_to_hex(last[1], last[2], last[3])
 
 
-def _status_chip(text: str, color: str) -> dict:
-    """卡片右上角状态徽标。"""
+def _status_chip(text: str, color: str, solid: bool = False) -> dict:
+    """卡片右上角状态徽标。
+
+    :param text: 徽标文字
+    :param color: 主题色
+    :param solid: True 时用实心底 + 白字（用于「待删除」这类必须一眼看到的状态），
+                  False 时用 15% 透明底 + 同色字（默认，较克制）
+    """
+    if solid:
+        style = ("flex: 0 0 auto; padding: 2px 10px; border-radius: 999px; "
+                 "font-size: 11px; line-height: 18px; font-weight: 600; "
+                 "white-space: nowrap; color: #fff; "
+                 f"background: {color};")
+    else:
+        style = ("flex: 0 0 auto; padding: 2px 10px; border-radius: 999px; "
+                 "font-size: 11px; line-height: 18px; font-weight: 600; "
+                 "white-space: nowrap; "
+                 f"color: {color}; background: {_rgba(color, 0.15)};")
     return {
         "component": "div",
-        "props": {
-            "style": "flex: 0 0 auto; padding: 2px 10px; border-radius: 999px; "
-                     "font-size: 11px; line-height: 18px; font-weight: 600; "
-                     "white-space: nowrap; "
-                     f"color: {color}; background: {_rgba(color, 0.15)};",
-        },
+        "props": {"style": style},
         "text": text,
     }
 
@@ -331,9 +361,14 @@ def _ring(percent: float, color: str, text: str, size: int = 46) -> dict:
 
 def _ring_card(ring: dict, title: str, chip: Optional[dict] = None,
                captions: Optional[List[str]] = None,
-               pills: Optional[List[dict]] = None) -> dict:
-    """环形卡片：左侧环形 + 右侧（标题 + 状态徽标 / 次级说明 / 指标胶囊）。"""
-    header = [{"component": "div", "props": {"style": CARD_TITLE_STYLE}, "text": title}]
+               pills: Optional[List[dict]] = None,
+               danger: bool = False) -> dict:
+    """环形卡片：左侧环形 + 右侧（标题 + 状态徽标 / 次级说明 / 指标胶囊）。
+
+    :param danger: True 时整卡套用「待删除」配色（红描边 + 淡红底 + 浅红标题）
+    """
+    title_style = CARD_TITLE_STYLE_DANGER if danger else CARD_TITLE_STYLE
+    header = [{"component": "div", "props": {"style": title_style}, "text": title}]
     if chip:
         header.append(chip)
 
@@ -355,7 +390,7 @@ def _ring_card(ring: dict, title: str, chip: Optional[dict] = None,
 
     return {
         "component": "div",
-        "props": {"style": CARD_STYLE},
+        "props": {"style": CARD_STYLE_DANGER if danger else CARD_STYLE},
         "content": [
             {
                 "component": "div",
@@ -388,7 +423,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "1.9.9"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -786,15 +821,13 @@ class ChdbitsHrMonitor(_PluginBase):
 
             if record.get("completed_at"):
                 # ── 待删除：已连续两次判定完成，进入删除倒计时 ──
+                # 统一用 COLOR_DANGER：该状态本身已是「即将删除」的最高级，
+                # 再按剩余时长分三色反而削弱了「整卡警示」的一致性
+                # （1.1h 显示橙色会让它看起来与「未达标」同类）。
                 completed_at = float(record.get("completed_at") or 0)
                 elapsed_hours = max(0.0, (now_ts - completed_at) / 3600)
                 remain_hours = max(0.0, delay_hours - elapsed_hours)
-                if remain_hours <= 1:
-                    color = COLOR_DANGER
-                elif remain_hours <= 6:
-                    color = COLOR_WARN
-                else:
-                    color = COLOR_OK
+                color = COLOR_DANGER
                 ratio = (elapsed_hours / delay_hours * 100) if delay_hours else 0.0
                 items.append({
                     "state": "deleting",
@@ -1005,15 +1038,11 @@ class ChdbitsHrMonitor(_PluginBase):
                     ],
                 })
                 continue
+            # 与「本地视角」分支保持一致：待删除统一用 COLOR_DANGER
             completed_at = float(record.get("completed_at") or 0)
             elapsed_hours = max(0.0, (now_ts - completed_at) / 3600)
             remain_hours = max(0.0, delay_hours - elapsed_hours)
-            if remain_hours <= 1:
-                color = COLOR_DANGER
-            elif remain_hours <= 6:
-                color = COLOR_WARN
-            else:
-                color = COLOR_OK
+            color = COLOR_DANGER
             ratio = (elapsed_hours / delay_hours * 100) if delay_hours else 0.0
             items.append({
                 "state": "deleting",
@@ -1215,13 +1244,17 @@ class ChdbitsHrMonitor(_PluginBase):
                 ]
                 pills.extend(item.get("pills") or [])
 
+                # 「待删除」走醒目样式：整卡红描边 + 淡红底 + 实心红 chip。
+                # 该状态是唯一会真正删除本地文件的，必须在长列表里第一眼可见。
+                is_danger = item["state"] == "deleting"
                 card_items.append(
                     _ring_card(
                         ring=_ring(item.get("pct") or 0.0, item["color"], item["ring_text"]),
                         title=item["title"],
-                        chip=_status_chip(item["chip"], item["color"]),
+                        chip=_status_chip(item["chip"], item["color"], solid=is_danger),
                         captions=captions,
                         pills=pills,
+                        danger=is_danger,
                     )
                 )
 
