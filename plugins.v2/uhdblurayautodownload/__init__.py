@@ -223,7 +223,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.13.1"
+    plugin_version = "2.15.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -519,8 +519,17 @@ class UhdBlurayAutoDownload(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
+                    # ===== 分区一：全局设置 =====
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption text-medium-emphasis mb-2"},
+                        "content": [
+                            {"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "全局设置"}
+                        ],
+                    },
                     {
                         "component": "VRow",
+                        "props": {"dense": True, "align": "center"},
                         "content": [
                             {
                                 "component": "VCol",
@@ -531,6 +540,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "model": "enabled",
                                             "label": "启用插件",
+                                            "color": "primary",
+                                            "hideDetails": True,
+                                            "density": "compact",
                                         },
                                     }
                                 ],
@@ -544,6 +556,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "model": "notify",
                                             "label": "发送通知",
+                                            "color": "primary",
+                                            "hideDetails": True,
+                                            "density": "compact",
                                         },
                                     }
                                 ],
@@ -557,40 +572,20 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "model": "run_once",
                                             "label": "立即执行一次",
+                                            "color": "primary",
+                                            "hideDetails": True,
+                                            "density": "compact",
                                         },
                                     }
                                 ],
                             },
                         ],
                     },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "采集站点：在「采集站点」里勾选的站点才会被抓取，"
-                                                    "可多选、也可点标签上的 × 单独移除；"
-                                                    "未保存过配置时，彩虹岛、我堡、家园默认勾选，"
-                                                    "天空默认不勾选（需手动勾选后才会抓取）。"
-                                                    "抓到的种子是否推送到下载器，"
-                                                    "由下方「下载分类与路径」表格里的「推送」开关逐站点决定。",
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
                     # 站点阀门（v2.11.0 引入，v2.12.0 起语义收窄为「采集」）：
-                    # 一个多选下拉取代原先每站点一个开关；是否推送另由下方表格的开关控制。
+                    # 一个多选下拉取代原先每站点一个开关；是否推送另由下方卡片组的开关控制。
                     {
                         "component": "VRow",
+                        "props": {"dense": True},
                         "content": [
                             {
                                 "component": "VCol",
@@ -604,6 +599,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                             "multiple": True,
                                             "chips": True,
                                             "closableChips": True,
+                                            "density": "compact",
                                             "items": [
                                                 {
                                                     "title": f"{site_conf.get('name') or domain}"
@@ -622,18 +618,21 @@ class UhdBlurayAutoDownload(_PluginBase):
                             }
                         ],
                     },
+                    # 下载器 / 间隔 / 条数 / 推送模式：2×2 两列对齐
                     {
                         "component": "VRow",
+                        "props": {"dense": True},
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VSelect",
                                         "props": {
                                             "model": "downloader",
                                             "label": "下载器",
+                                            "density": "compact",
                                             "items": [
                                                 {"title": config.name, "value": config.name}
                                                 for config in DownloaderHelper().get_configs().values()
@@ -644,7 +643,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -653,21 +652,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                             "label": "检查间隔（分钟）",
                                             "placeholder": "默认15，最小5",
                                             "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "latest_count",
-                                            "label": "每站采集最新条数",
-                                            "placeholder": "默认5，只处理列表页最新N条",
-                                            "type": "number",
+                                            "density": "compact",
                                         },
                                     }
                                 ],
@@ -676,16 +661,34 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
                     {
                         "component": "VRow",
+                        "props": {"dense": True},
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "latest_count",
+                                            "label": "每站采集最新条数",
+                                            "placeholder": "默认5，只处理列表页最新N条",
+                                            "type": "number",
+                                            "density": "compact",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VSelect",
                                         "props": {
                                             "model": "push_mode",
                                             "label": "推送模式",
+                                            "density": "compact",
                                             "items": [
                                                 {"title": "全部推送（不筛选促销）", "value": PUSH_MODE_ALL},
                                                 {"title": "免费优先（先推免费，收费排后）", "value": PUSH_MODE_FREE_FIRST},
@@ -698,383 +701,412 @@ class UhdBlurayAutoDownload(_PluginBase):
                         ],
                     },
                     {
-                        "component": "VRow",
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "density": "compact",
+                            "class": "text-caption mt-2 mb-3",
+                            "text": "定时抓取已勾选站点的 UHD BluRay 原盘列表，每站只处理最新 N 条，"
+                                    "筛掉已有下载记录的种子；「推送」开关打开的站点才自动推到下载器。"
+                                    "未保存过配置时：彩虹岛、我堡、家园默认勾选，天空需手动勾选。"
+                                    "家园另按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤。",
+                        },
+                    },
+                    {"component": "VDivider", "props": {"class": "my-3"}},
+                    # ===== 分区二：站点下载配置 =====
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption text-medium-emphasis mb-2"},
                         "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "下载配置：一行一个站点，直接编辑分类、标签与保存路径。"
-                                                    "最后一列「推送」控制该站点抓到的种子是否推送到下载器 —— "
-                                                    "关掉后该站点照常采集并在详情页展示，但不会推送（适合先观望一阵）。",
-                                        },
-                                    }
-                                ],
-                            }
+                            {"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "站点下载配置"}
                         ],
                     },
                     {
-                        "component": "VRow",
-                        "props": {"class": "text-caption text-medium-emphasis"},
-                        "content": [
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "站点"}]},
-                            {"component": "VCol", "props": {"cols": 3}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "分类"}]},
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "标签"}]},
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "保存路径"}]},
-                            {"component": "VCol", "props": {"cols": 2}, "content": [{"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "推送开关"}]},
-                        ],
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "density": "compact",
+                            "class": "text-caption mb-2",
+                            "text": "一行一个站点，直接编辑分类、标签与保存路径；"
+                                    "「推送」关掉后照常采集但不推送。新增站点会自动往下排。",
+                        },
                     },
                     {
-                        "component": "VRow",
-                        "props": {"dense": True, "align": "center"},
+                        "component": "VSheet",
+                        "props": {
+                            "class": "px-3 py-1 mb-2 rounded",
+                            "style": "border:1px solid #e3e6ea; border-left:4px solid #e8590c; background:#fbfcfd;",
+                        },
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
+                                "component": "VRow",
+                                "props": {"dense": True, "align": "center", "class": "py-0"},
                                 "content": [
-                                    {
-                                        "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "text": "彩虹岛",
-                                    }
-                                ],
-                            },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_CATEGORY_PREFIX}ptchdbits_co",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_TAG_PREFIX}ptchdbits_co",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_PATH_PREFIX}ptchdbits_co",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": f"{DW_PUSH_PREFIX}ptchdbits_co",
-                                            "label": "推送",
-                                            "color": "primary",
-                                            "density": "comfortable",
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VChip",
+                                "props": {"size": "x-small", "variant": "tonal", "color": "deep-orange"},
+                                "text": "彩虹岛",
                             },
                         ],
                     },
-                    {
-                        "component": "VRow",
-                        "props": {"dense": True, "align": "center"},
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "text": "我堡",
-                                    }
-                                ],
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_CATEGORY_PREFIX}ptchdbits_co",
+                                    "label": "分类",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_CATEGORY_PREFIX}ourbits_club",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_TAG_PREFIX}ptchdbits_co",
+                                    "label": "标签",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_TAG_PREFIX}ourbits_club",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_PATH_PREFIX}ptchdbits_co",
+                                    "label": "路径",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_PATH_PREFIX}ourbits_club",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": f"{DW_PUSH_PREFIX}ptchdbits_co",
+                                    "label": "推送",
+                                    "color": "primary",
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "class": "ml-1 text-no-wrap",
+                                },
                             },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": f"{DW_PUSH_PREFIX}ourbits_club",
-                                            "label": "推送",
-                                            "color": "primary",
-                                            "density": "comfortable",
-                                            "hideDetails": True,
-                                        },
-                                    }
+                        ],
+                    },
                                 ],
                             },
                         ],
                     },
                     {
-                        "component": "VRow",
-                        "props": {"dense": True, "align": "center"},
+                        "component": "VSheet",
+                        "props": {
+                            "class": "px-3 py-1 mb-2 rounded",
+                            "style": "border:1px solid #e3e6ea; border-left:4px solid #0c8599; background:#fbfcfd;",
+                        },
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
+                                "component": "VRow",
+                                "props": {"dense": True, "align": "center", "class": "py-0"},
                                 "content": [
-                                    {
-                                        "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "text": "天空",
-                                    }
-                                ],
-                            },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_CATEGORY_PREFIX}hdsky_me",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VChip",
+                                "props": {"size": "x-small", "variant": "tonal", "color": "teal"},
+                                "text": "我堡",
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_TAG_PREFIX}hdsky_me",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_CATEGORY_PREFIX}ourbits_club",
+                                    "label": "分类",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_PATH_PREFIX}hdsky_me",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_TAG_PREFIX}ourbits_club",
+                                    "label": "标签",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": f"{DW_PUSH_PREFIX}hdsky_me",
-                                            "label": "推送",
-                                            "color": "primary",
-                                            "density": "comfortable",
-                                            "hideDetails": True,
-                                        },
-                                    }
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_PATH_PREFIX}ourbits_club",
+                                    "label": "路径",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
+                            },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": f"{DW_PUSH_PREFIX}ourbits_club",
+                                    "label": "推送",
+                                    "color": "primary",
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "class": "ml-1 text-no-wrap",
+                                },
+                            },
+                        ],
+                    },
                                 ],
                             },
                         ],
                     },
                     {
-                        "component": "VRow",
-                        "props": {"dense": True, "align": "center"},
+                        "component": "VSheet",
+                        "props": {
+                            "class": "px-3 py-1 mb-2 rounded",
+                            "style": "border:1px solid #e3e6ea; border-left:4px solid #3b5bdb; background:#fbfcfd;",
+                        },
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
+                                "component": "VRow",
+                                "props": {"dense": True, "align": "center", "class": "py-0"},
                                 "content": [
-                                    {
-                                        "component": "VChip",
-                                        "props": {"size": "small", "variant": "tonal", "color": "primary"},
-                                        "text": "家园",
-                                    }
-                                ],
-                            },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_CATEGORY_PREFIX}hdhome_org",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VChip",
+                                "props": {"size": "x-small", "variant": "tonal", "color": "indigo"},
+                                "text": "天空",
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_TAG_PREFIX}hdhome_org",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_CATEGORY_PREFIX}hdsky_me",
+                                    "label": "分类",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": f"{DW_PATH_PREFIX}hdhome_org",
-                                            "density": "compact",
-                                            "variant": "solo",
-                                            "flat": True,
-                                            "hideDetails": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_TAG_PREFIX}hdsky_me",
+                                    "label": "标签",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
                             },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 2},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": f"{DW_PUSH_PREFIX}hdhome_org",
-                                            "label": "推送",
-                                            "color": "primary",
-                                            "density": "comfortable",
-                                            "hideDetails": True,
-                                        },
-                                    }
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_PATH_PREFIX}hdsky_me",
+                                    "label": "路径",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
+                            },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": f"{DW_PUSH_PREFIX}hdsky_me",
+                                    "label": "推送",
+                                    "color": "primary",
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "class": "ml-1 text-no-wrap",
+                                },
+                            },
+                        ],
+                    },
                                 ],
                             },
                         ],
                     },
                     {
-                        "component": "VRow",
+                        "component": "VSheet",
+                        "props": {
+                            "class": "px-3 py-1 mb-2 rounded",
+                            "style": "border:1px solid #e3e6ea; border-left:4px solid #7048e8; background:#fbfcfd;",
+                        },
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12},
+                                "component": "VRow",
+                                "props": {"dense": True, "align": "center", "class": "py-0"},
                                 "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "插件会定时抓取「已勾选采集站点」的 UHD BluRay 原盘列表，"
-                                                    "每站只处理列表页最新的 N 条（默认 5 条），"
-                                                    "筛选出进度列表示「尚无下载记录」的种子，"
-                                                    "对「推送」开关已打开的站点自动推送到 QB 下载器"
-                                                    "（分类、标签与路径取自上方表格）。"
-                                                    "家园：按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤。",
-                                        },
-                                    }
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
+                            {
+                                "component": "VChip",
+                                "props": {"size": "x-small", "variant": "tonal", "color": "purple"},
+                                "text": "家园",
+                            },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
+                        "content": [
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_CATEGORY_PREFIX}hdhome_org",
+                                    "label": "分类",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
+                            },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 3},
+                        "content": [
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_TAG_PREFIX}hdhome_org",
+                                    "label": "标签",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
+                            },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": f"{DW_PATH_PREFIX}hdhome_org",
+                                    "label": "路径",
+                                    "density": "compact",
+                                    "variant": "solo",
+                                    "flat": True,
+                                    "hideDetails": True,
+                                },
+                            },
+                        ],
+                    },
+{
+                        "component": "VCol",
+                        "props": {"cols": 2},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": f"{DW_PUSH_PREFIX}hdhome_org",
+                                    "label": "推送",
+                                    "color": "primary",
+                                    "density": "compact",
+                                    "hideDetails": True,
+                                    "class": "ml-1 text-no-wrap",
+                                },
+                            },
+                        ],
+                    },
                                 ],
-                            }
+                            },
                         ],
                     },
                 ],
