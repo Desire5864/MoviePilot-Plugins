@@ -24,6 +24,11 @@ INTRO_MIGRATED_KEY = "intro_migrated_to_tmdb"
 # 默认下载标签（站点未单独配置 tag 时使用）
 DOWNLOAD_TAG = "UHD自动下载"
 
+# 站点阀门配置键（v2.11.0 起）：单个数组键取代「每站点一个布尔键」。
+# 元素沿用 _site_switch_key() 生成的站点键名（如 enable_ptchdbits_co），
+# 这样旧配置里的布尔键与新数组元素同名，迁移时无需映射表。
+SITE_VALVE_KEY = "enable_sites"
+
 # 推送模式（push_mode）可选值
 PUSH_MODE_ALL = "all"               # 全部推送：不筛促销（现状）
 PUSH_MODE_FREE_ONLY = "free_only"   # 只推免费：抓取照常抓全量，推送时按行级 is_free 跳过收费
@@ -198,11 +203,11 @@ class UhdBlurayAutoDownload(_PluginBase):
 
     # 插件名称
     plugin_name = "UHD原盘自动下载"
-    plugin_desc = "监控彩虹岛/我堡/天空最新4K UHD BluRay原盘，各站点独立开关，支持免费优先/只推免费，未下载的自动推送QB。"
+    plugin_desc = "监控彩虹岛/我堡/天空最新4K UHD BluRay原盘，站点阀门按需勾选，支持免费优先/只推免费，未下载的自动推送QB。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.10.0"
+    plugin_version = "2.11.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -372,14 +377,24 @@ class UhdBlurayAutoDownload(_PluginBase):
         self._notify = bool(config.get("notify"))
         self._downloader = str(config.get("downloader") or "").strip()
 
-        # 各站点开关：未保存过配置（键缺失）时按站点的 default_enabled 取值，
-        # 这样升级到多站点版本后原有站点的行为保持不变，新站点默认关闭
-        for domain, site_conf in self._site_configs.items():
-            key = self._site_switch_key(domain)
-            if key in config:
-                self._site_enabled[domain] = bool(config.get(key))
-            else:
-                self._site_enabled[domain] = bool(site_conf.get("default_enabled", True))
+        # 站点阀门（v2.11.0 起）：
+        #   新版 = 单个数组键 enable_sites，元素为 _site_switch_key(domain)
+        #   旧版 = 每个站点一个布尔键 enable_<domain>
+        # 判定优先级：enable_sites 存在则以它为准（最后一次保存的表单是权威），
+        # 否则回退读旧布尔键；两者都缺失时按站点 default_enabled 取值。
+        raw_sites = config.get(SITE_VALVE_KEY)
+        if isinstance(raw_sites, (list, tuple, set)):
+            selected = {str(x) for x in raw_sites}
+            for domain in self._site_configs:
+                # 数组里没有就是「没勾」，不看旧布尔键——避免用户取消勾选后被旧值顶回来
+                self._site_enabled[domain] = self._site_switch_key(domain) in selected
+        else:
+            for domain, site_conf in self._site_configs.items():
+                key = self._site_switch_key(domain)
+                if key in config:
+                    self._site_enabled[domain] = bool(config.get(key))
+                else:
+                    self._site_enabled[domain] = bool(site_conf.get("default_enabled", True))
         try:
             self._interval_minutes = max(5, int(config.get("interval_minutes") or 15))
         except (TypeError, ValueError):
@@ -433,8 +448,10 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         :return: Vuetify 表单结构与默认配置
         """
-        # 默认配置：各站点开关按站点配置里的 default_enabled 取值，
-        # 新增站点会自动带上对应的开关项
+        # 默认配置：站点阀门用单个数组键，默认勾上 default_enabled 为真的站点，
+        # 新增站点会自动出现在选项里。
+        # 注意：这里**不再**生成旧版的每站点布尔键（enable_<domain>）——
+        # 新装用户用不到它们；老用户配置里的旧键由 init_plugin 兼容读取。
         default_config: Dict[str, Any] = {
             "enabled": False,
             "notify": False,
@@ -443,11 +460,8 @@ class UhdBlurayAutoDownload(_PluginBase):
             "latest_count": 5,
             "push_mode": PUSH_MODE_ALL,
             "run_once": False,
+            SITE_VALVE_KEY: self.__default_enabled_keys(),
         }
-        for domain, site_conf in self._site_configs.items():
-            default_config[self._site_switch_key(domain)] = bool(
-                site_conf.get("default_enabled", True)
-            )
 
         return [
             {
@@ -509,9 +523,10 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "站点开关：只有开启的站点才会被抓取与推送；"
-                                                    "未保存过配置时，彩虹岛、我堡、家园默认开启，"
-                                                    "天空默认关闭（需手动开启后才开始推送）。"
+                                            "text": "站点阀门：在「推送站点」里勾选的站点才会被抓取与推送，"
+                                                    "可多选、也可点标签上的 × 单独移除；"
+                                                    "未保存过配置时，彩虹岛、我堡、家园默认勾选，"
+                                                    "天空默认不勾（需手动勾选后才开始推送）。"
                                                     "家园当前仅抓取展示、暂不推送。",
                                         },
                                     }
@@ -519,24 +534,38 @@ class UhdBlurayAutoDownload(_PluginBase):
                             }
                         ],
                     },
+                    # 站点阀门：一个多选下拉取代原先每站点一个开关（v2.11.0）
                     {
                         "component": "VRow",
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12},
                                 "content": [
                                     {
-                                        "component": "VSwitch",
+                                        "component": "VSelect",
                                         "props": {
-                                            "model": self._site_switch_key(domain),
-                                            "label": f"{site_conf.get('name') or domain}"
-                                                     f"（{domain}）",
+                                            "model": SITE_VALVE_KEY,
+                                            "label": "推送站点",
+                                            "multiple": True,
+                                            "chips": True,
+                                            "closableChips": True,
+                                            "items": [
+                                                {
+                                                    "title": f"{site_conf.get('name') or domain}"
+                                                             f"（{domain}）",
+                                                    "value": self._site_switch_key(domain),
+                                                }
+                                                for domain, site_conf
+                                                in self._site_configs.items()
+                                            ],
+                                            "placeholder": "点击展开勾选要启用的站点",
+                                            "hint": "只有勾选的站点才会被抓取与推送",
+                                            "persistentHint": True,
                                         },
                                     }
                                 ],
                             }
-                            for domain, site_conf in self._site_configs.items()
                         ],
                     },
                     {
@@ -642,7 +671,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "插件会定时抓取「已开启站点」的 UHD BluRay 原盘列表，"
+                                            "text": "插件会定时抓取「已勾选站点」的 UHD BluRay 原盘列表，"
                                                     "每站只处理列表页最新的 N 条（默认 5 条），"
                                                     "筛选出进度列表示「尚无下载记录」的种子，"
                                                     "自动推送到 QB 下载器。"
@@ -2354,12 +2383,24 @@ class UhdBlurayAutoDownload(_PluginBase):
 
     @staticmethod
     def _site_switch_key(domain: str) -> str:
-        """把站点域名转换为配置表单里的开关字段名。
+        """把站点域名转换为配置表单里的站点键名。
 
         :param domain: 站点域名（如 hdsky.me）
-        :return: 表单字段名（如 enable_hdsky_me）
+        :return: 站点键名（如 enable_hdsky_me）
         """
         return "enable_" + re.sub(r'[^0-9a-z]+', '_', str(domain or '').lower()).strip('_')
+
+    @classmethod
+    def __default_enabled_keys(cls) -> List[str]:
+        """返回默认勾上的站点键名列表，用于表单默认值。
+
+        :return: default_enabled 为真的站点的键名列表
+        """
+        return [
+            cls._site_switch_key(domain)
+            for domain, site_conf in cls._site_configs.items()
+            if site_conf.get("default_enabled", True)
+        ]
 
     def __enabled_site_text(self) -> str:
         """返回已启用站点的名称文本，用于详情页概览。
