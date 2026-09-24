@@ -1,6 +1,6 @@
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from lxml import etree
@@ -202,7 +202,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.9.9"
+    plugin_version = "2.10.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -284,6 +284,28 @@ class UhdBlurayAutoDownload(_PluginBase):
             "no_download_marks": ("-", "--", "0%", "0"),
             # 新站点默认关闭，由用户手动开启后再开始推送
             "default_enabled": False,
+        },
+        "hdhome.org": {
+            "name": "家园",
+            "list_url": "https://hdhome.org/torrents.php",
+            # 分类/路径/标签为推送时的占位配置，当前 push_enabled=False 暂不使用
+            "category": "HDHome原盘",
+            "save_path": "/原盘",
+            "tag": "UHD自动下载",
+            # 家园列表页混着置顶行与其它分类，且排序非严格按发布时间，
+            # 不能沿用「取列表最前 N 条」。用专用解析 filter_mode="hdhome_diy"：
+            # 整页抓取后按三条规则过滤 ——
+            #   ① 标题含 2160p 与 UHD Blu-ray（大小写不敏感，兼容 UHD BluRay 写法）
+            #   ② 标题含制作组 DiY@HDHome（大小写不敏感）
+            #   ③ 发种时间 < max_age_hours（时间列带精确时间戳 span title）
+            # 过滤后按发种时间倒序取最新 N 条。
+            "filter_mode": "hdhome_diy",
+            "diy_team": "diy@hdhome",
+            "max_age_hours": 120,
+            "no_download_marks": ("-", "--", "0%", "0"),
+            # 先只上架抓取展示，暂不推送（推送逻辑照常解析但不落 QB）
+            "push_enabled": False,
+            "default_enabled": True,
         },
     }
 
@@ -488,8 +510,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "站点开关：只有开启的站点才会被抓取与推送；"
-                                                    "未保存过配置时，彩虹岛与我堡默认开启，"
-                                                    "天空默认关闭（需手动开启后才开始推送）。",
+                                                    "未保存过配置时，彩虹岛、我堡、家园默认开启，"
+                                                    "天空默认关闭（需手动开启后才开始推送）。"
+                                                    "家园当前仅抓取展示、暂不推送。",
                                         },
                                     }
                                 ],
@@ -625,7 +648,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                     "自动推送到 QB 下载器。"
                                                     "彩虹岛：分类「彩虹岛&HR」/ 路径「/原盘」/ 标签「UHD自动下载」；"
                                                     "我堡：分类「OurBits原盘」/ 路径「/原盘」/ 标签「UHD自动下载」；"
-                                                    "天空：分类「HDSky原盘」/ 路径「/ISO」/ 标签「UHD原盘下载」。",
+                                                    "天空：分类「HDSky原盘」/ 路径「/ISO」/ 标签「UHD原盘下载」；"
+                                                    "家园：按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤，"
+                                                    "当前仅抓取展示、暂不推送。",
                                         },
                                     }
                                 ],
@@ -1594,6 +1619,14 @@ class UhdBlurayAutoDownload(_PluginBase):
                 items.append(item)
                 continue
 
+            # 站点未启用推送（如家园「先只上架抓取展示」）：
+            # 走到这里说明该种子「该推了」（站点侧无下载记录、本插件也未推送过），
+            # 但按站点配置不执行推送 —— 仅展示、不下载种子、不写已处理记录。
+            if not site_conf.get("push_enabled", True):
+                item["action"] = "未推送（该站点暂不推送）"
+                items.append(item)
+                continue
+
             # —— 免费促销闸门（推送优先功能）——
             # 走到这里说明：站点侧无下载记录、且本插件尚未推送过，属于「该推」的种子。
             # 在此按 push_mode 决定是否推送：
@@ -1726,27 +1759,37 @@ class UhdBlurayAutoDownload(_PluginBase):
             # 依据行级 is_free（__parse_list_page 里提取）逐条决定是否推送——
             # 抓取与推送彻底解耦，避免在取数阶段就把收费种子筛掉。
             request_url = url
-            try:
-                res = RequestUtils(
-                    ua=site.get("ua"),
-                    cookies=site.get("cookie"),
-                    proxies=settings.PROXY if site.get("proxy") else None,
-                    timeout=site.get("timeout") or 20,
-                ).get_res(url=request_url)
-            except Exception as err:
-                logger.error(f"UHD原盘自动下载：抓取 {site_name} 列表失败，{err}")
-                continue
+            # 抓取重试：部分站点（如家园）偶发限流，RequestUtils 返回 None 或
+            # 非 200，短暂等待后重试几次，避免偶发抖动导致整轮抓空。
+            res = None
+            for attempt in range(3):
+                try:
+                    res = RequestUtils(
+                        ua=site.get("ua"),
+                        cookies=site.get("cookie"),
+                        proxies=settings.PROXY if site.get("proxy") else None,
+                        timeout=site.get("timeout") or 20,
+                    ).get_res(url=request_url)
+                except Exception as err:
+                    logger.error(f"UHD原盘自动下载：抓取 {site_name} 列表失败，{err}")
+                    res = None
+                if res is not None and res.status_code == 200:
+                    break
+                time.sleep(2)
 
             if res is None or res.status_code != 200:
                 logger.error(
                     f"UHD原盘自动下载：抓取 {site_name} 列表失败，"
-                    f"状态码 {res.status_code if res else 'None'}"
+                    f"状态码 {res.status_code if res else 'None'}（已重试）"
                 )
                 continue
 
-            parsed = self.__parse_list_page(
-                res.text, site_conf.get("filter_mode", "uhd_title")
-            )
+            filter_mode = site_conf.get("filter_mode", "uhd_title")
+            if filter_mode == "hdhome_diy":
+                # 家园专用：整页抓取 + 三规则过滤，返回发种时间倒序的命中列表
+                parsed = self.__parse_hdhome_page(res.text, site_conf)
+            else:
+                parsed = self.__parse_list_page(res.text, filter_mode)
             logger.info(
                 f"UHD原盘自动下载：{site_name} 列表页解析出 {len(parsed)} 个原盘"
             )
@@ -1762,8 +1805,10 @@ class UhdBlurayAutoDownload(_PluginBase):
         # 刻意**不按发布时间重排**：站点把置顶/推荐段排在列表最前，这一段往往
         # 比普通段更旧，一律按时间排序会把置顶段整体冲掉，抓到的种子与站点
         # 网页就对不上了（v2.8.x 曾按存活时间重排，天空的置顶段因此全军覆没）。
+        # （例外：家园的 filter_mode="hdhome_diy" 已在 __parse_hdhome_page 内
+        #   按发种时间倒序排好，符合「找最新」语义，不适用上面这条铁律。）
 
-        # 取站点顺序最前面的 N 条。这里刻意**不做**任何跳过：
+        # 取最前面的 N 条。这里刻意**不做**任何跳过：
         # 已下载/已推送的种子该不该推送由 __process_site 逐条判定并展示，
         # 但它们在窗口里的位置必须保留，否则抓到的种子与站点网页对不上。
         selected = collected[: self._latest_count]
@@ -2170,6 +2215,141 @@ class UhdBlurayAutoDownload(_PluginBase):
                     "hr_mark": hr_mark,
                 }
             )
+        return torrents
+
+    @staticmethod
+    def __parse_hdhome_page(html: str, site_conf: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """解析家园（HDHome）列表页，按三条规则过滤后返回命中列表（发种时间倒序）。
+
+        家园列表页是标准 NexusPHP，但**混着置顶行与其它分类**，且列表页排序并非
+        严格按发布时间（置顶段会插在普通段之前），因此不能沿用「取列表最前 N 条」。
+        改为整页抓取后按规则过滤：
+
+          ① 标题需含 2160p 与 UHD Blu-ray（大小写不敏感，兼容 UHD BluRay 写法）
+          ② 标题需含指定制作组（默认 DiY@HDHome，大小写不敏感）
+          ③ 发种时间 < max_age_hours（时间列带精确时间戳 span title，无歧义）
+
+        过滤后按发种时间倒序（最新在前），由调用方取前 N 条。
+
+        列表页的副标题不做解析（家园副标题较长、列表页可能截断），
+        留空后交由 __fetch_detail_fields 从详情页补齐（家园详情页字段与
+        现有 __parse_detail_subtitle / __parse_detail_seed_name 兼容）。
+
+        :param html: 页面 HTML
+        :param site_conf: 站点插件配置（含 diy_team / max_age_hours）
+        :return: 命中种子信息列表（字段与 __parse_list_page 返回一致）
+        """
+        torrents: List[Dict[str, Any]] = []
+        page = etree.HTML(html)
+        if page is None:
+            return torrents
+
+        diy_team = str(site_conf.get("diy_team") or "diy@hdhome")
+        try:
+            max_age_hours = float(site_conf.get("max_age_hours") or 120)
+        except (TypeError, ValueError):
+            max_age_hours = 120.0
+
+        team_re = re.compile(re.escape(diy_team), re.I)
+        res_re = re.compile(r'2160p', re.I)
+        uhd_re = re.compile(r'uhd\s*blu-?ray', re.I)
+        tz = timezone(timedelta(hours=8))
+        now = datetime.now(tz)
+
+        rows = page.xpath('//table[contains(@class,"torrents")]//tr[position()>1]')
+        for row in rows:
+            tds = row.xpath('./td')
+            if len(tds) < 10:
+                continue
+
+            detail_links = row.xpath('.//a[contains(@href,"details.php")]')
+            if not detail_links:
+                continue
+            detail_href = detail_links[0].get('href') or ""
+            id_match = re.search(r'id=(\d+)', detail_href)
+            torrent_id = id_match.group(1) if id_match else ""
+
+            title = detail_links[0].get('title') or ""
+            if not title:
+                title = detail_links[0].xpath('string(.)').strip()
+
+            # 规则 ① + ②：标题含 2160p 与 UHD Blu-ray，且制作组匹配
+            if not (res_re.search(title) and uhd_re.search(title)):
+                continue
+            if not team_re.search(title):
+                continue
+
+            # 规则 ③：发种时间 < max_age_hours（精确时间戳 span title）
+            ts_vals = tds[3].xpath('.//span/@title') if len(tds) > 3 else []
+            age_seconds: Optional[int] = None
+            if ts_vals:
+                try:
+                    t = datetime.strptime(ts_vals[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz)
+                    age_seconds = int((now - t).total_seconds())
+                except (ValueError, TypeError):
+                    age_seconds = None
+            if age_seconds is None or age_seconds >= max_age_hours * 3600:
+                continue
+
+            # 大小（家园为 td[4]）
+            size = tds[4].xpath('string(.)').strip() if len(tds) > 4 else ""
+
+            # 进度列（家园为 td[8]，未下载 "-"）
+            progress = ""
+            for idx in (8, 9):
+                if len(tds) > idx:
+                    text = tds[idx].xpath('string(.)').strip().replace("％", "%")
+                    if text in ("-", "--", "0%", "0", "100%") or re.match(
+                        r'^\d+(\.\d+)?%$', text
+                    ):
+                        progress = text
+                        break
+
+            # 下载链接（家园为 <a href="download.php?id=...">）
+            download_url = ""
+            download_method = "get"
+            dl_links = row.xpath('.//a[contains(@href,"download.php")]/@href')
+            if dl_links:
+                download_url = dl_links[0]
+            else:
+                dl_forms = row.xpath('.//form[contains(@action,"download.php")]')
+                picked = None
+                for form in dl_forms:
+                    if "type=" not in (form.get('action') or ""):
+                        picked = form
+                        break
+                if picked is None and dl_forms:
+                    picked = dl_forms[0]
+                if picked is not None:
+                    download_url = picked.get('action') or ""
+                    download_method = (picked.get('method') or "post").lower()
+
+            # 免费促销（家园用 pro_free 图标，与其它站一致，复用 _FREE_MARK_RE）
+            row_html = ""
+            try:
+                row_html = etree.tostring(row, encoding="unicode")
+            except Exception:
+                row_html = ""
+            is_free = bool(_FREE_MARK_RE.search(row_html)) if row_html else False
+
+            torrents.append(
+                {
+                    "id": torrent_id,
+                    "title": title,
+                    "subtitle": "",  # 列表页不解析，交详情页补齐
+                    "size": size,
+                    "progress": progress,
+                    "age_seconds": age_seconds,
+                    "download_url": download_url,
+                    "download_method": download_method,
+                    "is_free": is_free,
+                    "is_hr": False,
+                    "hr_mark": "",
+                }
+            )
+
+        # 按发种时间倒序（age_seconds 升序 = 最新在前）
+        torrents.sort(key=lambda x: x.get("age_seconds") or 0)
         return torrents
 
     @staticmethod
