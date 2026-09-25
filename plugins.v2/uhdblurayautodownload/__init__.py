@@ -103,11 +103,13 @@ HR_BADGE_OFFSET_Y = 1          # 垂直微调：行高居中后再下移 1px（�
 # 详情页「站点分类胶囊」的站点配色（键为站点中文名，值为胶囊圆点颜色）。
 # 配色沿用 H&R 徽章原则「同站点配色」：彩虹岛蓝 #1E90FF、我堡黑 #060619；
 # 天空站列表页无 H&R 徽章可参照，取站点头部主题蓝 #2bb24c（与站点 logo 一致）。
+# UBits 取站点标签底色 #e52d15（列表页 team1=1 / tag_id3=1 的标签背景色，实测）。
 # 未在映射里的站点（如「未知站点」）回退灰色 #888888。
 _SITE_COLORS = {
     "彩虹岛": "#1E90FF",
     "我堡": "#060619",
     "天空": "#2bb24c",
+    "UBits": "#e52d15",
 }
 
 # 详情页字段缓存最多保留条数（超出后按写入时间淘汰最旧的）
@@ -212,18 +214,18 @@ def _format_speed(bytes_per_sec: Any) -> str:
 class UhdBlurayAutoDownload(_PluginBase):
     """4K UHD BluRay 原盘自动下载插件。
 
-    定时抓取彩虹岛/我堡/天空站点的 UHD BluRay 原盘列表，取**站点顺序最
+    定时抓取彩虹岛/我堡/天空/UBits 站点的 UHD BluRay 原盘列表，取**站点顺序最
     前面**的 latest_count 条（与站点网页逐条对应），把其中尚未下载、也
     未被本插件推送过的种子自动推送到 QB 下载器，并按站点指定分类与路径。
     """
 
     # 插件名称
     plugin_name = "UHD原盘自动下载"
-    plugin_desc = "监控彩虹岛/我堡/天空/家园最新4K UHD BluRay原盘，采集站点按需勾选，下载分类/标签/路径逐站点可配并带推送开关，支持免费优先/只推免费，未下载的自动推送QB。"
+    plugin_desc = "监控彩虹岛/我堡/天空/家园/UBits最新4K UHD BluRay原盘，采集站点按需勾选，下载分类/标签/路径逐站点可配并带推送开关，支持免费优先/只推免费，未下载的自动推送QB。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.16.0"
+    plugin_version = "2.17.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -253,11 +255,20 @@ class UhdBlurayAutoDownload(_PluginBase):
     # save_path       QB 保存路径
     # tag             QB 标签（不配置时回退到 DOWNLOAD_TAG）
     # filter_mode     "uhd_title"  标题需匹配 UHD BluRay
+    #                 "uhd_2160p"  标题需**同时**含 2160p 与 UHD Blu-ray（v2.17.0 起，UBits 用）
     #                 "bluray_only" 站点已按媒介筛选，仅排除 WEB-DL/HDTV/Encode 等
     #                 "none"        不做标题筛选（列表页地址已带站点侧筛选条件）
+    #                 "hdhome_diy"  家园专用（见 __parse_hdhome_page）
+    # diy_team        可选，标题需含该制作组（大小写不敏感）。与家园同名键语义一致，
+    #                 区别是家园走独立解析函数、这里直接在 __parse_list_page 里过滤，
+    #                 **不重排**，保住站点自己的展示顺序。
     # no_download_marks  站点「进度」列中代表「尚无下载记录」的取值。
     #                 各站渲染不一致：彩虹岛/我堡为 "-"/"--"，天空则用 "0%"，
     #                 若按同一口径判断会导致天空站永不推送。
+    # has_progress_column  该站列表页是否有「进度」列（默认 True）。
+    #                 ⚠️ 设为 False 的站点**完全跳过进度判定**，见 UBits 条目说明。
+    # list_subtitle_index  可选，列表页副标题取标题单元格 text 分段的第几段
+    #                 （0 起算）。缺省沿用旧口径「取最后一段」。
     # default_enabled    未保存过配置时该站点开关的默认状态
     _site_configs = {
         "ptchdbits.co": {
@@ -327,6 +338,44 @@ class UhdBlurayAutoDownload(_PluginBase):
             # 先只上架抓取展示，暂不推送（推送逻辑照常解析但不落 QB）
             "push_enabled": False,
             "default_enabled": True,
+        },
+        "ubits.club": {
+            "name": "UBits",
+            # 列表页地址就是浏览器里打开的地址，站点侧已带两道筛选：
+            # medium10=1（UHD Blu-ray）+ standard5=1（2160p）。
+            # **不要追加 sort 参数**（见上方 list_url 说明）。
+            "list_url": "https://ubits.club/torrents.php?medium10=1&standard5=1",
+            "category": "UBits原盘",
+            "save_path": "/原盘",
+            "tag": "UHD自动下载",
+            # 站点侧已按媒介 + 分辨率筛过，这里再按标题复核一道
+            # （实测该地址下 100 条：2160p 命中 100、UHD Blu-ray 命中 99）。
+            # 真正起作用的筛子是下面的 diy_team —— 100 条里只有 17 条命中，
+            # 也就是说这个列表页混着别家的 DIY/官转，靠制作组才能收敛到 UBits 自制。
+            "filter_mode": "uhd_2160p",
+            # 制作组取「去掉分隔符的组名」而非 "-DIY@UBits"：
+            # 标题里的形态是 "…5.1-DIY@UBits"，前导 "-" 只是分隔符；
+            # 实测 100 条里 17 条命中，且不存在不带 "-" 的写法，
+            # 去掉 "-" 只会在站点将来改分隔符时更容忍，不会误伤。
+            "diy_team": "DIY@UBits",
+            # 站点新上架，勾选与推送都由用户手动开
+            "default_enabled": False,
+            "push_enabled": True,
+            # 🔴 UBits 列表页**没有「进度」列**，这里是本次适配最实质的一处改动。
+            #    实测该页列序：td[3]存活 td[4]大小 td[5]评论 td[6]…… td[8]是
+            #    「盒子」(class="seed-box-policy-column"，取值 100% 或空)，
+            #    td[9]是发布人（"匿名"）。
+            #    若沿用其它站的进度判定，td[8] 的 "100%" 会被认成「站点侧已下载
+            #    完成」——实测前 100 条里有 65 条是 100%，即 65 条会被静默跳过。
+            #    整页也没有任何用户级下载状态可用（"已下载" 出现 0 次）。
+            #    → 该站关闭进度列读取，详情页「站点进度」显示 —，
+            #      去重改由「插件历史记录 + QB 任务名核对」两道兜底
+            #      （见 __process_site 里的 qb 兜底段）。
+            "has_progress_column": False,
+            # 该站标题单元格是「英文标题 <br> 中文副标题 <br> 标签… <br> 评分」：
+            #   [0] 英文标题  [1] 中文副标题  [2..] 标签/评分（末段是豆瓣分，如 "7.4"）
+            # 旧的「取最后一段」口径在本站会取到评分或末位标签，故显式指定第 2 段。
+            "list_subtitle_index": 1,
         },
     }
 
@@ -709,8 +758,10 @@ class UhdBlurayAutoDownload(_PluginBase):
                             "class": "text-caption mt-2 mb-3",
                             "text": "定时抓取已勾选站点的 UHD BluRay 原盘列表，每站只处理最新 N 条，"
                                     "筛掉已有下载记录的种子；「推送」开关打开的站点才自动推到下载器。"
-                                    "未保存过配置时：彩虹岛、我堡、家园默认勾选，天空需手动勾选。"
-                                    "家园另按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤。",
+                                    "未保存过配置时：彩虹岛、我堡、家园默认勾选，天空与 UBits 需手动勾选。"
+                                    "家园另按 2160p UHD Blu-ray + DiY@HDHome + 发种<120H 三规则过滤；"
+                                    "UBits 按 2160p UHD Blu-ray + DIY@UBits 两规则过滤，"
+                                    "该站列表页无进度列，站点进度以 — 展示，去重改由插件记录 + QB 任务名核对承担。",
                         },
                     },
                     {"component": "VDivider", "props": {"class": "my-3"}},
@@ -1109,6 +1160,106 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                         ],
                     },
+                    # UBits（v2.17.0 新增）。以下是**照抄**上面四个站点块的写法，
+                    # 只换域名后缀与配色（域名 ubits.club -> ubits_club）。
+                    # 四个旧站块刻意保持原样不动：这块逐站点手写虽然啰嗦，
+                    # 但改它的收益只是「少写几行」，风险却是「四个在跑的站点
+                    # 表单一起来变」。要重构成循环就单独做一次、单独验证。
+                    {
+                        "component": "VSheet",
+                        "props": {
+                            "class": "px-3 py-1 mb-2 rounded",
+                            "style": "border:1px solid #e3e6ea; border-left:4px solid #e52d15; background:#fbfcfd;",
+                        },
+                        "content": [
+                            {
+                                "component": "VRow",
+                                "props": {"dense": True, "align": "center", "class": "py-0"},
+                                "content": [
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 2},
+                                        "content": [
+                                            {
+                                                "component": "VChip",
+                                                "props": {"size": "x-small", "variant": "tonal",
+                                                          "color": "red-darken-2"},
+                                                "text": "UBits",
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 3},
+                                        "content": [
+                                            {
+                                                "component": "VTextField",
+                                                "props": {
+                                                    "model": f"{DW_CATEGORY_PREFIX}ubits_club",
+                                                    "label": "分类",
+                                                    "density": "compact",
+                                                    "variant": "solo",
+                                                    "flat": True,
+                                                    "hideDetails": True,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 3},
+                                        "content": [
+                                            {
+                                                "component": "VTextField",
+                                                "props": {
+                                                    "model": f"{DW_TAG_PREFIX}ubits_club",
+                                                    "label": "标签",
+                                                    "density": "compact",
+                                                    "variant": "solo",
+                                                    "flat": True,
+                                                    "hideDetails": True,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 2},
+                                        "content": [
+                                            {
+                                                "component": "VTextField",
+                                                "props": {
+                                                    "model": f"{DW_PATH_PREFIX}ubits_club",
+                                                    "label": "路径",
+                                                    "density": "compact",
+                                                    "variant": "solo",
+                                                    "flat": True,
+                                                    "hideDetails": True,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "VCol",
+                                        "props": {"cols": 2},
+                                        "content": [
+                                            {
+                                                "component": "VSwitch",
+                                                "props": {
+                                                    "model": f"{DW_PUSH_PREFIX}ubits_club",
+                                                    "label": "推送",
+                                                    "color": "primary",
+                                                    "density": "compact",
+                                                    "hideDetails": True,
+                                                    "class": "ml-1 text-no-wrap",
+                                                },
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
                 ],
             }
         ], default_config
@@ -1341,6 +1492,12 @@ class UhdBlurayAutoDownload(_PluginBase):
                             }
                         )
 
+                    # 「站点进度」：无进度列的站点（UBits）显示长破折号 —，
+                    # 与那几站用短横「-」表示「尚无下载记录」区分开，
+                    # 避免被读成「这站显示无下载记录，却没被推送」。
+                    progress_text = str(item.get("progress") or "")
+                    if not progress_text:
+                        progress_text = "—" if item.get("no_progress_col") else "-"
                     card_lines: List[Dict[str, Any]] = [
                         {
                             "component": "div",
@@ -1364,7 +1521,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                 "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
                             },
                             "text": f"大小：{item.get('size') or '-'}　|　"
-                                    f"站点进度：{item.get('progress') or '-'}　|　"
+                                    f"站点进度：{progress_text}　|　"
                                     f"促销：{'免费' if item.get('is_free') else '收费'}　|　"
                                     f"H&R：{'是' if item.get('is_hr') else '否'}　|　"
                                     f"处理结果：{item.get('action') or '-'}",
@@ -1962,6 +2119,11 @@ class UhdBlurayAutoDownload(_PluginBase):
         # 站点对「尚无下载记录」的取值口径（各站渲染不一致：
         # 彩虹岛/我堡为 "-"/"--"，天空为 "0%"）
         no_download_marks = tuple(site_conf.get("no_download_marks") or ("-", "--"))
+        # 该站列表页是否有「进度」列（UBits 没有，见 _site_configs 说明）。
+        # 为 False 时整段进度判定跳过，改用下面 QB 兜底去重。
+        has_progress_column = bool(site_conf.get("has_progress_column", True))
+        # QB 任务表兜底缓存（惰性读取：本轮真正要判重时才读一次）
+        qb_guard: Dict[str, Any] = {"loaded": False, "torrents": None}
 
         # 「免费优先」模式下暂缓处理的收费种子（先推完免费的再回头处理）。
         # 只影响推送动作的先后，不改变取数顺序（站点顺序铁律不受影响）。
@@ -1980,6 +2142,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                 "intro": "",
                 "size": torrent.get("size") or "",
                 "progress": progress,
+                # 该站没有进度列时置位，详情页把「站点进度」渲染成长破折号 —
+                # （而不是短横「-」，后者在那几站是「尚无下载记录」的取值，容易误读）
+                "no_progress_col": not has_progress_column,
                 "is_free": bool(torrent.get("is_free")),
                 "is_hr": bool(torrent.get("is_hr")),
                 "hr_mark": str(torrent.get("hr_mark") or ""),
@@ -2040,7 +2205,7 @@ class UhdBlurayAutoDownload(_PluginBase):
             # （本插件推送后，站点侧会从「无记录」变成 "0%" 再逐步上涨）。
             # 因此对本插件推送过的种子单独归类为「已推送」，与「别家在下」区分；
             # 本地真实进度在详情页单独展示（由 QB 实时读取）。
-            if progress not in no_download_marks:
+            if has_progress_column and progress not in no_download_marks:
                 if record_key in processed_map:
                     item["pushed"] = True
                     item["action"] = "已推送，已完成" if progress == "100%" else "已推送，下载中"
@@ -2073,6 +2238,27 @@ class UhdBlurayAutoDownload(_PluginBase):
                 item["action"] = "已推送，下载中"
                 items.append(item)
                 continue
+
+            # —— 无进度列站点的去重兜底（v2.17.0 起，当前只有 UBits）——
+            # 站点没有「进度」列时，上面那道「站点侧是否已有下载记录」的判断被跳过，
+            # 只剩「插件历史记录」一道。这会漏掉两种情况：
+            #   ① 用户在站点侧手动下过（或别的客户端在跑），本插件没有记录；
+            #   ② 插件数据被重置过（记录清空），种子其实还在 QB 里。
+            # 两者都会导致重复推送。这里在真正推送前拿 QB 现有任务名核对一次。
+            # 匹配口径**故意收紧成「归一化全等」**，不沿用 __pick_qb_torrent 的模糊
+            # 重合（那是为「展示本地进度」服务的，宁可多匹配）；
+            # 判重场景下宁可漏判（重复推送最多是多一个任务）也不能错判（会漏推原盘）。
+            if not has_progress_column:
+                if not qb_guard["loaded"]:
+                    qb_guard["loaded"] = True
+                    qb_guard["torrents"] = self.__list_qb_torrents()
+                if self.__qb_has_torrent(
+                    qb_guard.get("torrents"), item.get("qb_name") or "", title
+                ):
+                    item["pushed"] = True
+                    item["action"] = "已在下载器中，跳过"
+                    items.append(item)
+                    continue
 
             # 站点未开启推送（表单表格里「推送」开关关掉，或站点常量 push_enabled=False）：
             # 走到这里说明该种子「该推了」（站点侧无下载记录、本插件也未推送过），
@@ -2244,7 +2430,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                 # 家园专用：整页抓取 + 三规则过滤，返回发种时间倒序的命中列表
                 parsed = self.__parse_hdhome_page(res.text, site_conf)
             else:
-                parsed = self.__parse_list_page(res.text, filter_mode)
+                parsed = self.__parse_list_page(res.text, filter_mode, site_conf)
             logger.info(
                 f"UHD原盘自动下载：{site_name} 列表页解析出 {len(parsed)} 个原盘"
             )
@@ -2294,6 +2480,43 @@ class UhdBlurayAutoDownload(_PluginBase):
         else:
             torrents = result
         return list(torrents or [])
+
+    @staticmethod
+    def __qb_has_torrent(torrents: Optional[List[Any]], qb_name: str = "",
+                         title: str = "") -> bool:
+        """判断种子是否已经存在于 QB 任务列表中（无进度列站点的去重兜底）。
+
+        与 __pick_qb_torrent 的区别：**只做归一化全等匹配**，不做关键词重合。
+        __pick_qb_torrent 服务于「展示本地进度」，宁可多匹配；
+        本方法服务于「该不该再推一次」，错判会导致漏推原盘，因此必须收紧。
+
+        归一化：去掉所有非字母数字与中文字符、统一小写
+        （QB 任务名可能带中文前缀或调整过标点，与站点给的种名不完全一致）。
+
+        :param torrents: QB 任务对象列表；None 表示读取失败（此时返回 False，按未命中处理）
+        :param qb_name: 站点详情页给出的种子标题（预期 QB 任务名）
+        :param title: 站点列表页的种子标题（备用匹配依据）
+        :return: 已存在返回 True
+        """
+        if not torrents:
+            return False
+
+        def norm(text: str) -> str:
+            return re.sub(r'[^0-9a-z\u4e00-\u9fff]+', '', str(text or '').lower())
+
+        def name_of(torrent: Any) -> str:
+            try:
+                return str(torrent.get("name") or "")
+            except AttributeError:
+                return str(getattr(torrent, "name", "") or "")
+
+        targets = {norm(k) for k in (qb_name, title) if norm(k)}
+        if not targets:
+            return False
+        for torrent in torrents:
+            if norm(name_of(torrent)) in targets:
+                return True
+        return False
 
     @staticmethod
     def __pick_qb_torrent(torrents: List[Any], qb_name: str = "",
@@ -2513,20 +2736,35 @@ class UhdBlurayAutoDownload(_PluginBase):
         return success
 
     @staticmethod
-    def __parse_list_page(html: str, filter_mode: str) -> List[Dict[str, Any]]:
+    def __parse_list_page(html: str, filter_mode: str,
+                          site_conf: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """解析站点种子列表页，提取 UHD BluRay 原盘。
 
         :param html: 页面 HTML
         :param filter_mode: 筛选模式
                             "uhd_title"   标题需匹配 UHD BluRay
+                            "uhd_2160p"   标题需同时含 2160p 与 UHD BluRay
                             "bluray_only" 仅排除非原盘（站点已按媒介筛选）
                             "none"        不做标题筛选（列表页地址已带站点侧筛选条件）
+        :param site_conf: 站点配置，可选。读取三个站点级开关：
+                          diy_team             标题需含的制作组（空 = 不过滤）
+                          has_progress_column  该页是否有「进度」列（False = 不读进度）
+                          list_subtitle_index  副标题取 text 分段的第几段
         :return: 种子信息列表
         """
         torrents: List[Dict[str, Any]] = []
         page = etree.HTML(html)
         if page is None:
             return torrents
+
+        conf = site_conf or {}
+        # 站点级制作组过滤（与家园同名键语义一致，但不重排、保持站点顺序）
+        require_team = str(conf.get("diy_team") or "")
+        team_re = re.compile(re.escape(require_team), re.I) if require_team else None
+        # 该站列表页是否有「进度」列。没有时不读进度，交由调用方换用别的去重手段
+        has_progress_column = bool(conf.get("has_progress_column", True))
+        # 副标题在标题单元格 text 分段里的下标；None = 沿用旧口径「取最后一段」
+        subtitle_index = conf.get("list_subtitle_index")
 
         rows = page.xpath('//table[contains(@class,"torrents")]//tr[position()>1]')
         for row in rows:
@@ -2552,6 +2790,12 @@ class UhdBlurayAutoDownload(_PluginBase):
                 # 需标题含 UHD BluRay
                 if not re.search(r'UHD\s*Blu-?ray', title, re.I):
                     continue
+            elif filter_mode == "uhd_2160p":
+                # UBits：分辨率与媒介两个条件都要满足（站点侧已筛，这里复核）
+                if not re.search(r'2160p', title, re.I):
+                    continue
+                if not re.search(r'UHD\s*Blu-?ray', title, re.I):
+                    continue
             elif filter_mode == "bluray_only":
                 # 站点已按媒介筛选，仅排除非原盘（WEB-DL/HDTV/Encode 等）
                 if re.search(r'WEB-?DL|HDTV|WEBRip|Encode|Remux', title, re.I):
@@ -2561,7 +2805,12 @@ class UhdBlurayAutoDownload(_PluginBase):
                     continue
             # filter_mode == "none"：列表页地址已带站点侧筛选条件，此处不再过滤标题
 
-            # 副标题：优先从 font.subtitle（彩虹岛）提取，其次取 td.embedded 末尾文本（我堡/天空）
+            # 制作组过滤（UBits 的真正筛子）：标题不含指定组名直接跳过。
+            # 放在标题筛选之后、解析字段之前，命中的行才继续走后面的请求。
+            if team_re and not team_re.search(title):
+                continue
+
+            # 副标题：优先从 font.subtitle（彩虹岛）提取，其次取 td.embedded 文本（我堡/天空）
             subtitle = ""
             subtitle_nodes = tds[1].xpath('.//font[contains(@class,"subtitle")]')
             if subtitle_nodes:
@@ -2582,7 +2831,12 @@ class UhdBlurayAutoDownload(_PluginBase):
                 if embedded:
                     texts = [t.strip() for t in embedded[0].xpath('.//text()') if t.strip()]
                     if texts:
-                        subtitle = texts[-1]
+                        # 站点指定了下标就按下标取（UBits 的中文副标题固定在第 2 段，
+                        # 末段是豆瓣评分，如 "7.4"）；否则沿用旧口径取最后一段
+                        if isinstance(subtitle_index, int) and 0 <= subtitle_index < len(texts):
+                            subtitle = texts[subtitle_index]
+                        else:
+                            subtitle = texts[-1]
             # 列表页副标题只是兜底（部分站点会截断或取到无意义的片段），
             # 形如 "]" 的无效值直接丢弃，交由详情页补齐
             if subtitle and (len(subtitle) < 4
@@ -2598,18 +2852,24 @@ class UhdBlurayAutoDownload(_PluginBase):
 
             # 进度列：我堡为 td[8]，彩虹岛为 td[9]，天空为 td[8]
             # 未下载时值为 "-"（我堡）或 "--"（彩虹岛）或 "0%"（天空），已下载为 "100%"
+            #
+            # ⚠️ 站点没有该列时必须整段跳过（has_progress_column=False）：
+            #    UBits 的 td[8] 是「盒子」(class="seed-box-policy-column")，取值
+            #    100% 或空。照搬这段会读出 "100%" 并被当成「站点侧已下载完成」，
+            #    实测前 100 条里 65 条会因此被静默跳过。
             progress = ""
-            for idx in (8, 9):
-                if len(tds) > idx:
-                    text = tds[idx].xpath('string(.)').strip()
-                    # 部分站点用全角百分号渲染进度（如彩虹岛的 "29.29％"），
-                    # 归一化为半角后再匹配，否则会被当成「无法识别」而误判
-                    normalized = text.replace("％", "%")
-                    if normalized in ("-", "--", "100%") or re.match(
-                        r'^\d+(\.\d+)?%$', normalized
-                    ):
-                        progress = normalized
-                        break
+            if has_progress_column:
+                for idx in (8, 9):
+                    if len(tds) > idx:
+                        text = tds[idx].xpath('string(.)').strip()
+                        # 部分站点用全角百分号渲染进度（如彩虹岛的 "29.29％"），
+                        # 归一化为半角后再匹配，否则会被当成「无法识别」而误判
+                        normalized = text.replace("％", "%")
+                        if normalized in ("-", "--", "100%") or re.match(
+                            r'^\d+(\.\d+)?%$', normalized
+                        ):
+                            progress = normalized
+                            break
 
             # 下载链接：优先 <a href="download.php...">（彩虹岛/我堡），
             # 其次 <form action="download.php...">（天空用 POST 表单触发下载）
