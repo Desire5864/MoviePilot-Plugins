@@ -109,6 +109,9 @@ _SITE_COLORS = {
     "彩虹岛": "#1E90FF",
     "我堡": "#060619",
     "天空": "#2bb24c",
+    # 家园用中性灰：站点侧没给过家园主题色，数据页圆点一直是这个兜底灰，
+    # v2.22.0 起显式登记 —— 配置页左侧色条与数据页圆点统一取这里（用户 2026-09-26 选定）
+    "家园": "#888888",
     "UBits": "#e52d15",
 }
 
@@ -225,7 +228,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.21.0"
+    plugin_version = "2.22.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -788,7 +791,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "component": "VSheet",
                         "props": {
                             "class": "px-3 py-1 mb-2 rounded",
-                            "style": "border:1px solid #e3e6ea; border-left:4px solid #e8590c; background:#fbfcfd;",
+                            "style": f"border:1px solid #e3e6ea; "
+                                     f"border-left:4px solid {_SITE_COLORS['彩虹岛']}; "
+                                     f"background:#fbfcfd;",
                         },
                         "content": [
                             {
@@ -882,7 +887,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "component": "VSheet",
                         "props": {
                             "class": "px-3 py-1 mb-2 rounded",
-                            "style": "border:1px solid #e3e6ea; border-left:4px solid #0c8599; background:#fbfcfd;",
+                            "style": f"border:1px solid #e3e6ea; "
+                                     f"border-left:4px solid {_SITE_COLORS['我堡']}; "
+                                     f"background:#fbfcfd;",
                         },
                         "content": [
                             {
@@ -976,7 +983,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "component": "VSheet",
                         "props": {
                             "class": "px-3 py-1 mb-2 rounded",
-                            "style": "border:1px solid #e3e6ea; border-left:4px solid #3b5bdb; background:#fbfcfd;",
+                            "style": f"border:1px solid #e3e6ea; "
+                                     f"border-left:4px solid {_SITE_COLORS['天空']}; "
+                                     f"background:#fbfcfd;",
                         },
                         "content": [
                             {
@@ -1070,7 +1079,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "component": "VSheet",
                         "props": {
                             "class": "px-3 py-1 mb-2 rounded",
-                            "style": "border:1px solid #e3e6ea; border-left:4px solid #7048e8; background:#fbfcfd;",
+                            "style": f"border:1px solid #e3e6ea; "
+                                     f"border-left:4px solid {_SITE_COLORS['家园']}; "
+                                     f"background:#fbfcfd;",
                         },
                         "content": [
                             {
@@ -1169,7 +1180,9 @@ class UhdBlurayAutoDownload(_PluginBase):
                         "component": "VSheet",
                         "props": {
                             "class": "px-3 py-1 mb-2 rounded",
-                            "style": "border:1px solid #e3e6ea; border-left:4px solid #e52d15; background:#fbfcfd;",
+                            "style": f"border:1px solid #e3e6ea; "
+                                     f"border-left:4px solid {_SITE_COLORS['UBits']}; "
+                                     f"background:#fbfcfd;",
                         },
                         "content": [
                             {
