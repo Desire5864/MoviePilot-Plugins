@@ -221,11 +221,11 @@ class UhdBlurayAutoDownload(_PluginBase):
 
     # 插件名称
     plugin_name = "UHD原盘自动下载"
-    plugin_desc = "监控彩虹岛/我堡/天空/家园/UBits最新4K UHD BluRay原盘，采集站点按需勾选，下载分类/标签/路径逐站点可配并带推送开关，支持免费优先/只推免费，未下载的自动推送QB。"
+    plugin_desc = "监控多站点4K UHD原盘并推送下载器。采集站点可勾选，分类/标签/路径逐站可配，支持只推免费。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.18.0"
+    plugin_version = "2.19.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
