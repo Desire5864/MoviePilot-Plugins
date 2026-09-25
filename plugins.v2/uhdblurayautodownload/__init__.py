@@ -225,7 +225,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.17.0"
+    plugin_version = "2.18.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1421,19 +1421,34 @@ class UhdBlurayAutoDownload(_PluginBase):
                 # 使用卡片式布局，避免 VTable 单元格强制 nowrap 导致标题截断
                 card_items = []
                 for item in group_items:
-                    # 已推送到 QB 的种子：实时展示本地真实进度
+                    # 本地状态行：实时读取 QB 任务状态，回答「这个原盘现在到底在不在下载器里」。
+                    #
+                    # 展示条件是**两选一**：
+                    #   ① 已推送（含历史轮次推过的）—— 刚推下去时站点侧往往还是 0%，
+                    #      正是最需要看本地进度的时刻（v2.7.5 起的老口径）；
+                    #   ② 该站点**没有进度列**（has_progress_column=False，当前只有 UBits）。
+                    #      这类站点的「站点进度」恒为 —，卡片上再没有第二个信号能说明
+                    #      「本地有没有」，而本插件的去重恰恰依赖 QB 任务名核对 ——
+                    #      把这个结果直接摆出来，用户才看得出「没在下载器里 = 真候选」。
+                    # 有进度列的站点（彩虹岛/我堡/天空/家园）保持原样：只在已推送时展示，
+                    # 未推送的条目由「站点进度 / 处理结果」两列说明，不再多一行噪音。
                     local_text = ""
-                    if item.get("pushed"):
+                    if item.get("pushed") or item.get("no_progress_col"):
                         if qb_torrents is None:
                             local_text = f"本地：无法读取 QB 状态（{self._downloader or '未配置下载器'}）"
                         else:
-                            local_text = "本地：" + self.__describe_qb(
-                                self.__pick_qb_torrent(
-                                    qb_torrents,
-                                    str(item.get("qb_name") or ""),
-                                    str(item.get("title") or ""),
-                                )
+                            matched_qb = self.__pick_qb_torrent(
+                                qb_torrents,
+                                str(item.get("qb_name") or ""),
+                                str(item.get("title") or ""),
                             )
+                            if matched_qb is not None or item.get("pushed"):
+                                # 已推送过却匹配不到 → __describe_qb(None) 会说明
+                                # 「QB 中未找到该任务（可能已被删除或改名）」
+                                local_text = "本地：" + self.__describe_qb(matched_qb)
+                            else:
+                                # 从未推送过：说清「下载器里没有」，别让「未找到」被读成任务丢了
+                                local_text = "本地：下载器中无此任务"
 
                     # 副标题行：副标题文本 + 可选 H&R 徽章。徽章紧跟在副标题之后
                     # （flex 布局：空间够就并排在同一行，副标题过长时自动换行）。
