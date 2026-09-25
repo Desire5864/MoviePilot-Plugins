@@ -113,11 +113,11 @@ class BdmvToIso(_PluginBase):
     # 插件名称
     plugin_name = "BDMV自动打包ISO"
     # 插件描述
-    plugin_desc = "监控QB指定标签的已完成原盘，自动打包为ISO，完成后秒级感知并触发CD2备份同步；直出ISO的站点支持跳过打包直接触发备份。"
+    plugin_desc = "监控QB指定分类/标签的已完成原盘，自动打包ISO，打包或直出后触发CD2备份同步并通知。"
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.9.3"
+    plugin_version = "1.9.4"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
