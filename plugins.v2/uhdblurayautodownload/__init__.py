@@ -225,7 +225,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.19.0"
+    plugin_version = "2.20.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1423,17 +1423,20 @@ class UhdBlurayAutoDownload(_PluginBase):
                 for item in group_items:
                     # 本地状态行：实时读取 QB 任务状态，回答「这个原盘现在到底在不在下载器里」。
                     #
-                    # 展示条件是**两选一**：
+                    # 展示条件是**三选一**：
                     #   ① 已推送（含历史轮次推过的）—— 刚推下去时站点侧往往还是 0%，
                     #      正是最需要看本地进度的时刻（v2.7.5 起的老口径）；
                     #   ② 该站点**没有进度列**（has_progress_column=False，当前只有 UBits）。
                     #      这类站点的「站点进度」恒为 —，卡片上再没有第二个信号能说明
                     #      「本地有没有」，而本插件的去重恰恰依赖 QB 任务名核对 ——
                     #      把这个结果直接摆出来，用户才看得出「没在下载器里 = 真候选」。
+                    #   ③ 该站有进度列但**读不出取值**（progress_unknown，站点改版信号）。
+                    #      此时判重也走了 QB 任务名那条路，同样需要把结果显示出来。
                     # 有进度列的站点（彩虹岛/我堡/天空/家园）保持原样：只在已推送时展示，
                     # 未推送的条目由「站点进度 / 处理结果」两列说明，不再多一行噪音。
                     local_text = ""
-                    if item.get("pushed") or item.get("no_progress_col"):
+                    if (item.get("pushed") or item.get("no_progress_col")
+                            or item.get("progress_unknown")):
                         if qb_torrents is None:
                             local_text = f"本地：无法读取 QB 状态（{self._downloader or '未配置下载器'}）"
                         else:
@@ -1507,12 +1510,24 @@ class UhdBlurayAutoDownload(_PluginBase):
                             }
                         )
 
-                    # 「站点进度」：无进度列的站点（UBits）显示长破折号 —，
-                    # 与那几站用短横「-」表示「尚无下载记录」区分开，
-                    # 避免被读成「这站显示无下载记录，却没被推送」。
+                    # 「站点进度」三种展示口径，别混：
+                    #   有取值        → 原样显示（家园还会带上站点自己的状态词，
+                    #                   如 "100% Seeding" / "100% Noseed"）
+                    #   无进度列      → 长破折号 —（UBits。用短横会和那几站的
+                    #                   「尚无下载记录」取值撞车，容易被误读）
+                    #   有列但读不出   → 「未知」+ 日志告警（站点改版信号，
+                    #                   见 __process_site 的 progress_unreadable）
                     progress_text = str(item.get("progress") or "")
-                    if not progress_text:
-                        progress_text = "—" if item.get("no_progress_col") else "-"
+                    if progress_text:
+                        progress_state = str(item.get("progress_state") or "")
+                        if progress_state:
+                            progress_text = f"{progress_text} {progress_state}"
+                    elif item.get("no_progress_col"):
+                        progress_text = "—"
+                    elif item.get("progress_unknown"):
+                        progress_text = "未知"
+                    else:
+                        progress_text = "-"
                     card_lines: List[Dict[str, Any]] = [
                         {
                             "component": "div",
@@ -2150,6 +2165,23 @@ class UhdBlurayAutoDownload(_PluginBase):
             torrent_id = torrent.get("id") or ""
             record_key = f"{domain}:{torrent_id}"
 
+            # 该站**有**进度列、却没能读出取值 → 「读不到」，不是「站点侧已下载」。
+            # 两者旧实现里是混在一起的：空串恰好绕过了 `not in no_download_marks`
+            # 这一关，被归到「站点侧已下载，跳过」——卡片上「站点进度」显示短横、
+            # 处理结果却是兜底的「站点侧已下载，跳过」，站点上写着 100% 却对不上
+            # （家园 2026-09-26 反馈的症状，根因是解析没认出台带状态词的形态）。
+            # 现在单独识别：告警 + 明确文案，并且**不再把它当「已下载」跳过**，
+            # 而是继续走下面的记录 / QB 任务名去重（与无进度列站点同一套兜底）。
+            # 取舍依据与 __qb_has_torrent 一致：宁可重复推送（多一个任务），
+            # 也不能因为站点改版把新品漏推。
+            progress_unreadable = has_progress_column and not progress
+            if progress_unreadable:
+                logger.warning(
+                    f"UHD原盘自动下载：{site_name} 的「站点进度」列读不出取值"
+                    f"（{title[:60]}），已按「无进度记录」处理；"
+                    f"若该站改过列表页版式，请核对进度列位置"
+                )
+
             item = {
                 "site": site_name,
                 "title": title,
@@ -2157,9 +2189,13 @@ class UhdBlurayAutoDownload(_PluginBase):
                 "intro": "",
                 "size": torrent.get("size") or "",
                 "progress": progress,
+                # 进度列附带的状态词（家园的 Seeding / Noseed），仅用于展示
+                "progress_state": str(torrent.get("progress_state") or ""),
                 # 该站没有进度列时置位，详情页把「站点进度」渲染成长破折号 —
                 # （而不是短横「-」，后者在那几站是「尚无下载记录」的取值，容易误读）
                 "no_progress_col": not has_progress_column,
+                # 有进度列但读不出取值：详情页显示「未知」，与上面两种区分开
+                "progress_unknown": progress_unreadable,
                 "is_free": bool(torrent.get("is_free")),
                 "is_hr": bool(torrent.get("is_hr")),
                 "hr_mark": str(torrent.get("hr_mark") or ""),
@@ -2220,7 +2256,10 @@ class UhdBlurayAutoDownload(_PluginBase):
             # （本插件推送后，站点侧会从「无记录」变成 "0%" 再逐步上涨）。
             # 因此对本插件推送过的种子单独归类为「已推送」，与「别家在下」区分；
             # 本地真实进度在详情页单独展示（由 QB 实时读取）。
-            if has_progress_column and progress not in no_download_marks:
+            #
+            # `and progress` 不能省：进度没读出来时不该进这道闸门（见上面的
+            # progress_unreadable 说明），否则空串会被当成「站点侧已下载」跳过。
+            if has_progress_column and progress and progress not in no_download_marks:
                 if record_key in processed_map:
                     item["pushed"] = True
                     item["action"] = "已推送，已完成" if progress == "100%" else "已推送，下载中"
@@ -2254,8 +2293,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                 items.append(item)
                 continue
 
-            # —— 无进度列站点的去重兜底（v2.17.0 起，当前只有 UBits）——
-            # 站点没有「进度」列时，上面那道「站点侧是否已有下载记录」的判断被跳过，
+            # —— 判重兜底：无进度列的站点（v2.17.0 起，UBits）与进度读不出的条目 ——
+            # 这两种情况下，上面那道「站点侧是否已有下载记录」的判断都用不上，
             # 只剩「插件历史记录」一道。这会漏掉两种情况：
             #   ① 用户在站点侧手动下过（或别的客户端在跑），本插件没有记录；
             #   ② 插件数据被重置过（记录清空），种子其实还在 QB 里。
@@ -2263,7 +2302,7 @@ class UhdBlurayAutoDownload(_PluginBase):
             # 匹配口径**故意收紧成「归一化全等」**，不沿用 __pick_qb_torrent 的模糊
             # 重合（那是为「展示本地进度」服务的，宁可多匹配）；
             # 判重场景下宁可漏判（重复推送最多是多一个任务）也不能错判（会漏推原盘）。
-            if not has_progress_column:
+            if not has_progress_column or progress_unreadable:
                 if not qb_guard["loaded"]:
                     qb_guard["loaded"] = True
                     qb_guard["torrents"] = self.__list_qb_torrents()
@@ -2872,18 +2911,31 @@ class UhdBlurayAutoDownload(_PluginBase):
             #    UBits 的 td[8] 是「盒子」(class="seed-box-policy-column")，取值
             #    100% 或空。照搬这段会读出 "100%" 并被当成「站点侧已下载完成」，
             #    实测前 100 条里 65 条会因此被静默跳过。
+            #
+            # 归一化两步（2026-09-26 与家园对齐口径）：
+            #   ① 全角百分号 → 半角（彩虹岛渲染 "29.29％"）；
+            #   ② 连续空白压成一个空格，并容忍百分数后面跟状态词
+            #      （家园是 "100%  Seeding" / "100%  Noseed"）。
+            #      只认「整格恰好是百分数」会让带状态词的单元格读成空串，
+            #      详见 __parse_hdhome_page 的注释。
+            # 状态词单独存 progress_state，仅用于展示，不参与判定。
             progress = ""
+            progress_state = ""
             if has_progress_column:
                 for idx in (8, 9):
                     if len(tds) > idx:
-                        text = tds[idx].xpath('string(.)').strip()
-                        # 部分站点用全角百分号渲染进度（如彩虹岛的 "29.29％"），
-                        # 归一化为半角后再匹配，否则会被当成「无法识别」而误判
-                        normalized = text.replace("％", "%")
-                        if normalized in ("-", "--", "100%") or re.match(
-                            r'^\d+(\.\d+)?%$', normalized
-                        ):
+                        normalized = re.sub(
+                            r'\s+', ' ', tds[idx].xpath('string(.)').replace("％", "%")
+                        ).strip()
+                        if normalized in ("-", "--"):
                             progress = normalized
+                            break
+                        matched = re.match(
+                            r'^(\d+(?:\.\d+)?%)(?:\s+(\S.*))?$', normalized
+                        )
+                        if matched:
+                            progress = matched.group(1)
+                            progress_state = (matched.group(2) or "").strip()
                             break
 
             # 下载链接：优先 <a href="download.php...">（彩虹岛/我堡），
@@ -2937,6 +2989,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     "subtitle": subtitle,
                     "size": size,
                     "progress": progress,
+                    "progress_state": progress_state,
                     "age_seconds": age_seconds,
                     "download_url": download_url,
                     "download_method": download_method,
@@ -3024,16 +3077,34 @@ class UhdBlurayAutoDownload(_PluginBase):
             # 大小（家园为 td[4]）
             size = tds[4].xpath('string(.)').strip() if len(tds) > 4 else ""
 
-            # 进度列（家园为 td[8]，未下载 "-"）
+            # 进度列（家园固定在 td[8]，实测 100 行 td 数恒为 10，td[9] 是发布人）。
+            # 单元格有三种形态（2026-09-26 抓真实页面确认）：
+            #   <td align="center">-</td>                          尚无下载记录
+            #   <td bgcolor="#d0d0d0"><b>100% <br/> Noseed</b></td> 已下载完成、未做种
+            #   <td bgcolor="#44cef6"><font color="#FF0066"><b>100% <br/> Seeding</b>
+            #                                                   已下载完成、做种中
+            # <br/> 折叠成空白后，单元格文本是 "100%  Seeding"（百分号与状态词之间
+            # 两个空格）。实测整页分布：'-' × 80、'100%  Noseed' × 17、'100%  Seeding' × 3。
+            #
+            # ⚠️ 旧实现要求整格严格等于 "-" / "--" / "0%" / "0" / "100%" 或纯百分数，
+            #    于是那 20 行的状态词形态一律认不出来，progress 落成空串 ——
+            #    详情页「站点进度」退化成短横（看着像「尚无下载记录」，站点上明明写着
+            #    100%），而 __process_site 又把空串当成「站点侧已有下载记录」，
+            #    处理结果虽然同样是跳过、文案却只能是兜底那句「站点侧已下载，跳过」。
+            #    这就是用户 2026-09-26 反馈的「家园的进度不对」。
+            # 状态词（Seeding / Noseed）单独存字段，只用于展示，不参与任何判定。
             progress = ""
-            for idx in (8, 9):
-                if len(tds) > idx:
-                    text = tds[idx].xpath('string(.)').strip().replace("％", "%")
-                    if text in ("-", "--", "0%", "0", "100%") or re.match(
-                        r'^\d+(\.\d+)?%$', text
-                    ):
-                        progress = text
-                        break
+            progress_state = ""
+            if len(tds) > 8:
+                cell = re.sub(r'\s+', ' ',
+                              tds[8].xpath('string(.)').replace("％", "%")).strip()
+                if cell in ("-", "--"):
+                    progress = cell
+                else:
+                    matched = re.match(r'^(\d+(?:\.\d+)?%)(?:\s+(\S.*))?$', cell)
+                    if matched:
+                        progress = matched.group(1)
+                        progress_state = (matched.group(2) or "").strip()
 
             # 下载链接（家园为 <a href="download.php?id=...">）
             download_url = ""
@@ -3069,6 +3140,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     "subtitle": "",  # 列表页不解析，交详情页补齐
                     "size": size,
                     "progress": progress,
+                    "progress_state": progress_state,
                     "age_seconds": age_seconds,
                     "download_url": download_url,
                     "download_method": download_method,
