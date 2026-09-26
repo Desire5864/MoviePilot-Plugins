@@ -46,7 +46,7 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -63,6 +63,8 @@ class ScpTrafficMonitor(_PluginBase):
     _notify: bool = False
     _username: str = ""
     _password: str = ""
+    _username2: str = ""
+    _password2: str = ""
     _proxy: bool = False
     _interval_value: int = 6
     _interval_unit: str = "hours"
@@ -83,6 +85,8 @@ class ScpTrafficMonitor(_PluginBase):
         self._notify = False
         self._username = ""
         self._password = ""
+        self._username2 = ""
+        self._password2 = ""
         self._proxy = False
         self._interval_value = 6
         self._interval_unit = "hours"
@@ -99,6 +103,8 @@ class ScpTrafficMonitor(_PluginBase):
         self._notify = bool(config.get("notify"))
         self._username = str(config.get("username") or "").strip()
         self._password = str(config.get("password") or "")
+        self._username2 = str(config.get("username2") or "").strip()
+        self._password2 = str(config.get("password2") or "")
         self._proxy = bool(config.get("proxy"))
         try:
             self._interval_value = max(1, int(config.get("interval_value") or 6))
@@ -126,6 +132,8 @@ class ScpTrafficMonitor(_PluginBase):
                     "notify": self._notify,
                     "username": self._username,
                     "password": self._password,
+                    "username2": self._username2,
+                    "password2": self._password2,
                     "proxy": self._proxy,
                     "interval_value": self._interval_value,
                     "interval_unit": self._interval_unit,
@@ -196,7 +204,7 @@ class ScpTrafficMonitor(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "username",
-                                            "label": "SCP 账号",
+                                            "label": "SCP 账号 1",
                                             "placeholder": "295820",
                                         },
                                     }
@@ -210,9 +218,43 @@ class ScpTrafficMonitor(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "password",
-                                            "label": "SCP 密码",
+                                            "label": "SCP 密码 1",
                                             "type": "password",
-                                            "placeholder": "登录 servercontrolpanel.de 的密码",
+                                            "placeholder": "账号 1 的登录密码",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "username2",
+                                            "label": "SCP 账号 2（可选）",
+                                            "placeholder": "第二台机器的账号，留空则不监控",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "password2",
+                                            "label": "SCP 密码 2",
+                                            "type": "password",
+                                            "placeholder": "账号 2 的登录密码",
                                         },
                                     }
                                 ],
@@ -299,7 +341,7 @@ class ScpTrafficMonitor(_PluginBase):
                                             "text": "插件会按设定间隔登录 Server Control Panel 控制面板，"
                                                     "汇总每台服务器本月已用流量（Traffic current month），"
                                                     "统一换算为 TB 展示（GiB ÷ 1024），超过阈值时发送通知。"
-                                                    "账号密码即登录 servercontrolpanel.de 使用的账号密码。",
+                                                    "账号 1 必填；若有多台机器分属不同账号，可在账号 2 填写，留空则只监控账号 1。",
                                         },
                                     }
                                 ],
@@ -313,6 +355,8 @@ class ScpTrafficMonitor(_PluginBase):
             "notify": False,
             "username": "",
             "password": "",
+            "username2": "",
+            "password2": "",
             "proxy": False,
             "interval_value": 6,
             "interval_unit": "hours",
@@ -389,6 +433,30 @@ class ScpTrafficMonitor(_PluginBase):
                 }
             )
 
+        # 部分账号失败的警告提示
+        if self._last_result and self._last_result.get("warning"):
+            page_content.append(
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "VAlert",
+                                    "props": {
+                                        "type": "warning",
+                                        "variant": "tonal",
+                                        "text": f"部分账号查询失败：{self._last_result.get('warning')}",
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
         # 流量汇总
         if self._last_result:
             result = self._last_result
@@ -426,6 +494,7 @@ class ScpTrafficMonitor(_PluginBase):
                     {
                         "component": "tr",
                         "content": [
+                            {"component": "td", "text": str(srv.get("account") or "")},
                             {"component": "td", "text": str(srv.get("name") or "")},
                             {"component": "td", "text": str(srv.get("hostname") or "")},
                             {"component": "td", "text": f"{srv.get('rx_gib', 0):.1f}"},
@@ -454,6 +523,7 @@ class ScpTrafficMonitor(_PluginBase):
                                                 {
                                                     "component": "tr",
                                                     "content": [
+                                                        {"component": "th", "text": "账号"},
                                                         {"component": "th", "text": "服务器"},
                                                         {"component": "th", "text": "主机名"},
                                                         {"component": "th", "text": "下行 (GiB)"},
@@ -606,6 +676,9 @@ class ScpTrafficMonitor(_PluginBase):
         self._last_result = result
         self.__record_history(result)
 
+        if result.get("warning"):
+            logger.warning(f"SCP流量监控：部分账号查询失败，{result.get('warning')}")
+
         total_mib = result.get("total_mib") or 0
         total_gib = total_mib / 1024.0
         total_tb = total_gib / 1024.0
@@ -619,7 +692,7 @@ class ScpTrafficMonitor(_PluginBase):
         if self._notify and alerting and not self._alerting:
             lines = [f"本月已用流量 {total_tb:.3f} TB，已超过告警阈值 {self._threshold:g} TB。"]
             for srv in servers:
-                lines.append(f"{srv.get('name')}：{srv.get('total_tb', 0):.3f} TB")
+                lines.append(f"{srv.get('account', '')} · {srv.get('name')}：{srv.get('total_tb', 0):.3f} TB")
             lines.append("（本次告警仅通知一次，本月流量重置后才会重新提醒）")
             self.post_message(
                 mtype=NotificationType.SiteMessage,
@@ -664,102 +737,131 @@ class ScpTrafficMonitor(_PluginBase):
         self.save_data(TRAFFIC_HISTORY_KEY, history)
 
     def __fetch_traffic(self) -> Tuple[Optional[Dict[str, Any]], str]:
-        """登录 SCP 并抓取所有服务器本月已用流量。
+        """登录 SCP 并抓取所有账号下所有服务器本月已用流量。
 
-        流程：Keycloak PKCE 授权码登录 → 获取服务器列表 → 逐台抓详情 → 汇总流量。
+        流程：对账号 1、账号 2 分别走 Keycloak PKCE 授权码登录 →
+        获取各自服务器列表 → 逐台抓详情 → 汇总流量。
 
         :return: (流量数据, 错误信息)；成功时错误信息为空字符串
         """
-        session = requests.Session()
-        session.headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120 Safari/537.36"
-        )
-        session.verify = False
-        if self._proxy:
-            from app.core.config import settings
-            proxies = settings.PROXY
-            if proxies:
-                session.proxies.update(proxies)
+        # 组装账号列表（账号 2 留空则只监控账号 1）
+        accounts: List[Tuple[str, str]] = []
+        if self._username and self._password:
+            accounts.append((self._username, self._password))
+        if self._username2 and self._password2:
+            accounts.append((self._username2, self._password2))
+        if not accounts:
+            return None, "未配置任何账号"
 
-        try:
-            access_token, err = self.__login(session)
-        except Exception as e:  # noqa: BLE001
-            return None, f"登录异常：{str(e)}"
-        if err:
-            return None, err
-
-        api_headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-
-        # 服务器列表
-        try:
-            resp = session.get(f"{SCP_CORE_API}/v1/servers", headers=api_headers, timeout=30)
-        except Exception as e:  # noqa: BLE001
-            return None, f"获取服务器列表异常：{str(e)}"
-        if resp.status_code != 200:
-            return None, f"服务器列表返回状态码 {resp.status_code}"
-        try:
-            servers_list = resp.json()
-        except Exception as e:  # noqa: BLE001
-            return None, f"解析服务器列表失败：{str(e)}"
+        def new_session() -> requests.Session:
+            session = requests.Session()
+            session.headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+            )
+            session.verify = False
+            if self._proxy:
+                from app.core.config import settings
+                proxies = settings.PROXY
+                if proxies:
+                    session.proxies.update(proxies)
+            return session
 
         servers: List[Dict[str, Any]] = []
-        for srv in servers_list:
-            if srv.get("disabled"):
-                continue
-            sid = srv.get("id")
-            name = srv.get("name") or ""
-            hostname = srv.get("hostname") or ""
+        errors: List[str] = []
 
+        for username, password in accounts:
+            session = new_session()
             try:
-                dresp = session.get(f"{SCP_CORE_API}/v1/servers/{sid}", headers=api_headers, timeout=30)
+                access_token, err = self.__login(session, username, password)
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"SCP流量监控：服务器 {name} 详情请求异常，{e}")
+                errors.append(f"账号 {username} 登录异常：{str(e)}")
                 continue
-            if dresp.status_code != 200:
-                logger.warning(f"SCP流量监控：服务器 {name} 详情返回 {dresp.status_code}")
+            if err:
+                errors.append(f"账号 {username}：{err}")
+                continue
+
+            api_headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+
+            # 服务器列表
+            try:
+                resp = session.get(f"{SCP_CORE_API}/v1/servers", headers=api_headers, timeout=30)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"账号 {username} 获取服务器列表异常：{str(e)}")
+                continue
+            if resp.status_code != 200:
+                errors.append(f"账号 {username} 服务器列表返回状态码 {resp.status_code}")
                 continue
             try:
-                detail = dresp.json()
+                servers_list = resp.json()
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"SCP流量监控：服务器 {name} 详情解析失败，{e}")
+                errors.append(f"账号 {username} 解析服务器列表失败：{str(e)}")
                 continue
 
-            ifaces = (detail.get("serverLiveInfo") or {}).get("interfaces") or []
-            rx_mib = sum(i.get("rxMonthlyInMiB") or 0 for i in ifaces)
-            tx_mib = sum(i.get("txMonthlyInMiB") or 0 for i in ifaces)
-            total_mib = rx_mib + tx_mib
+            for srv in servers_list:
+                if srv.get("disabled"):
+                    continue
+                sid = srv.get("id")
+                name = srv.get("name") or ""
+                hostname = srv.get("hostname") or ""
 
-            servers.append(
-                {
-                    "id": sid,
-                    "name": name,
-                    "hostname": hostname,
-                    "rx_mib": rx_mib,
-                    "tx_mib": tx_mib,
-                    "total_mib": total_mib,
-                    "rx_gib": rx_mib / 1024.0,
-                    "tx_gib": tx_mib / 1024.0,
-                    "total_gib": total_mib / 1024.0,
-                    "total_tb": (total_mib / 1024.0) / 1024.0,
-                }
-            )
+                try:
+                    dresp = session.get(f"{SCP_CORE_API}/v1/servers/{sid}", headers=api_headers, timeout=30)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"SCP流量监控：服务器 {name} 详情请求异常，{e}")
+                    continue
+                if dresp.status_code != 200:
+                    logger.warning(f"SCP流量监控：服务器 {name} 详情返回 {dresp.status_code}")
+                    continue
+                try:
+                    detail = dresp.json()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"SCP流量监控：服务器 {name} 详情解析失败，{e}")
+                    continue
+
+                ifaces = (detail.get("serverLiveInfo") or {}).get("interfaces") or []
+                rx_mib = sum(i.get("rxMonthlyInMiB") or 0 for i in ifaces)
+                tx_mib = sum(i.get("txMonthlyInMiB") or 0 for i in ifaces)
+                total_mib = rx_mib + tx_mib
+
+                servers.append(
+                    {
+                        "id": sid,
+                        "name": name,
+                        "hostname": hostname,
+                        "account": username,
+                        "rx_mib": rx_mib,
+                        "tx_mib": tx_mib,
+                        "total_mib": total_mib,
+                        "rx_gib": rx_mib / 1024.0,
+                        "tx_gib": tx_mib / 1024.0,
+                        "total_gib": total_mib / 1024.0,
+                        "total_tb": (total_mib / 1024.0) / 1024.0,
+                    }
+                )
 
         if not servers:
+            if errors:
+                return None, "；".join(errors)
             return None, "未获取到任何服务器流量数据"
 
         total_mib = sum(s.get("total_mib") or 0 for s in servers)
+        # 若部分账号失败但仍有数据，把失败信息以警告形式返回（不阻断展示）
+        warning = "；".join(errors) if errors else ""
         return {
             "servers": servers,
             "total_mib": total_mib,
             "total_gib": total_mib / 1024.0,
             "total_tb": (total_mib / 1024.0) / 1024.0,
+            "warning": warning,
         }, ""
 
-    def __login(self, session: requests.Session) -> Tuple[Optional[str], str]:
+    def __login(self, session: requests.Session, username: str, password: str) -> Tuple[Optional[str], str]:
         """Keycloak PKCE 授权码登录，返回 access_token。
 
         :param session: 已配置好 headers / verify / proxies 的 requests.Session
+        :param username: SCP 账号
+        :param password: SCP 密码
         :return: (access_token, 错误信息)；成功时错误信息为空字符串
         """
         verifier = secrets.token_urlsafe(64)
@@ -783,7 +885,7 @@ class ScpTrafficMonitor(_PluginBase):
         try:
             r2 = session.post(
                 action,
-                data={"username": self._username, "password": self._password, "credentialId": ""},
+                data={"username": username, "password": password, "credentialId": ""},
                 allow_redirects=False,
                 timeout=30,
             )
