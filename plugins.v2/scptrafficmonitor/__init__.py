@@ -2,6 +2,7 @@ import base64
 import hashlib
 import re
 import secrets
+import threading
 import urllib.parse
 import urllib3
 from datetime import datetime
@@ -30,6 +31,10 @@ TRAFFIC_HISTORY_KEY = "traffic_history"
 TRAFFIC_HISTORY_LIMIT = 300
 # 告警状态持久化键名（避免重复通知）
 ALERT_STATE_KEY = "alert_state"
+# 最近一次查询结果缓存键名（用于详情页秒开）
+RESULT_CACHE_KEY = "last_result_cache"
+# 打开详情页时缓存的最大容忍年龄（秒）；超过则同步刷新，否则后台刷新
+PAGE_CACHE_TTL = 180
 
 
 class ScpTrafficMonitor(_PluginBase):
@@ -46,7 +51,7 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -76,6 +81,10 @@ class ScpTrafficMonitor(_PluginBase):
     _last_check_time: Optional[str] = None
     # 最近一次查询错误
     _last_error: str = ""
+    # 告警状态（避免重复通知）
+    _alerting: bool = False
+    # 后台刷新中标记（防止线程堆积）
+    _refreshing: bool = False
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
@@ -95,6 +104,7 @@ class ScpTrafficMonitor(_PluginBase):
         self._last_check_time = None
         self._last_error = ""
         self._alerting = False
+        self._refreshing = False
 
         if not config:
             return
@@ -121,6 +131,13 @@ class ScpTrafficMonitor(_PluginBase):
         # 恢复告警状态，避免重启后重复通知
         alert_state = self.get_data(ALERT_STATE_KEY) or {}
         self._alerting = bool(alert_state.get("alerting"))
+
+        # 恢复最近一次查询结果缓存，用于详情页秒开
+        cached = self.get_data(RESULT_CACHE_KEY) or {}
+        if cached.get("result"):
+            self._last_result = cached.get("result")
+            self._last_check_time = cached.get("check_time")
+            self._last_error = cached.get("error") or ""
 
         # 立即执行一次：执行后自动关闭开关
         if config.get("run_once"):
@@ -365,20 +382,32 @@ class ScpTrafficMonitor(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页。"""
+        """返回插件详情页。
+
+        性能设计：打开详情页时**不阻塞等待**远程登录抓取。
+        - 有缓存：立即渲染缓存数据；若缓存超过 PAGE_CACHE_TTL，再丢到后台线程刷新。
+        - 无缓存：才同步抓取一次（首次打开会慢几秒，之后都是秒开）。
+        """
         if not self._enabled:
             return None
 
-        # 打开详情页时实时查询一次，确保展示最新数据
         if self._username and self._password:
-            result, error = self.__fetch_traffic()
-            self._last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if error:
-                self._last_error = error
+            if self._last_result:
+                # 已有缓存：秒出，过期则在后台静默刷新
+                age = self.__cache_age_seconds()
+                if age is None or age > PAGE_CACHE_TTL:
+                    self.__refresh_in_background()
             else:
-                self._last_error = ""
-                self._last_result = result
-                self.__record_history(result)
+                # 无缓存（首次打开 / 重启后）：同步抓一次
+                result, error = self.__fetch_traffic()
+                self._last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if error:
+                    self._last_error = error
+                else:
+                    self._last_error = ""
+                    self._last_result = result
+                    self.__record_history(result)
+                self.__save_result_cache()
 
         page_content: List[dict] = []
 
@@ -653,6 +682,56 @@ class ScpTrafficMonitor(_PluginBase):
             ]
         return []
 
+    def __cache_age_seconds(self) -> Optional[float]:
+        """返回当前缓存数据距上次更新的秒数；无缓存或时间不可解析时返回 None。"""
+        if not self._last_check_time:
+            return None
+        try:
+            last = datetime.strptime(self._last_check_time, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return None
+        return (datetime.now() - last).total_seconds()
+
+    def __save_result_cache(self) -> None:
+        """把最近一次查询结果落盘，供重启后详情页秒开。"""
+        try:
+            self.save_data(
+                RESULT_CACHE_KEY,
+                {
+                    "result": self._last_result,
+                    "check_time": self._last_check_time,
+                    "error": self._last_error,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"SCP流量监控：写入结果缓存失败，{e}")
+
+    def __refresh_in_background(self) -> None:
+        """后台线程静默刷新一次流量数据，不阻塞详情页渲染。"""
+        # 上一次刷新还在跑就跳过，避免线程堆积
+        if self._refreshing:
+            return
+        self._refreshing = True
+
+        def _worker() -> None:
+            try:
+                result, error = self.__fetch_traffic()
+                self._last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if error:
+                    self._last_error = error
+                    logger.warning(f"SCP流量监控：后台刷新失败，{error}")
+                else:
+                    self._last_error = ""
+                    self._last_result = result
+                    self.__record_history(result)
+                self.__save_result_cache()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"SCP流量监控：后台刷新异常，{e}")
+            finally:
+                self._refreshing = False
+
+        threading.Thread(target=_worker, name="ScpTrafficRefresh", daemon=True).start()
+
     def check_traffic(self) -> None:
         """登录并抓取流量，记录历史，超过阈值时发送通知。"""
         if not self._enabled or not self._username or not self._password:
@@ -663,6 +742,7 @@ class ScpTrafficMonitor(_PluginBase):
 
         if error:
             self._last_error = error
+            self.__save_result_cache()
             logger.error(f"SCP流量监控：查询流量失败，{error}")
             if self._notify:
                 self.post_message(
@@ -674,6 +754,7 @@ class ScpTrafficMonitor(_PluginBase):
 
         self._last_error = ""
         self._last_result = result
+        self.__save_result_cache()
         self.__record_history(result)
 
         if result.get("warning"):
