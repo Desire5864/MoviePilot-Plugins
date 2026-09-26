@@ -202,5 +202,18 @@
       "v1.9.4": "插件介绍文案精简：改为「监控QB指定分类/标签的已完成原盘，自动打包ISO，打包或直出后触发CD2备份同步并通知。」——45 字、3 行内完整显示；旧源码版 63 字需 4 行，「直出ISO的站点支持跳过打包直接触发备份」整段被截断。本次同步修复 package.description 与源码 plugin_desc 两处不一致（此前 package 已改、源码未跟上，卡片一直显示旧长文案）。仅改显示文案与版本号，不涉及打包/备份/直通逻辑。",
       "v1.9.5": "ISO 直通记录上限由 200 条收紧为 20 条（ISO_SUBMITTED_LIMIT），与「已提交打包记录」的 20 条保持一致；页面展示仍为最近 6 条不变。该上限同时决定去重记录（bdmv_iso_map）的保留量，收紧后更早的记录会被淘汰。"
     }
+  },
+  "ScpTrafficMonitor": {
+    "name": "SCP流量监控",
+    "description": "监控Server Control Panel服务器本月已用流量，按TB展示，超阈值时通知。",
+    "labels": "工具",
+    "version": "1.0.0",
+    "icon": "world.png",
+    "author": "Desire5864",
+    "level": 1,
+    "system_version": ">=2.12.0",
+    "history": {
+      "v1.0.0": "初始版本：登录Server Control Panel控制面板，抓取服务器本月已用流量，统一换算为TB展示，超过阈值时通知。"
+    }
   }
 }
