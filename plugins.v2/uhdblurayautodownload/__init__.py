@@ -115,6 +115,58 @@ _SITE_COLORS = {
     "UBits": "#e52d15",
 }
 
+# 详情页卡片「处理结果 / 本地」两行取值的语义色（v2.23.0 起，用户从效果图选定方案③）。
+# 配色全部取自面板现有色，与站点圆点同源，不自造色板：
+#   绿 #2BB24C = 天空站点色    红 #E52D15 = UBits 站点色    蓝 #16B1FF = 面板 info 色
+#   橙 #E08A17 = 「需留意」档（跳过 / 未推送），面板无现成橙，取 Material Amber 深一档
+# 设计要点：**只给取值上色，标签（「处理结果：」「本地：」）保持原样** ——
+# 标签与取值之间的层级差才是可读性的来源，标签一起上色反而会把两者糊成一块。
+STATUS_COLOR_SUCCESS = "#2BB24C"   # 成功：已完成 / 做种中 / 已推送
+STATUS_COLOR_ACTIVE = "#16B1FF"    # 进行中：下载中 / 校验中 / 排队中 / 移动文件中 …
+STATUS_COLOR_SKIP = "#E08A17"      # 跳过 / 未推送 / 非免费
+STATUS_COLOR_ERROR = "#E52D15"     # 异常：失败 / 出错 / 文件丢失 / 未找到 / 无法读取
+
+# 取值 → 语义色的关键词表。**顺序敏感，先命中者胜出**，靠顺序区分两个「双重语义」取值：
+#   「站点侧下载中（80%），跳过」→ 既含「下载中」又含「跳过」，落点是「本轮跳过了」→ 橙
+#   「已推送，下载中」          → 既含「已推送」又含「下载中」，落点是「正在下」→ 蓝
+# 所以优先级必须是 error > skip > active > success。
+# 任何关键词都没命中（「-」「下载器中无此任务」「已暂停」「状态未知」…）→ 不着色，仅加粗。
+_STATUS_COLOR_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    (STATUS_COLOR_ERROR, ("失败", "出错", "文件丢失", "未找到", "无法读取")),
+    (STATUS_COLOR_SKIP, ("跳过", "未推送", "非免费", "开关已关闭")),
+    (STATUS_COLOR_ACTIVE, ("下载中", "获取元数据中", "校验中", "分配空间中",
+                           "排队中", "排队做种中", "移动文件中")),
+    (STATUS_COLOR_SUCCESS, ("已完成", "做种中", "已推送")),
+)
+
+
+def status_value_color(text: str) -> Optional[str]:
+    """把「处理结果 / 本地」的取值映射为语义色。
+
+    :param text: 取值原文（**不含**「处理结果：」「本地：」标签）
+    :return: 十六进制色值；None 表示中性取值（渲染时仅加粗、不改色）
+    """
+    value = (text or "").strip()
+    if not value or value == "-":
+        return None
+    for color, keywords in _STATUS_COLOR_RULES:
+        if any(kw in value for kw in keywords):
+            return color
+    return None
+
+
+def status_value_style(text: str) -> str:
+    """取值节点的 style：中性取值只加粗，语义取值加粗 + 着色。
+
+    :param text: 取值原文（不含标签）
+    :return: 可直接写进节点 props.style 的 CSS 片段
+    """
+    color = status_value_color(text)
+    if color:
+        return f"font-weight: 700; color: {color};"
+    return "font-weight: 700;"
+
+
 # 详情页字段缓存最多保留条数（超出后按写入时间淘汰最旧的）
 DETAIL_CACHE_LIMIT = 800
 # 影片简介缓存最多保留条数
@@ -228,7 +280,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.22.0"
+    plugin_version = "2.23.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1540,6 +1592,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                         progress_text = "未知"
                     else:
                         progress_text = "-"
+                    action_text = str(item.get("action") or "-")
                     card_lines: List[Dict[str, Any]] = [
                         {
                             "component": "div",
@@ -1557,28 +1610,61 @@ class UhdBlurayAutoDownload(_PluginBase):
                             },
                             "text": str(item.get("title") or ""),
                         },
+                        # meta 行：必须是**多节点**，不能是一条 text ——
+                        # 「处理结果」的取值要单独上语义色，混在一条 text 里做不到。
+                        # 🔴 opacity 从容器移到标签节点上：opacity 会按子树整体合成，
+                        #    挂在容器上会把着色后的取值一起压到 85%（绿 #2BB24C 会被
+                        #    冲淡成 #46B862）。移到标签上后标签渲染结果**逐像素不变**
+                        #    （同样的字形、同样的卡片底），取值则保持全强度。
                         {
                             "component": "div",
                             "props": {
-                                "style": "font-size: 12px; opacity: 0.85; margin-top: 4px;",
+                                "style": "font-size: 12px; margin-top: 4px;",
                             },
-                            "text": f"大小：{item.get('size') or '-'}　|　"
-                                    f"站点进度：{progress_text}　|　"
-                                    f"促销：{'免费' if item.get('is_free') else '收费'}　|　"
-                                    f"H&R：{'是' if item.get('is_hr') else '否'}　|　"
-                                    f"处理结果：{item.get('action') or '-'}",
+                            "content": [
+                                {
+                                    "component": "span",
+                                    "props": {"style": "opacity: 0.85;"},
+                                    "text": f"大小：{item.get('size') or '-'}　|　"
+                                            f"站点进度：{progress_text}　|　"
+                                            f"促销：{'免费' if item.get('is_free') else '收费'}　|　"
+                                            f"H&R：{'是' if item.get('is_hr') else '否'}　|　"
+                                            f"处理结果：",
+                                },
+                                {
+                                    "component": "span",
+                                    "props": {"style": status_value_style(action_text)},
+                                    "text": action_text,
+                                },
+                            ],
                         },
                     ]
                     if local_text:
+                        # 「本地：」标签与取值同样拆两个节点 —— 取值要单独上语义色。
+                        # partition 按**第一个**全角冒号切，取值里再出现冒号也不受影响。
+                        local_label, _, local_value = local_text.partition("：")
                         card_lines.append(
                             {
                                 "component": "div",
                                 "props": {
                                     "style": "white-space: normal; word-break: break-all; "
-                                             "font-size: 12px; font-weight: 500; "
+                                             "font-size: 12px; "
                                              "line-height: 1.5; margin-top: 2px;",
                                 },
-                                "text": local_text,
+                                "content": [
+                                    {
+                                        "component": "span",
+                                        "props": {"style": "font-weight: 500;"},
+                                        "text": f"{local_label}：",
+                                    },
+                                    {
+                                        "component": "span",
+                                        "props": {
+                                            "style": status_value_style(local_value),
+                                        },
+                                        "text": local_value,
+                                    },
+                                ],
                             }
                         )
                     card_lines.append(
