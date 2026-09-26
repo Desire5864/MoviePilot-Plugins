@@ -69,8 +69,8 @@ CD2_UPLOAD_ERROR_STATES = (9, 10)
 
 # ISO 直通（直出 ISO 的站点：跳过打包，直接触发 CD2 备份）记录持久化键名
 ISO_SUBMITTED_DATA_KEY = "bdmv_iso_map"
-# ISO 直通记录最多保留条数（同时用于去重，保留较多避免重复触发）
-ISO_SUBMITTED_LIMIT = 200
+# ISO 直通记录最多保留条数（同时用于去重）
+ISO_SUBMITTED_LIMIT = 20
 # 页面展示的 ISO 直通记录条数
 ISO_SUBMITTED_DISPLAY = 6
 # 默认 ISO 直通分类（与 UHD原盘自动下载 插件推送天空站时使用的分类保持一致）
@@ -117,7 +117,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.9.4"
+    plugin_version = "1.9.5"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
