@@ -937,12 +937,10 @@ class CloudDrive2Storage(_PluginBase):
         """
         把云盘明细拼成 3/4 列的迷你卡片（不含汇总卡）
 
-        每格内容：名称 + 占用率 / 大号「已用 / 总量」/「剩余 xx」/ 双色进度条。
-        占用率取不到（total 为 0）时显示「—」，不按 0% 处理，避免被误读成空盘。
-
-        进度条为「已用 + 剩余」同条双色：已用段沿用原有语义色
-        （primary / warning / error），剩余段固定 success 绿；
-        占用率取不到时不做双色、整条置灰。
+        每格为横向两栏布局：左侧一个 32px 细环形指示器表示占用率，
+        右侧竖排「名称 / 已用 / 总量 / 剩余 xx」三行文字。
+        占用率取不到（total 为 0）时环内不画进度、显示「—」，不按 0% 处理，
+        避免被误读成空盘。
 
         :param items (List[Dict]): 云盘明细列表
 
@@ -960,8 +958,6 @@ class CloudDrive2Storage(_PluginBase):
         for it in items:
             name = it.get("name") or ""
             pct = self._space_pct(it)
-            pct_text = f"{pct:.0f}%" if pct is not None else "—"
-            used_pct = round(pct, 1) if pct is not None else 0
             cells.append(
                 {
                     "component": "VCol",
@@ -978,48 +974,51 @@ class CloudDrive2Storage(_PluginBase):
                                         {
                                             "component": "div",
                                             "props": {
-                                                "class": "d-flex align-center "
-                                                "justify-space-between"
+                                                "class": "d-flex align-center"
                                             },
                                             "content": [
+                                                self._space_ring(pct),
                                                 {
-                                                    "component": "span",
+                                                    "component": "div",
                                                     "props": {
-                                                        "class": "text-caption "
-                                                        "text-truncate"
+                                                        "class": "ml-3 "
+                                                        "flex-grow-1",
+                                                        "style": "min-width: 0;",
                                                     },
-                                                    "text": name,
-                                                },
-                                                {
-                                                    "component": "span",
-                                                    "props": {
-                                                        "class": "text-caption "
-                                                        "font-weight-bold "
-                                                        f"text-{self._space_bar_color(pct)}"
-                                                    },
-                                                    "text": pct_text,
+                                                    "content": [
+                                                        {
+                                                            "component": "div",
+                                                            "props": {
+                                                                "class": "text-caption "
+                                                                "text-truncate"
+                                                            },
+                                                            "text": name,
+                                                        },
+                                                        {
+                                                            "component": "div",
+                                                            "props": {
+                                                                "class": "text-body-2 "
+                                                                "font-weight-bold"
+                                                            },
+                                                            "text": f"{it.get('used_text')} "
+                                                            f"/ {it.get('total_text')}",
+                                                        },
+                                                        {
+                                                            "component": "div",
+                                                            "props": {
+                                                                "class": "text-caption "
+                                                                "text-medium-emphasis"
+                                                            },
+                                                            "text": self._space_free_text(
+                                                                it
+                                                            ).replace(
+                                                                "剩余 ", "剩余 "
+                                                            ),
+                                                        },
+                                                    ],
                                                 },
                                             ],
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "text-subtitle-1 "
-                                                "font-weight-bold"
-                                            },
-                                            "text": f"{it.get('used_text')} / "
-                                            f"{it.get('total_text')}",
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "text-body-2 "
-                                                "font-weight-bold "
-                                                "text-success"
-                                            },
-                                            "text": self._space_free_text(it),
-                                        },
-                                        self._space_bar(used_pct, pct),
+                                        }
                                     ],
                                 }
                             ],
@@ -1029,45 +1028,51 @@ class CloudDrive2Storage(_PluginBase):
             )
         return cells
 
-    def _space_bar(self, used_pct: float, pct: Optional[float]) -> dict:
+    def _space_ring(self, pct: Optional[float]) -> dict:
         """
-        生成「已用 + 剩余」同条的双色进度条
+        生成 32px 细环形占用率指示器
 
-        受 VProgressLinear 只能单色限制，这里用一条 6px 圆角灰轨道作底，
-        内部横向排两个色块：左段已用（占 used_pct%）、右段剩余（吃掉余量）。
-        占用率取不到（pct 为 None）时两段都不着色，显示为空条。
+        环用主色（≥80% 转 warning、≥95% 转 error），轨道用中性灰；
+        用 SVG 的 stroke-dasharray 画进度，起点转到 12 点方向。
+        占用率取不到（pct 为 None）时只画灰轨道，不画进度弧。
 
-        :param used_pct (float): 已用占比（0-100）
-        :param pct (Optional[float]): 原始占用率，None 表示无法计算
+        :param pct (Optional[float]): 占用率百分比
 
-        :return dict: 进度条节点
+        :return dict: 环形容器节点（内嵌原始 SVG 字符串）
         """
-        color = self._space_bar_color(pct) if pct is not None else "grey"
-        free_color = "success" if pct is not None and pct < 100 else "grey"
+        radius = 13.0
+        stroke = 2.6
+        circumference = 2 * 3.14159265 * radius
+        color = self._space_bar_color(pct)
+        if pct is None:
+            arc = ""
+        else:
+            dash = circumference * max(0.0, min(pct, 100.0)) / 100.0
+            arc = (
+                f'<circle cx="16" cy="16" r="{radius}" fill="none" '
+                f'stroke="currentColor" stroke-width="{stroke}" '
+                f'stroke-linecap="round" '
+                f'stroke-dasharray="{dash:.2f} {circumference:.2f}" '
+                f'transform="rotate(-90 16 16)"/>'
+            )
+        track = (
+            f'<circle cx="16" cy="16" r="{radius}" fill="none" '
+            f'stroke="currentColor" stroke-width="{stroke}"/>'
+        )
+        svg = (
+            '<svg width="32" height="32" viewBox="0 0 32 32" '
+            'xmlns="http://www.w3.org/2000/svg">'
+            f'<g style="color: rgba(var(--v-border-color), 1);">{track}</g>'
+            f'<g style="color: rgb(var(--v-theme-{color}));">{arc}</g>'
+            "</svg>"
+        )
         return {
             "component": "div",
             "props": {
-                "class": "d-flex mt-1",
-                "style": "height: 6px; border-radius: 3px; overflow: hidden; "
-                "background-color: rgba(var(--v-border-color), "
-                "var(--v-border-opacity));",
+                "class": "d-flex align-center justify-center flex-shrink-0",
+                "style": "width: 32px; height: 32px;",
+                "innerHTML": svg,
             },
-            "content": [
-                {
-                    "component": "div",
-                    "props": {
-                        "class": f"bg-{color}",
-                        "style": f"width: {used_pct}%; height: 100%;",
-                    },
-                },
-                {
-                    "component": "div",
-                    "props": {
-                        "class": f"bg-{free_color}",
-                        "style": "flex: 1 1 auto; height: 100%;",
-                    },
-                },
-            ],
         }
 
     @staticmethod
