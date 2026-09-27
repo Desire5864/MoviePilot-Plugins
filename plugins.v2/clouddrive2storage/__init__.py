@@ -28,6 +28,7 @@ from .assistant import (
     convert_bytes,
     get_cd2_system_info,
     restart_cd2,
+    space_logo_data_uri,
 )
 from .clouddrive_api import CloudDriveApi
 from .version import VERSION
@@ -937,9 +938,10 @@ class CloudDrive2Storage(_PluginBase):
         """
         把云盘明细拼成 3/4 列的迷你卡片（不含汇总卡）
 
-        每格结构（「数字主导」版）：首行左侧一个 21px 大号占用率作为视觉主角、
-        右侧小字名称；随后是「已用 / 总量」与「剩余 xx」两行文字，
-        末尾一条 3px 细进度条只作装饰（颜色沿用占用率的语义色）。
+        每格结构（「数字主导」版）：左侧一栏文字 —— 首行是 21px 大号占用率
+        作为视觉主角、其后跟小字名称；随后「已用 / 总量」与「剩余 xx」两行；
+        右侧一个 28px 圆形图标（按名称匹配，取不到时回退首字母色块）；
+        整格底部一条 3px 细进度条只作装饰（颜色沿用占用率的语义色）。
         占用率取不到（total 为 0）时显示「—」，不按 0% 处理，避免被误读成空盘。
 
         :param items (List[Dict]): 云盘明细列表
@@ -977,55 +979,78 @@ class CloudDrive2Storage(_PluginBase):
                                         {
                                             "component": "div",
                                             "props": {
-                                                "class": "d-flex align-baseline"
+                                                "class": "d-flex "
+                                                "align-center"
                                             },
                                             "content": [
                                                 {
-                                                    "component": "span",
+                                                    "component": "div",
                                                     "props": {
-                                                        "class": "text-h5 "
-                                                        "font-weight-bold "
-                                                        f"text-{color}",
-                                                        "style": "line-height: 1.15;",
-                                                    },
-                                                    "text": pct_text,
-                                                },
-                                                {
-                                                    "component": "span",
-                                                    "props": {
-                                                        "class": "text-caption",
-                                                        "style": "font-weight: 400;",
-                                                    },
-                                                    "text": "%",
-                                                },
-                                                {
-                                                    "component": "span",
-                                                    "props": {
-                                                        "class": "text-caption "
-                                                        "text-truncate ml-2 "
-                                                        "text-medium-emphasis",
+                                                        "class": "flex-grow-1",
                                                         "style": "min-width: 0;",
                                                     },
-                                                    "text": name,
+                                                    "content": [
+                                                        {
+                                                            "component": "div",
+                                                            "props": {
+                                                                "class": "d-flex "
+                                                                "align-baseline",
+                                                                "style": "min-width: 0;",
+                                                            },
+                                                            "content": [
+                                                                {
+                                                                    "component": "span",
+                                                                    "props": {
+                                                                        "class": "text-h5 "
+                                                                        "font-weight-bold "
+                                                                        f"text-{color}",
+                                                                        "style": "line-height: 1.15;",
+                                                                    },
+                                                                    "text": pct_text,
+                                                                },
+                                                                {
+                                                                    "component": "span",
+                                                                    "props": {
+                                                                        "class": "text-caption",
+                                                                        "style": "font-weight: 400;",
+                                                                    },
+                                                                    "text": "%",
+                                                                },
+                                                                {
+                                                                    "component": "span",
+                                                                    "props": {
+                                                                        "class": "text-caption "
+                                                                        "text-truncate ml-2 "
+                                                                        "text-medium-emphasis",
+                                                                        "style": "min-width: 0;",
+                                                                    },
+                                                                    "text": name,
+                                                                },
+                                                            ],
+                                                        },
+                                                        {
+                                                            "component": "div",
+                                                            "props": {
+                                                                "class": "text-body-2 "
+                                                                "font-weight-bold"
+                                                            },
+                                                            "text": f"{it.get('used_text')} "
+                                                            f"/ {it.get('total_text')}",
+                                                        },
+                                                        {
+                                                            "component": "div",
+                                                            "props": {
+                                                                "class": "text-caption "
+                                                                "text-medium-emphasis"
+                                                            },
+                                                            "text": self._space_free_text(
+                                                                it
+                                                            ),
+                                                        },
+                                                    ],
                                                 },
+                                                self._space_avatar(it),
                                             ],
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "text-body-2 "
-                                                "font-weight-bold"
-                                            },
-                                            "text": f"{it.get('used_text')} / "
-                                            f"{it.get('total_text')}",
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "text-caption "
-                                                "text-medium-emphasis"
-                                            },
-                                            "text": self._space_free_text(it),
                                         },
                                         {
                                             "component": "div",
@@ -1044,6 +1069,57 @@ class CloudDrive2Storage(_PluginBase):
                 }
             )
         return cells
+
+    @staticmethod
+    def _space_avatar(item: Dict[str, Any]) -> dict:
+        """
+        生成卡片右侧的 28px 圆形图标
+
+        有匹配到品牌图标时用 `<img>` 承载 data URI；否则回退成首字母灰底圆，
+        这样整排右侧都有元素、不会参差不齐。
+
+        :param item (Dict): 云盘信息（含 name / logo）
+
+        :return dict: 圆形图标节点
+        """
+        name = item.get("name") or ""
+        logo = item.get("logo") or ""
+        if not logo:
+            logo = space_logo_data_uri(name)
+
+        if logo:
+            inner = {
+                "component": "img",
+                "props": {
+                    "src": logo,
+                    "alt": "",
+                    "style": "width: 100%; height: 100%; "
+                    "object-fit: contain; display: block;",
+                },
+            }
+            bg = "#FFFFFF"
+        else:
+            initial = name[0].upper() if name else "?"
+            inner = {
+                "component": "span",
+                "props": {
+                    "class": "text-caption font-weight-bold",
+                    "style": "color: rgba(60, 60, 60, .5);",
+                },
+                "text": initial,
+            }
+            bg = "#F1F3F2"
+
+        return {
+            "component": "div",
+            "props": {
+                "class": "d-flex align-center justify-center flex-shrink-0 ml-2",
+                "style": "width: 28px; height: 28px; border-radius: 50%; "
+                f"overflow: hidden; background-color: {bg}; "
+                "border: 1px solid #E6E8EB;",
+            },
+            "content": [inner],
+        }
 
     @staticmethod
     def _metric_seg(title: str, value) -> dict:
