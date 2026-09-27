@@ -1154,7 +1154,10 @@ class CloudDriveDisk(_PluginBase):
                     "text": mem_unit,
                 }
             )
-        rate = str(cd2_info.get("speed") or "").replace("/s", "")
+        # 实时速率由下载/上传两个字段拼成（源码里无单独的 speed 字段）
+        dl_speed = str(cd2_info.get("download_speed") or "0KB/s").replace("/s", "")
+        ul_speed = str(cd2_info.get("upload_speed") or "0KB/s").replace("/s", "")
+        rate = f"↓ {dl_speed}　↑ {ul_speed}"
         run_segs = [
             self._metric_seg("CPU 占用", cd2_info.get("cpuUsage")),
             self._metric_seg("内存占用", mem_value),
@@ -1162,11 +1165,11 @@ class CloudDriveDisk(_PluginBase):
             self._metric_seg("实时速率", rate),
         ]
         task_segs = [
-            self._metric_seg("打开文件", cd2_info.get("fileOpenCount")),
-            self._metric_seg("缓存目录", cd2_info.get("cacheDirCount")),
+            self._metric_seg("打开文件", cd2_info.get("fhTableCount")),
+            self._metric_seg("缓存目录", cd2_info.get("dirCacheCount")),
             self._metric_seg("临时文件", cd2_info.get("tempFileCount")),
-            self._metric_seg("下载任务", cd2_info.get("downloadTaskCount")),
-            self._metric_seg("上传任务", cd2_info.get("uploadTaskCount")),
+            self._metric_seg("下载任务", cd2_info.get("download_count")),
+            self._metric_seg("上传任务", cd2_info.get("upload_count")),
         ]
         cd2_url = f"http://{self._host}:{self._port}"
         return {
