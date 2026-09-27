@@ -859,6 +859,24 @@ class CloudDrive2Storage(_PluginBase):
             return "warning"
         return "primary"
 
+    @staticmethod
+    def _space_free_text(item: Dict[str, Any]) -> str:
+        """
+        取单个云盘的剩余空间文案（剩余 = 总量 - 已用）
+
+        取不到总量（total 为 0）时返回「—」，不按 0 处理，
+        避免被误读成「已经存满」。
+
+        :param item (Dict): 含 used/total 的云盘信息
+
+        :return str: 形如「剩余 234.51 TB」；无法计算时返回「剩余 —」
+        """
+        total = item.get("total") or 0
+        used = item.get("used") or 0
+        if total <= 0:
+            return "剩余 —"
+        return f"剩余 {convert_bytes(max(total - used, 0))}"
+
     def _space_summary_text(self, items: List[Dict[str, Any]]) -> str:
         """
         生成「共 N 个云盘 · 合计 X / Y · 占用 Z%」汇总文案
@@ -917,10 +935,14 @@ class CloudDrive2Storage(_PluginBase):
 
     def _space_cells(self, items: List[Dict[str, Any]]) -> List[dict]:
         """
-        把云盘明细拼成 4 列 × N 行的迷你卡片（含首格「合计」）
+        把云盘明细拼成 3/4 列的迷你卡片（不含汇总卡）
 
-        每格内容：名称 + 占用率 / 大号「已用 / 总量」/ 进度条。
+        每格内容：名称 + 占用率 / 大号「已用 / 总量」/「剩余 xx」/ 双色进度条。
         占用率取不到（total 为 0）时显示「—」，不按 0% 处理，避免被误读成空盘。
+
+        进度条为「已用 + 剩余」同条双色：已用段沿用原有语义色
+        （primary / warning / error），剩余段固定 success 绿；
+        占用率取不到时不做双色、整条置灰。
 
         :param items (List[Dict]): 云盘明细列表
 
@@ -928,87 +950,18 @@ class CloudDrive2Storage(_PluginBase):
         """
         cells: List[dict] = []
 
-        valid = [it for it in items if (it.get("total") or 0) > 0]
-        # 格子总数 = 云盘数 + 首格「合计」
-        cell_count = len(items) + (1 if valid else 0)
-        # 动态列数：4 列 -> md=3；3 列 -> md=4
-        md_cols = 12 // self._space_grid_cols(cell_count)
-        col_props = {"cols": 12, "sm": 6, "md": md_cols}
+        if not items:
+            return cells
 
-        if valid:
-            total = sum(it.get("total") or 0 for it in valid)
-            used = sum(it.get("used") or 0 for it in valid)
-            pct = used / total * 100 if total else 0
-            cells.append(
-                {
-                    "component": "VCol",
-                    "props": dict(col_props),
-                    "content": [
-                        {
-                            "component": "VCard",
-                            "props": {"variant": "outlined"},
-                            "content": [
-                                {
-                                    "component": "VCardText",
-                                    "props": {"class": "pa-2"},
-                                    "content": [
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "d-flex align-center "
-                                                "justify-space-between"
-                                            },
-                                            "content": [
-                                                {
-                                                    "component": "span",
-                                                    "props": {
-                                                        "class": "text-caption "
-                                                        "font-weight-medium"
-                                                    },
-                                                    "text": "合计",
-                                                },
-                                                {
-                                                    "component": "span",
-                                                    "props": {
-                                                        "class": "text-caption "
-                                                        "font-weight-bold "
-                                                        f"text-{self._space_bar_color(pct)}"
-                                                    },
-                                                    "text": f"{pct:.0f}%",
-                                                },
-                                            ],
-                                        },
-                                        {
-                                            "component": "div",
-                                            "props": {
-                                                "class": "text-subtitle-1 "
-                                                "font-weight-bold"
-                                            },
-                                            "text": f"{convert_bytes(used)} / "
-                                            f"{convert_bytes(total)}",
-                                        },
-                                        {
-                                            "component": "VProgressLinear",
-                                            "props": {
-                                                "model-value": round(pct, 1),
-                                                "height": 6,
-                                                "rounded": True,
-                                                "color": self._space_bar_color(pct),
-                                                "class": "mt-1",
-                                            },
-                                        },
-                                    ],
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
+        # 动态列数：4 列 -> md=3；3 列 -> md=4
+        md_cols = 12 // self._space_grid_cols(len(items))
+        col_props = {"cols": 12, "sm": 6, "md": md_cols}
 
         for it in items:
             name = it.get("name") or ""
             pct = self._space_pct(it)
             pct_text = f"{pct:.0f}%" if pct is not None else "—"
+            used_pct = round(pct, 1) if pct is not None else 0
             cells.append(
                 {
                     "component": "VCol",
@@ -1058,17 +1011,15 @@ class CloudDrive2Storage(_PluginBase):
                                             f"{it.get('total_text')}",
                                         },
                                         {
-                                            "component": "VProgressLinear",
+                                            "component": "div",
                                             "props": {
-                                                "model-value": round(pct, 1)
-                                                if pct is not None
-                                                else 0,
-                                                "height": 6,
-                                                "rounded": True,
-                                                "color": self._space_bar_color(pct),
-                                                "class": "mt-1",
+                                                "class": "text-body-2 "
+                                                "font-weight-bold "
+                                                "text-success"
                                             },
+                                            "text": self._space_free_text(it),
                                         },
+                                        self._space_bar(used_pct, pct),
                                     ],
                                 }
                             ],
@@ -1077,6 +1028,47 @@ class CloudDrive2Storage(_PluginBase):
                 }
             )
         return cells
+
+    def _space_bar(self, used_pct: float, pct: Optional[float]) -> dict:
+        """
+        生成「已用 + 剩余」同条的双色进度条
+
+        受 VProgressLinear 只能单色限制，这里用一条 6px 圆角灰轨道作底，
+        内部横向排两个色块：左段已用（占 used_pct%）、右段剩余（吃掉余量）。
+        占用率取不到（pct 为 None）时两段都不着色，显示为空条。
+
+        :param used_pct (float): 已用占比（0-100）
+        :param pct (Optional[float]): 原始占用率，None 表示无法计算
+
+        :return dict: 进度条节点
+        """
+        color = self._space_bar_color(pct) if pct is not None else "grey"
+        free_color = "success" if pct is not None and pct < 100 else "grey"
+        return {
+            "component": "div",
+            "props": {
+                "class": "d-flex mt-1",
+                "style": "height: 6px; border-radius: 3px; overflow: hidden; "
+                "background-color: rgba(var(--v-border-color), "
+                "var(--v-border-opacity));",
+            },
+            "content": [
+                {
+                    "component": "div",
+                    "props": {
+                        "class": f"bg-{color}",
+                        "style": f"width: {used_pct}%; height: 100%;",
+                    },
+                },
+                {
+                    "component": "div",
+                    "props": {
+                        "class": f"bg-{free_color}",
+                        "style": "flex: 1 1 auto; height: 100%;",
+                    },
+                },
+            ],
+        }
 
     @staticmethod
     def _metric_seg(title: str, value) -> dict:
