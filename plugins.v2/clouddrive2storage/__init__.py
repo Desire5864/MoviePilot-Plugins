@@ -937,10 +937,10 @@ class CloudDrive2Storage(_PluginBase):
         """
         把云盘明细拼成 3/4 列的迷你卡片（不含汇总卡）
 
-        每格为横向两栏布局：左侧一个 32px 细环形指示器表示占用率，
-        右侧竖排「名称 / 已用 / 总量 / 剩余 xx」三行文字。
-        占用率取不到（total 为 0）时环内不画进度、显示「—」，不按 0% 处理，
-        避免被误读成空盘。
+        每格结构（「数字主导」版）：首行左侧一个 21px 大号占用率作为视觉主角、
+        右侧小字名称；随后是「已用 / 总量」与「剩余 xx」两行文字，
+        末尾一条 3px 细进度条只作装饰（颜色沿用占用率的语义色）。
+        占用率取不到（total 为 0）时显示「—」，不按 0% 处理，避免被误读成空盘。
 
         :param items (List[Dict]): 云盘明细列表
 
@@ -958,6 +958,9 @@ class CloudDrive2Storage(_PluginBase):
         for it in items:
             name = it.get("name") or ""
             pct = self._space_pct(it)
+            pct_text = f"{pct:.0f}" if pct is not None else "—"
+            color = self._space_bar_color(pct) if pct is not None else "grey"
+            bar_pct = round(pct, 1) if pct is not None else 0
             cells.append(
                 {
                     "component": "VCol",
@@ -974,51 +977,65 @@ class CloudDrive2Storage(_PluginBase):
                                         {
                                             "component": "div",
                                             "props": {
-                                                "class": "d-flex align-center"
+                                                "class": "d-flex align-baseline"
                                             },
                                             "content": [
-                                                self._space_ring(pct),
                                                 {
-                                                    "component": "div",
+                                                    "component": "span",
                                                     "props": {
-                                                        "class": "ml-3 "
-                                                        "flex-grow-1",
+                                                        "class": "text-h5 "
+                                                        "font-weight-bold "
+                                                        f"text-{color}",
+                                                        "style": "line-height: 1.15;",
+                                                    },
+                                                    "text": pct_text,
+                                                },
+                                                {
+                                                    "component": "span",
+                                                    "props": {
+                                                        "class": "text-caption",
+                                                        "style": "font-weight: 400;",
+                                                    },
+                                                    "text": "%",
+                                                },
+                                                {
+                                                    "component": "span",
+                                                    "props": {
+                                                        "class": "text-caption "
+                                                        "text-truncate ml-2 "
+                                                        "text-medium-emphasis",
                                                         "style": "min-width: 0;",
                                                     },
-                                                    "content": [
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption "
-                                                                "text-truncate"
-                                                            },
-                                                            "text": name,
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-body-2 "
-                                                                "font-weight-bold"
-                                                            },
-                                                            "text": f"{it.get('used_text')} "
-                                                            f"/ {it.get('total_text')}",
-                                                        },
-                                                        {
-                                                            "component": "div",
-                                                            "props": {
-                                                                "class": "text-caption "
-                                                                "text-medium-emphasis"
-                                                            },
-                                                            "text": self._space_free_text(
-                                                                it
-                                                            ).replace(
-                                                                "剩余 ", "剩余 "
-                                                            ),
-                                                        },
-                                                    ],
+                                                    "text": name,
                                                 },
                                             ],
-                                        }
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "text-body-2 "
+                                                "font-weight-bold"
+                                            },
+                                            "text": f"{it.get('used_text')} / "
+                                            f"{it.get('total_text')}",
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "text-caption "
+                                                "text-medium-emphasis"
+                                            },
+                                            "text": self._space_free_text(it),
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": f"bg-{color} mt-1",
+                                                "style": "height: 3px; "
+                                                f"width: {bar_pct}%; "
+                                                "border-radius: 2px;",
+                                            },
+                                        },
                                     ],
                                 }
                             ],
@@ -1027,53 +1044,6 @@ class CloudDrive2Storage(_PluginBase):
                 }
             )
         return cells
-
-    def _space_ring(self, pct: Optional[float]) -> dict:
-        """
-        生成 32px 细环形占用率指示器
-
-        环用主色（≥80% 转 warning、≥95% 转 error），轨道用中性灰；
-        用 SVG 的 stroke-dasharray 画进度，起点转到 12 点方向。
-        占用率取不到（pct 为 None）时只画灰轨道，不画进度弧。
-
-        :param pct (Optional[float]): 占用率百分比
-
-        :return dict: 环形容器节点（内嵌原始 SVG 字符串）
-        """
-        radius = 13.0
-        stroke = 2.6
-        circumference = 2 * 3.14159265 * radius
-        color = self._space_bar_color(pct)
-        if pct is None:
-            arc = ""
-        else:
-            dash = circumference * max(0.0, min(pct, 100.0)) / 100.0
-            arc = (
-                f'<circle cx="16" cy="16" r="{radius}" fill="none" '
-                f'stroke="currentColor" stroke-width="{stroke}" '
-                f'stroke-linecap="round" '
-                f'stroke-dasharray="{dash:.2f} {circumference:.2f}" '
-                f'transform="rotate(-90 16 16)"/>'
-            )
-        track = (
-            f'<circle cx="16" cy="16" r="{radius}" fill="none" '
-            f'stroke="currentColor" stroke-width="{stroke}"/>'
-        )
-        svg = (
-            '<svg width="32" height="32" viewBox="0 0 32 32" '
-            'xmlns="http://www.w3.org/2000/svg">'
-            f'<g style="color: rgba(var(--v-border-color), 1);">{track}</g>'
-            f'<g style="color: rgb(var(--v-theme-{color}));">{arc}</g>'
-            "</svg>"
-        )
-        return {
-            "component": "div",
-            "props": {
-                "class": "d-flex align-center justify-center flex-shrink-0",
-                "style": "width: 32px; height: 32px;",
-                "innerHTML": svg,
-            },
-        }
 
     @staticmethod
     def _metric_seg(title: str, value) -> dict:
