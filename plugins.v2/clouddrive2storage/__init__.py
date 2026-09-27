@@ -878,6 +878,43 @@ class CloudDrive2Storage(_PluginBase):
             f"{convert_bytes(total)} · 占用 {pct:.0f}%"
         )
 
+    @staticmethod
+    def _space_grid_cols(cell_count: int) -> int:
+        """
+        按格子总数挑选每行格数（桌面 / md 断点），让排版尽量整齐。
+
+        候选 4 列（md=3）与 3 列（md=4），评分优先级：
+
+        1. **能整除**（末行排满）最优；
+        2. 不能整除时**末行格数越多越好**（3/4 优于 2/4），
+           并避免「末行只剩 1 格」这种最难看的情形；
+        3. 同分时**列数大的优先**（卡片略窄但行数少、更紧凑）。
+
+        例：8 格 → 4 列（4+4 排满）；9 格 → 3 列（3+3+3 排满）；
+        11 格 → 4 列（4+4+3，比 3 列的 3+3+3+2 末行更满）。
+
+        :param cell_count (int): 格子总数（含首格「合计」）
+
+        :return int: 每行格数；cell_count <= 0 时返回 4（不影响渲染）
+        """
+        if cell_count <= 0:
+            return 4
+
+        best_cols = 4
+        best_key: Optional[tuple] = None
+        for cols in (4, 3):
+            rows, rem = divmod(cell_count, cols)
+            if rem == 0:
+                key = (0, 0, -cols)  # 排满最优
+            elif rem == 1:
+                key = (2, 0, -cols)  # 末行只剩 1 格，最差
+            else:
+                key = (1, -rem, -cols)  # 末行越满越好
+            if best_key is None or key < best_key:
+                best_key = key
+                best_cols = cols
+        return best_cols
+
     def _space_cells(self, items: List[Dict[str, Any]]) -> List[dict]:
         """
         把云盘明细拼成 4 列 × N 行的迷你卡片（含首格「合计」）
@@ -892,6 +929,12 @@ class CloudDrive2Storage(_PluginBase):
         cells: List[dict] = []
 
         valid = [it for it in items if (it.get("total") or 0) > 0]
+        # 格子总数 = 云盘数 + 首格「合计」
+        cell_count = len(items) + (1 if valid else 0)
+        # 动态列数：4 列 -> md=3；3 列 -> md=4
+        md_cols = 12 // self._space_grid_cols(cell_count)
+        col_props = {"cols": 12, "sm": 6, "md": md_cols}
+
         if valid:
             total = sum(it.get("total") or 0 for it in valid)
             used = sum(it.get("used") or 0 for it in valid)
@@ -899,7 +942,7 @@ class CloudDrive2Storage(_PluginBase):
             cells.append(
                 {
                     "component": "VCol",
-                    "props": {"cols": 12, "sm": 6, "md": 3},
+                    "props": dict(col_props),
                     "content": [
                         {
                             "component": "VCard",
@@ -969,7 +1012,7 @@ class CloudDrive2Storage(_PluginBase):
             cells.append(
                 {
                     "component": "VCol",
-                    "props": {"cols": 12, "sm": 6, "md": 3},
+                    "props": dict(col_props),
                     "content": [
                         {
                             "component": "VCard",
