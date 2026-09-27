@@ -47,6 +47,28 @@ MATCH_STATS_DATA_KEY = "hr_match_stats"
 MATCH_FAIL_MIN_PREV = 2      # 上一轮至少匹配到 N 个，才说明「此前匹配是正常的」
 MATCH_FAIL_MIN_LOCAL = 2     # 本轮参与比对的本地任务至少 N 个，判定才有意义
 
+# ── 标题匹配：片名特征（v2.0.1） ────────────────────────────────────
+# 原盘种子名里绝大部分是规格词（分辨率 / 容器 / 编码 / 音轨 / 发布组），片名只
+# 占 2~4 个词。若直接按「全词交集比例」评分，同规格、同发布组的任意两部电影都
+# 能拿到 0.8 以上 —— 实测 Evil.Dead.Burn.2026 与 Made 2001 的共有词有 9 个、
+# 全部是规格词（9 / min(13, 11) = 0.818 ≥ 0.8），于是**已完成**的种子被误配到
+# 别人的 H&R 记录上，表现为「站点仍在考核」而永远不进删除流程（漏删）。
+# 规则：片名特征 = 第一个规格锚点之前的词（剔除停用词）；匹配时要求两侧片名
+# 特征至少共享一个词，「片名相等 / 互含」两条快路径同样受此约束。
+SPEC_ANCHOR_TOKENS = frozenset({
+    # 分辨率 / 片源
+    "2160p", "1080p", "720p", "576p", "480p", "4k", "8k", "uhd", "hd", "sd",
+    "bluray", "blu", "bd", "bdrip", "brrip", "web", "webdl", "webrip",
+    "remux", "hdtv", "dvdrip", "dvd", "hdrip", "iso", "mkv", "mp4", "ts", "avi",
+    # 画质 / 编码
+    "hdr", "hdr10", "hdr10plus", "dovi", "dv", "sdr", "10bit", "8bit",
+    "hevc", "h264", "h265", "avc", "x264", "x265", "av1", "mpeg2", "vc1",
+})
+NAME_STOP_TOKENS = frozenset({
+    "the", "a", "an", "of", "on", "in", "and", "or", "to", "for", "with",
+    "at", "by", "from", "v2", "v3", "repack", "proper",
+})
+
 # ── 删除保险 ⑤：删除留档 ─────────────────────────────────────────
 DELETE_LOG_DATA_KEY = "hr_deleted_log"
 DELETE_LOG_LIMIT = 50        # 存储条数（保证事后可追溯）
@@ -423,7 +445,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -2157,6 +2179,8 @@ class ChdbitsHrMonitor(_PluginBase):
         # 提取片名特征：取规范化标题的前 3 个词（通常是片名）
         local_tokens = normalized.split()
         local_name = " ".join(local_tokens[:3])
+        # 片名特征词（规格锚点之前的词）：兜底评分前的硬闸门，见 SPEC_ANCHOR_TOKENS
+        local_sig = self.__name_signature(local_tokens)
 
         best_task = None
         best_score = 0.0
@@ -2164,11 +2188,16 @@ class ChdbitsHrMonitor(_PluginBase):
             site_title = self.__normalize_title(task.get("title") or "")
             if not site_title:
                 continue
-            # 完全一致直接返回
+            # 完全一致直接返回（唯一不受片名闸门约束的快路径）
             if site_title == normalized:
                 return task
             site_tokens = site_title.split()
             site_name = " ".join(site_tokens[:3])
+            # 片名特征必须至少有实质重合，否则只是「同规格、同发布组的另一个种子」
+            # （规格词占比过高，仅凭它们重合不足以证明是同一个种子）
+            site_sig = self.__name_signature(site_tokens)
+            if not (local_sig and site_sig and (local_sig & site_sig)):
+                continue
             # 片名完全一致，视为同一任务
             if local_name and local_name == site_name:
                 return task
@@ -2192,6 +2221,26 @@ class ChdbitsHrMonitor(_PluginBase):
         if best_task is not None and best_score >= 0.8:
             return best_task
         return None
+
+    @staticmethod
+    def __name_signature(tokens: List[str]) -> set:
+        """提取标题的「片名特征词」：第一个规格锚点之前的词，剔除停用词。
+
+        原盘种子名里规格词占绝大多数（分辨率 / 容器 / 编码 / 音轨 / 发布组），
+        真正能区分「是不是同一个种子」的只有片名部分。匹配前先用它做闸门，
+        避免同规格、同发布组的两部电影互相误配（v2.0.1）。
+
+        :param tokens: 规范化标题切分出的词列表
+        :return: 片名特征词集合；标题里没有片名词时返回空集
+        """
+        signature: set = set()
+        for token in tokens:
+            if token in SPEC_ANCHOR_TOKENS:
+                break
+            if token in NAME_STOP_TOKENS:
+                continue
+            signature.add(token)
+        return signature
 
     def __match_site_title(self, local_title: str, site_titles: set) -> bool:
         """判断本地任务标题是否匹配站点未完成任务。
