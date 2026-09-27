@@ -38,7 +38,7 @@ class CloudDrive2Storage(_PluginBase):
     CloudDrive2 储存插件（魔改 UI 版本）
     """
 
-    plugin_name = "CloudDrive2储存魔改版"
+    plugin_name = "CloudDrive2储存"
     plugin_desc = "使存储支持 CloudDrive2，grpc 原生 API 操作。魔改 UI 版本，重排版详情页指标卡。"
     plugin_icon = "Cloudrive_A.png"
     plugin_version = VERSION
