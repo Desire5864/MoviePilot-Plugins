@@ -263,14 +263,15 @@
   },
   "CloudDrive2Storage": {
     "v3": false,
-    "name": "CloudDrive2储存魔改版",
+    "name": "CloudDrive2储存",
     "description": "使存储支持 CloudDrive2，grpc 原生 API 操作。魔改 UI 版本，重排版详情页指标卡。",
     "labels": "云盘",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "author": "Desire5864",
     "system_version": ">=2.15.2",
     "level": 1,
     "history": {
+      "v1.0.1": "插件名调整为「CloudDrive2储存」。（三改：Desire5864）",
       "v1.0.0": "魔改 UI 版本首发：基于 CloudDrive2 储存插件重新发布，作者改为 Desire5864。详情页系统指标整合压缩，原 10 张独立卡片改为单个整行卡片，内分「运行状态」（CPU 占用 / 内存占用 / 运行时长 / 实时速率）与「任务与缓存」（打开文件 / 缓存目录 / 临时文件 / 下载任务 / 上传任务）两组横条；运行时长简写为「4天20时42分」，内存数值与单位分字号显示；存储空间改为 4 列迷你卡片，显示占用率与进度条（≥80% 橙、≥95% 红）。（首发：Desire5864）"
     }
   }
