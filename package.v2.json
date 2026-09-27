@@ -224,11 +224,12 @@
     "name": "CloudDrive2储存",
     "description": "使存储支持 CloudDrive2，grpc 原生 API 操作。",
     "labels": "云盘",
-    "version": "0.3.3",
+    "version": "0.3.4",
     "author": "DDSRem",
     "system_version": ">=2.15.2",
     "level": 1,
     "history": {
+      "v0.3.4": "修正详情页指标字段映射：原「打开文件/缓存目录/下载任务/上传任务」取错字段导致显示为空，现改用 fhTableCount / dirCacheCount / download_count / upload_count；「实时速率」改为由 download_speed 与 upload_speed 拼接显示。（三改：Desire5864）",
       "v0.3.3": "详情页系统指标整合压缩：原 10 张独立卡片改为单个整行卡片，内分「运行状态」（CPU/内存/运行时长/实时速率）与「任务与缓存」（打开文件/缓存目录/临时文件/下载/上传任务数）两组横条，占用高度下降约两成。运行时长简写为「4天20时42分」，内存数值与单位分字号。（三改：Desire5864）",
       "v0.3.2": "详情页「存储空间」重新排版：由整段多行文本改为 4 列迷你卡片，每盘显示占用率与进度条（≥80% 橙、≥95% 红），无法读取总量时显示「—」。（二改：Desire5864）",
       "v0.3.1": "适配 MoviePilot 严格存储查询接口，避免查询异常时误覆盖文件",
