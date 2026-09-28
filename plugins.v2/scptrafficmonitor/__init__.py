@@ -27,8 +27,8 @@ SCP_AUTH_URL = SCP_BASE + "/realms/scp/protocol/openid-connect/auth"
 
 # 流量历史持久化键名
 TRAFFIC_HISTORY_KEY = "traffic_history"
-# 流量历史最多保留条数
-TRAFFIC_HISTORY_LIMIT = 300
+# 流量历史最多保留条数（详情页展示同样取此条数）
+TRAFFIC_HISTORY_LIMIT = 10
 # 告警状态持久化键名（避免重复通知）
 ALERT_STATE_KEY = "alert_state"
 # 最近一次查询结果缓存键名（用于详情页秒开）
@@ -51,7 +51,7 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -594,10 +594,10 @@ class ScpTrafficMonitor(_PluginBase):
                 }
             )
 
-        # 流量历史（最近 30 条）
+        # 流量历史（最近 TRAFFIC_HISTORY_LIMIT 条）
         history = self.get_data(TRAFFIC_HISTORY_KEY) or []
         if history:
-            recent = history[-30:][::-1]
+            recent = history[-TRAFFIC_HISTORY_LIMIT:][::-1]
             rows = []
             for rec in recent:
                 rows.append(
@@ -624,7 +624,7 @@ class ScpTrafficMonitor(_PluginBase):
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": "流量历史（最近 30 条，倒序）",
+                                        "text": f"流量历史（最近 {TRAFFIC_HISTORY_LIMIT} 条，倒序）",
                                     },
                                 }
                             ],
