@@ -5,7 +5,7 @@ import secrets
 import threading
 import urllib.parse
 import urllib3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -59,6 +59,70 @@ OVERFLOW_HATCH = "repeating-linear-gradient(45deg, #C0392B 0 3px, #7E1B0F 3px 6p
 # 语义色（卡片右下角的「剩余 / 已超」）
 COLOR_TAIL_OK = "#2E7D32"
 COLOR_TAIL_BAD = "#C0392B"
+# 卡片底行「下行 / 上行」的标签色：用带透明度的**颜色**而不是 opacity，
+# 这样同级加粗的数值不会被一起压暗（opacity 按子树整体合成）
+COLOR_FIELD_LABEL = "rgba(var(--v-theme-on-surface), 0.62)"
+
+# ---------------------------------------------------------------------------
+# 计费周期
+# ---------------------------------------------------------------------------
+# 流量按「计费月」计，每月 25 日 00:00（站点时区）服务端把
+# rxMonthlyInMiB / txMonthlyInMiB 清零重新累计。
+#
+# 🔴 SCP 的 `/scp-core/api` 不返回任何「周期 / 重置日」字段（2026-09-28 实测
+#    serverLiveInfo.interfaces 里只有 rxMonthlyInMiB / txMonthlyInMiB /
+#    speedInMBits / trafficThrottled 等），所以重置日是本地按这个常量推算的，
+#    不是从接口读的。也正因为计数在服务端清零，插件**不需要自己重置任何数据**，
+#    只要按同一条规则切分历史即可。
+DEFAULT_BILLING_RESET_DAY = 25
+
+
+def billing_period(reset_day: int = DEFAULT_BILLING_RESET_DAY, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """推算 `now` 所处的计费周期（每月 `reset_day` 日 00:00 重置）。
+
+    :param reset_day: 每月重置日；<=0 或非数字回落默认值，>28 夹到 28
+    :param now: 参照时刻，留空取当前时间
+    :return: dict ——
+        ``key`` 周期标识（用起始日 ``"2026-09-25"``，比「按结束月命名」少一层误读）；
+        ``label`` 起止（``"09-25 ~ 10-24"``）；``start`` / ``next_reset`` 起止日期；
+        ``day_index`` 今天第几天；``days_total`` 本周期共几天；``days_left`` 距重置几天。
+    """
+    now = now or datetime.now()
+    try:
+        day = DEFAULT_BILLING_RESET_DAY if reset_day is None else int(reset_day)
+    except (TypeError, ValueError):
+        day = DEFAULT_BILLING_RESET_DAY
+    # 与其他数值配置项同口径：非正数回落默认，再夹到 28（29–31 会让部分月份对不上）
+    if day <= 0:
+        day = DEFAULT_BILLING_RESET_DAY
+    day = min(day, 28)
+
+    # 本周期起点：本月的重置日；若今天还没到重置日，则起点在上个月
+    if now.day >= day:
+        start = datetime(now.year, now.month, day)
+    else:
+        prev_month_end = datetime(now.year, now.month, 1) - timedelta(days=1)
+        start = datetime(prev_month_end.year, prev_month_end.month, day)
+
+    # 下一个重置日：起点 + 1 个月（用「当月 1 日 ± 月数」避免 31 日溢出）
+    if start.month == 12:
+        next_reset = datetime(start.year + 1, 1, day)
+    else:
+        next_reset = datetime(start.year, start.month + 1, day)
+
+    day_index = (now.date() - start.date()).days + 1
+    days_total = (next_reset.date() - start.date()).days
+    days_left = (next_reset.date() - now.date()).days
+    return {
+        "key": start.strftime("%Y-%m-%d"),
+        "label": f"{start.strftime('%m-%d')} ~ "
+                 f"{(next_reset - timedelta(days=1)).strftime('%m-%d')}",
+        "start": start,
+        "next_reset": next_reset,
+        "day_index": day_index,
+        "days_total": days_total,
+        "days_left": days_left,
+    }
 
 
 def _traffic_tone(pct: float) -> str:
@@ -73,18 +137,20 @@ def _traffic_tone(pct: float) -> str:
 class ScpTrafficMonitor(_PluginBase):
     """Server Control Panel（servercontrolpanel.de）流量监控插件。
 
-    定时登录 SCP 控制面板，抓取每台服务器本月已用流量（Traffic current month），
+    定时登录 SCP 控制面板，抓取每台服务器本计费月已用流量（Traffic current month），
     统一换算为 TB 展示（GiB ÷ 1024），超过设定阈值时发送通知提醒。
+
+    计费月定义：每月 25 日 00:00 服务端清零重新累计（见 ``DEFAULT_BILLING_RESET_DAY``）。
     """
 
     # 插件名称
     plugin_name = "SCP流量监控"
     # 插件描述
-    plugin_desc = "监控Server Control Panel服务器本月已用流量，按TB展示，超阈值时通知。"
+    plugin_desc = "监控Server Control Panel服务器计费月流量，按TB展示，超阈值时通知。"
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -114,6 +180,8 @@ class ScpTrafficMonitor(_PluginBase):
     _fast_mbps: float = DEFAULT_FAST_MBPS
     # 超出额度后的限速（Mbps）
     _slow_mbps: float = DEFAULT_SLOW_MBPS
+    # 计费月重置日（每月第几天 00:00 清零）
+    _reset_day: int = DEFAULT_BILLING_RESET_DAY
     # 最近一次流量查询结果
     _last_result: Optional[Dict[str, Any]] = None
     # 最近一次查询时间
@@ -142,6 +210,7 @@ class ScpTrafficMonitor(_PluginBase):
         self._quota_tb = DEFAULT_QUOTA_TB
         self._fast_mbps = DEFAULT_FAST_MBPS
         self._slow_mbps = DEFAULT_SLOW_MBPS
+        self._reset_day = DEFAULT_BILLING_RESET_DAY
         self._last_result = None
         self._last_check_time = None
         self._last_error = ""
@@ -183,6 +252,14 @@ class ScpTrafficMonitor(_PluginBase):
         self._fast_mbps = _pos_float("fast_mbps", DEFAULT_FAST_MBPS)
         self._slow_mbps = _pos_float("slow_mbps", DEFAULT_SLOW_MBPS)
 
+        # 计费月重置日：非正数回落默认、>28 夹到 28（与 billing_period 同口径）
+        try:
+            raw_day = config.get("reset_day")
+            day = int(float(raw_day)) if raw_day not in (None, "") else DEFAULT_BILLING_RESET_DAY
+        except (TypeError, ValueError):
+            day = DEFAULT_BILLING_RESET_DAY
+        self._reset_day = DEFAULT_BILLING_RESET_DAY if day <= 0 else min(day, 28)
+
         # 恢复告警状态，避免重启后重复通知
         alert_state = self.get_data(ALERT_STATE_KEY) or {}
         self._alerting = bool(alert_state.get("alerting"))
@@ -213,6 +290,7 @@ class ScpTrafficMonitor(_PluginBase):
                     "quota_tb": self._quota_tb,
                     "fast_mbps": self._fast_mbps,
                     "slow_mbps": self._slow_mbps,
+                    "reset_day": self._reset_day,
                     "run_once": False,
                 }
             )
@@ -341,7 +419,7 @@ class ScpTrafficMonitor(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -356,7 +434,7 @@ class ScpTrafficMonitor(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -371,7 +449,7 @@ class ScpTrafficMonitor(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -380,6 +458,21 @@ class ScpTrafficMonitor(_PluginBase):
                                             "label": "超量后限速（M）",
                                             "type": "number",
                                             "placeholder": "默认200",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "reset_day",
+                                            "label": "计费月重置日（每月）",
+                                            "type": "number",
+                                            "placeholder": "默认25",
                                         },
                                     }
                                 ],
@@ -464,8 +557,10 @@ class ScpTrafficMonitor(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "插件会按设定间隔登录 Server Control Panel 控制面板，"
-                                                    "汇总每台服务器本月已用流量（Traffic current month），"
+                                                    "汇总每台服务器本计费月已用流量（Traffic current month），"
                                                     "统一换算为 TB 展示（GiB ÷ 1024），超过阈值时发送通知。"
+                                                    "计费月按每月「重置日」00:00 起算（默认 25 日 → 次月 24 日），"
+                                                    "流量由服务端清零、插件只读不写，跨周期后流量历史自动只保留本计费月。"
                                                     "账号 1 必填；若有多台机器分属不同账号，可在账号 2 填写，留空则只监控账号 1。"
                                                     "详情页按「每台一台卡片」展示高速额度进度（额度、占比、剩余、"
                                                     "上下行、速率档），额度按台独立计算，"
@@ -492,6 +587,7 @@ class ScpTrafficMonitor(_PluginBase):
             "quota_tb": DEFAULT_QUOTA_TB,
             "fast_mbps": DEFAULT_FAST_MBPS,
             "slow_mbps": DEFAULT_SLOW_MBPS,
+            "reset_day": DEFAULT_BILLING_RESET_DAY,
             "run_once": False,
         }
 
@@ -528,6 +624,7 @@ class ScpTrafficMonitor(_PluginBase):
         # 配置概览
         interval_unit_text = "分钟" if self._interval_unit == "minutes" else "小时"
         threshold_text = "不告警" if self._threshold <= 0 else f"{self._threshold:g} TB"
+        period = billing_period(self._reset_day)
         page_content.append(
             {
                 "component": "VRow",
@@ -543,6 +640,9 @@ class ScpTrafficMonitor(_PluginBase):
                                     "variant": "tonal",
                                     "text": f"高速额度：{self._quota_tb:g} TB/月·每台"
                                             f"（额度内 {self._fast_mbps:g} M，超出后限速 {self._slow_mbps:g} M）；"
+                                            f"计费周期：{period['label']}"
+                                            f"（第 {period['day_index']}/{period['days_total']} 天，"
+                                            f"{period['days_left']} 天后重置）；"
                                             f"检查间隔：{self._interval_value} {interval_unit_text}；"
                                             f"告警阈值：{threshold_text}；"
                                             f"最近检查：{self._last_check_time or '尚未检查'}",
@@ -687,7 +787,9 @@ class ScpTrafficMonitor(_PluginBase):
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": f"流量历史（最近 {TRAFFIC_HISTORY_LIMIT} 条，倒序）",
+                                        "text": f"流量历史（本计费月 {period['label']}，"
+                                                f"最近 {TRAFFIC_HISTORY_LIMIT} 条，倒序；"
+                                                f"跨周期后自动只保留本计费月）",
                                     },
                                 }
                             ],
@@ -854,19 +956,65 @@ class ScpTrafficMonitor(_PluginBase):
                 {"component": "div", "props": {"style": "margin-top: 7px;"},
                  "content": [self.__progress_bar(tb)]},
                 # ⑥ 上下行 + 剩余/已超
+                #
+                # 🔴 opacity 必须挂在**标签节点**上，不能挂容器：opacity 按子树整体
+                #    合成，挂容器会把加粗的数值一起压暗（与 UHD 详情页卡片同一个坑）。
+                # 🔴 数值单独拆成 span 才加得粗；「下行 + 数值 + 单位」各自 nowrap，
+                #    窄卡（min-width 240px）时在两组之间换行，不会从中间断字。
                 {
                     "component": "div",
                     "props": {"style": "display: flex; justify-content: space-between; "
-                                       "gap: 8px; font-size: 11px; margin-top: 6px;"},
+                                       "align-items: baseline; flex-wrap: wrap; "
+                                       "gap: 3px 10px; font-size: 11.5px; margin-top: 7px;"},
                     "content": [
                         {
                             "component": "span",
-                            "props": {"style": "opacity: 0.7;"},
-                            "text": f"下行 {rx:,.1f} · 上行 {tx:,.1f} GiB",
+                            "props": {"style": "display: flex; align-items: baseline; "
+                                               "flex-wrap: wrap; gap: 2px 9px;"},
+                            "content": [
+                                {
+                                    "component": "span",
+                                    "props": {"style": "white-space: nowrap; "
+                                                       "font-variant-numeric: tabular-nums;"},
+                                    "content": [
+                                        {"component": "span",
+                                         "props": {"style": f"font-weight: 600; color: {COLOR_FIELD_LABEL};"},
+                                         "text": "下行 "},
+                                        {"component": "span",
+                                         "props": {"style": "font-size: 12.5px; font-weight: 700;"},
+                                         "text": f"{rx:,.1f}"},
+                                        {"component": "span",
+                                         "props": {"style": f"font-weight: 600; color: {COLOR_FIELD_LABEL};"},
+                                         "text": " GiB"},
+                                    ],
+                                },
+                                {
+                                    "component": "span",
+                                    "props": {"style": f"color: {COLOR_FIELD_LABEL}; "
+                                                       "font-weight: 400; white-space: nowrap;"},
+                                    "text": "·",
+                                },
+                                {
+                                    "component": "span",
+                                    "props": {"style": "white-space: nowrap; "
+                                                       "font-variant-numeric: tabular-nums;"},
+                                    "content": [
+                                        {"component": "span",
+                                         "props": {"style": f"font-weight: 600; color: {COLOR_FIELD_LABEL};"},
+                                         "text": "上行 "},
+                                        {"component": "span",
+                                         "props": {"style": "font-size: 12.5px; font-weight: 700;"},
+                                         "text": f"{tx:,.1f}"},
+                                        {"component": "span",
+                                         "props": {"style": f"font-weight: 600; color: {COLOR_FIELD_LABEL};"},
+                                         "text": " GiB"},
+                                    ],
+                                },
+                            ],
                         },
                         {
                             "component": "span",
-                            "props": {"style": tail_style},
+                            "props": {"style": tail_style + " white-space: nowrap;"},
                             "text": tail_text,
                         },
                     ],
@@ -1027,26 +1175,39 @@ class ScpTrafficMonitor(_PluginBase):
         self._last_error = ""
         self._last_result = result
         self.__save_result_cache()
-        self.__record_history(result)
+        rolled = self.__record_history(result)
+
+        # 跨计费周期：显式清零告警状态，保证新周期能重新提醒一次。
+        # （原有的「跌回阈值以下就复位」是启发式，这里用周期标识做确定性复位，
+        #   两者并存 —— 后者还能覆盖「用户把阈值调高」这类同周期内的复位场景。）
+        if rolled and self._alerting:
+            self._alerting = False
+            self.save_data(ALERT_STATE_KEY, {"alerting": False})
 
         if result.get("warning"):
             logger.warning(f"SCP流量监控：部分账号查询失败，{result.get('warning')}")
 
+        period = billing_period(self._reset_day)
         total_mib = result.get("total_mib") or 0
         total_gib = total_mib / 1024.0
         total_tb = total_gib / 1024.0
         servers = result.get("servers") or []
         server_count = len(servers)
 
-        logger.info(f"SCP流量监控：本月已用流量 {total_tb:.3f} TB（{total_gib:.1f} GiB，{server_count} 台服务器）")
+        logger.info(
+            f"SCP流量监控：计费月 {period['label']} 已用流量 {total_tb:.3f} TB"
+            f"（{total_gib:.1f} GiB，{server_count} 台服务器）"
+        )
 
-        # 超过阈值时通知（流量单调递增，本月内只通知一次，月初重置后重新通知）
+        # 超过阈值时通知（本计费月内只通知一次，重置后会重新提醒）
         alerting = self._threshold > 0 and total_tb >= self._threshold
         if self._notify and alerting and not self._alerting:
-            lines = [f"本月已用流量 {total_tb:.3f} TB，已超过告警阈值 {self._threshold:g} TB。"]
+            lines = [f"本计费月（{period['label']}）已用流量 {total_tb:.3f} TB，"
+                     f"已超过告警阈值 {self._threshold:g} TB。"]
             for srv in servers:
                 lines.append(f"{srv.get('account', '')} · {srv.get('name')}：{srv.get('total_tb', 0):.3f} TB")
-            lines.append("（本次告警仅通知一次，本月流量重置后才会重新提醒）")
+            lines.append(f"（计费月于每月 {self._reset_day} 日 00:00 重置，"
+                         f"距今 {period['days_left']} 天；本次告警仅通知一次，重置后才会重新提醒）")
             self.post_message(
                 mtype=NotificationType.SiteMessage,
                 title="【SCP流量告警】",
@@ -1060,24 +1221,52 @@ class ScpTrafficMonitor(_PluginBase):
             if not alerting:
                 logger.info("SCP流量监控：流量已低于阈值，告警状态重置")
 
-    def __record_history(self, result: Dict[str, Any]) -> None:
-        """记录流量历史，用于详情页展示趋势。"""
+    def __record_history(self, result: Dict[str, Any]) -> bool:
+        """记录流量历史，用于详情页展示趋势。
+
+        **计费周期切分**：历史只保留「当前计费月」的记录。判据是**周期标识变化**
+        （而不是「数值暴跌」这类启发式）—— 后者会把 `traffic_history` 里因为某个账号
+        偶发查询失败导致的数值回落误判成重置，把历史整段清掉。周期标识由本地
+        ``billing_period()`` 按重置日推算，是确定性的。
+
+        :return: 本次是否发生了跨周期重置（调用方据此清零告警状态）
+        """
         total_mib = result.get("total_mib") or 0
         total_gib = total_mib / 1024.0
         total_tb = total_gib / 1024.0
 
         history: List[Dict[str, Any]] = self.get_data(TRAFFIC_HISTORY_KEY) or []
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        period = billing_period(self._reset_day, now)
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        # 若与上一条记录的 GB 值相同（取整后），跳过避免冗余
+        rolled = False
+        if history:
+            last_time_str = str(history[-1].get("time") or "")
+            try:
+                last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                last_time = None
+            if last_time and billing_period(self._reset_day, last_time)["key"] != period["key"]:
+                # 跨计费月：上周期记录整段丢弃，历史重新从本周期第一条开始
+                history = []
+                rolled = True
+                logger.info(
+                    f"SCP流量监控：进入新计费周期 {period['label']}，流量历史已重置"
+                    f"（上一周期最后记录 {last_time_str}）"
+                )
+
+        # 若与上一条记录的 GiB 值几乎相同，跳过避免冗余
+        # （必须放在跨周期判断之后：重置当轮即便数值接近也要记一条，作为新周期起点）
         if history:
             last = history[-1]
             if abs(float(last.get("total_gib") or 0) - total_gib) < 0.05:
-                return
+                return rolled
 
         history.append(
             {
                 "time": now_str,
+                "cycle": period["key"],
                 "total_mib": total_mib,
                 "total_gib": total_gib,
                 "total_tb": total_tb,
@@ -1088,9 +1277,10 @@ class ScpTrafficMonitor(_PluginBase):
             history = history[-TRAFFIC_HISTORY_LIMIT:]
 
         self.save_data(TRAFFIC_HISTORY_KEY, history)
+        return rolled
 
     def __fetch_traffic(self) -> Tuple[Optional[Dict[str, Any]], str]:
-        """登录 SCP 并抓取所有账号下所有服务器本月已用流量。
+        """登录 SCP 并抓取所有账号下所有服务器本计费月已用流量。
 
         流程：对账号 1、账号 2 分别走 Keycloak PKCE 授权码登录 →
         获取各自服务器列表 → 逐台抓详情 → 汇总流量。
