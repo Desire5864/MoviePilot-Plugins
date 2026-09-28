@@ -36,6 +36,39 @@ RESULT_CACHE_KEY = "last_result_cache"
 # 打开详情页时缓存的最大容忍年龄（秒）；超过则同步刷新，否则后台刷新
 PAGE_CACHE_TTL = 180
 
+# ---------------------------------------------------------------------------
+# 高速流量额度与速率档（详情页展示口径，均可在插件配置里覆盖）
+# ---------------------------------------------------------------------------
+# 高速流量额度（TB/月），按「每台服务器独立」计算
+DEFAULT_QUOTA_TB = 120.0
+# 额度内的速率（Mbps）
+DEFAULT_FAST_MBPS = 2500
+# 超出额度后的限速（Mbps）
+DEFAULT_SLOW_MBPS = 200
+# 进度条满刻度 = 额度 + 溢出可视上限。所有服务器共用同一刻度，
+# 这样两台在视觉上可以直接横向比较（额度线是公共参照物）。
+OVERFLOW_VISUAL_CAP_TB = 15.0
+# 溢出段最小宽度（px）：刚超一点点时按真实比例画几乎看不见，
+# 给个下限保证「已经越线」这件事至少看得见（代价：极小幅超额时长度略失真）
+OVERFLOW_MIN_WIDTH_PX = 8
+# 进度条配色分档：<80% 用主题主色 / 80–100% 橙 / >=100% 红
+BAR_COLOR_WARN = "#E08A17"
+BAR_COLOR_OVER = "#E52D15"
+# 超出额度部分的斜纹纹理
+OVERFLOW_HATCH = "repeating-linear-gradient(45deg, #C0392B 0 3px, #7E1B0F 3px 6px)"
+# 语义色（卡片右下角的「剩余 / 已超」）
+COLOR_TAIL_OK = "#2E7D32"
+COLOR_TAIL_BAD = "#C0392B"
+
+
+def _traffic_tone(pct: float) -> str:
+    """按占比返回进度条 / 状态点的颜色。"""
+    if pct >= 100.0:
+        return BAR_COLOR_OVER
+    if pct >= 80.0:
+        return BAR_COLOR_WARN
+    return "rgb(var(--v-theme-primary))"
+
 
 class ScpTrafficMonitor(_PluginBase):
     """Server Control Panel（servercontrolpanel.de）流量监控插件。
@@ -51,7 +84,7 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -75,6 +108,12 @@ class ScpTrafficMonitor(_PluginBase):
     _interval_unit: str = "hours"
     # 流量告警阈值（TB），0 表示不告警
     _threshold: float = 0.0
+    # 高速流量额度（TB/月，每台独立）
+    _quota_tb: float = DEFAULT_QUOTA_TB
+    # 额度内速率（Mbps）
+    _fast_mbps: float = DEFAULT_FAST_MBPS
+    # 超出额度后的限速（Mbps）
+    _slow_mbps: float = DEFAULT_SLOW_MBPS
     # 最近一次流量查询结果
     _last_result: Optional[Dict[str, Any]] = None
     # 最近一次查询时间
@@ -100,6 +139,9 @@ class ScpTrafficMonitor(_PluginBase):
         self._interval_value = 6
         self._interval_unit = "hours"
         self._threshold = 0.0
+        self._quota_tb = DEFAULT_QUOTA_TB
+        self._fast_mbps = DEFAULT_FAST_MBPS
+        self._slow_mbps = DEFAULT_SLOW_MBPS
         self._last_result = None
         self._last_check_time = None
         self._last_error = ""
@@ -128,6 +170,19 @@ class ScpTrafficMonitor(_PluginBase):
         except (TypeError, ValueError):
             self._threshold = 0.0
 
+        # 额度 / 速率档：非正数或非法值一律回落到默认
+        def _pos_float(key: str, default: float) -> float:
+            try:
+                raw = config.get(key)
+                val = float(raw) if raw not in (None, "") else default
+            except (TypeError, ValueError):
+                return default
+            return val if val > 0 else default
+
+        self._quota_tb = _pos_float("quota_tb", DEFAULT_QUOTA_TB)
+        self._fast_mbps = _pos_float("fast_mbps", DEFAULT_FAST_MBPS)
+        self._slow_mbps = _pos_float("slow_mbps", DEFAULT_SLOW_MBPS)
+
         # 恢复告警状态，避免重启后重复通知
         alert_state = self.get_data(ALERT_STATE_KEY) or {}
         self._alerting = bool(alert_state.get("alerting"))
@@ -155,6 +210,9 @@ class ScpTrafficMonitor(_PluginBase):
                     "interval_value": self._interval_value,
                     "interval_unit": self._interval_unit,
                     "threshold": self._threshold,
+                    "quota_tb": self._quota_tb,
+                    "fast_mbps": self._fast_mbps,
+                    "slow_mbps": self._slow_mbps,
                     "run_once": False,
                 }
             )
@@ -283,6 +341,56 @@ class ScpTrafficMonitor(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "quota_tb",
+                                            "label": "高速额度（TB/月·每台）",
+                                            "type": "number",
+                                            "placeholder": "默认120",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "fast_mbps",
+                                            "label": "额度内速率（M）",
+                                            "type": "number",
+                                            "placeholder": "默认2500",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "slow_mbps",
+                                            "label": "超量后限速（M）",
+                                            "type": "number",
+                                            "placeholder": "默认200",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
@@ -358,7 +466,10 @@ class ScpTrafficMonitor(_PluginBase):
                                             "text": "插件会按设定间隔登录 Server Control Panel 控制面板，"
                                                     "汇总每台服务器本月已用流量（Traffic current month），"
                                                     "统一换算为 TB 展示（GiB ÷ 1024），超过阈值时发送通知。"
-                                                    "账号 1 必填；若有多台机器分属不同账号，可在账号 2 填写，留空则只监控账号 1。",
+                                                    "账号 1 必填；若有多台机器分属不同账号，可在账号 2 填写，留空则只监控账号 1。"
+                                                    "详情页按「每台一台卡片」展示高速额度进度（额度、占比、剩余、"
+                                                    "上下行、速率档），额度按台独立计算，"
+                                                    "超出额度后进度条转为红色并显示溢出段。",
                                         },
                                     }
                                 ],
@@ -378,6 +489,9 @@ class ScpTrafficMonitor(_PluginBase):
             "interval_value": 6,
             "interval_unit": "hours",
             "threshold": 0.0,
+            "quota_tb": DEFAULT_QUOTA_TB,
+            "fast_mbps": DEFAULT_FAST_MBPS,
+            "slow_mbps": DEFAULT_SLOW_MBPS,
             "run_once": False,
         }
 
@@ -427,7 +541,9 @@ class ScpTrafficMonitor(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": f"检查间隔：{self._interval_value} {interval_unit_text}；"
+                                    "text": f"高速额度：{self._quota_tb:g} TB/月·每台"
+                                            f"（额度内 {self._fast_mbps:g} M，超出后限速 {self._slow_mbps:g} M）；"
+                                            f"检查间隔：{self._interval_value} {interval_unit_text}；"
                                             f"告警阈值：{threshold_text}；"
                                             f"最近检查：{self._last_check_time or '尚未检查'}",
                                 },
@@ -486,89 +602,36 @@ class ScpTrafficMonitor(_PluginBase):
                 }
             )
 
-        # 流量汇总
-        if self._last_result:
-            result = self._last_result
-            servers = result.get("servers") or []
-            total_mib = result.get("total_mib") or 0
-            total_gib = total_mib / 1024.0
-            total_tb = total_gib / 1024.0
-
+        # 每台服务器：并列卡片（方案 2）
+        #
+        # 旧版这里是「一条合计 VAlert + 一张明细表」。2026-09-28 用户定板：
+        # 不显示合计，只体现每台服务器，排版改为「逐台并列卡」——
+        # 每张卡自带 已用 / 额度 / 占比 / 剩余 / 上下行 / 速率档，不依赖别的区块。
+        servers = (self._last_result or {}).get("servers") or []
+        if servers:
             page_content.append(
                 {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "success",
-                                        "variant": "tonal",
-                                        "text": f"本月已用流量：{total_tb:.2f} TB（{total_gib:.0f} GiB）",
-                                    },
-                                }
-                            ],
-                        }
-                    ],
+                    "component": "div",
+                    "props": {"style": "display: flex; flex-wrap: wrap; gap: 8px;"},
+                    "content": [self.__server_card(srv) for srv in servers],
                 }
             )
-
-            # 每台服务器明细
-            rows = []
-            for srv in servers:
-                rows.append(
-                    {
-                        "component": "tr",
-                        "content": [
-                            {"component": "td", "text": str(srv.get("account") or "")},
-                            {"component": "td", "text": str(srv.get("name") or "")},
-                            {"component": "td", "text": str(srv.get("hostname") or "")},
-                            {"component": "td", "text": f"{srv.get('rx_gib', 0):.1f}"},
-                            {"component": "td", "text": f"{srv.get('tx_gib', 0):.1f}"},
-                            {"component": "td", "text": f"{srv.get('total_gib', 0):.1f}"},
-                            {"component": "td", "text": f"{srv.get('total_tb', 0):.3f}"},
-                        ],
-                    }
-                )
-
+            # 一句话交代进度条口径：竖线是额度线、刻度是统一放大的，
+            # 不解释的话「条只走到 88.9%」会被读成数据没抓全。
             page_content.append(
                 {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "账号"},
-                                                        {"component": "th", "text": "服务器"},
-                                                        {"component": "th", "text": "主机名"},
-                                                        {"component": "th", "text": "下行 (GiB)"},
-                                                        {"component": "th", "text": "上行 (GiB)"},
-                                                        {"component": "th", "text": "合计 (GiB)"},
-                                                        {"component": "th", "text": "合计 (TB)"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {"component": "tbody", "content": rows},
-                                    ],
-                                }
-                            ],
-                        }
-                    ],
+                    "component": "div",
+                    "props": {
+                        "style": "font-size: 11px; line-height: 1.7; opacity: 0.7; "
+                                 "margin: 2px 0 0 2px;",
+                    },
+                    "text": (
+                        f"进度条统一按 {self._quota_tb + OVERFLOW_VISUAL_CAP_TB:g} TB 满刻度绘制，"
+                        f"竖线为 {self._quota_tb:g} TB 额度线"
+                        f"（{self._quota_tb / (self._quota_tb + OVERFLOW_VISUAL_CAP_TB) * 100:.1f}% 处），"
+                        f"各服务器共用同一刻度以便横向比较；"
+                        f"超出额度的部分用斜纹块表示，最多画 {OVERFLOW_VISUAL_CAP_TB:g} TB。"
+                    ),
                 }
             )
         else:
@@ -667,6 +730,213 @@ class ScpTrafficMonitor(_PluginBase):
             )
 
         return page_content
+
+    def __server_card(self, srv: Dict[str, Any]) -> Dict[str, Any]:
+        """构造单台服务器的卡片节点（方案 2「逐台并列卡」）。
+
+        一张卡里自包含 6 项信息，不依赖任何别的区块、也不含合计：
+            ① 状态点 + 主机名        ② 速率档徽章
+            ③ 服务器名 + 账号        ④ 已用 / 额度 / 占比（22px 大号）
+            ⑤ 额度进度条             ⑥ 上下行 + 剩余/已超
+
+        配色即语义：<80% 主题主色、80–100% 橙、>=100% 红；
+        超量后有 4 处联动变红 —— 状态点、大号数字、速率徽章、右侧「已超 X TB」。
+        """
+        quota = self._quota_tb
+        tb = float(srv.get("total_tb") or 0.0)
+        pct = (tb / quota * 100.0) if quota > 0 else 0.0
+        over = max(tb - quota, 0.0)
+        color = _traffic_tone(pct)
+        rx = float(srv.get("rx_gib") or 0.0)
+        tx = float(srv.get("tx_gib") or 0.0)
+
+        # 速率档徽章：达到额度 → 红底「已限速」；80–100% → 橙底；其余 → 紫底「高速」。
+        # 🔴 判定用 pct >= 100 而不是 over > 0：恰好 120.00 TB 时 over 为 0，
+        #    但此时进度条已转红、右侧已写「已达额度」，徽章若还挂「高速 2500 M」
+        #    就会出现同屏自相矛盾的读数（触发限速的分界就在 120 TB 这一步）。
+        if pct >= 100.0:
+            badge_bg, badge_fg = "#FDE7E9", "#C0392B"
+            badge_text = f"已限速 {self._slow_mbps:g} M"
+        elif pct >= 80.0:
+            badge_bg, badge_fg = "#FFF3E0", "#B26A00"
+            badge_text = f"高速 {self._fast_mbps:g} M"
+        else:
+            badge_bg, badge_fg = "#EFE7FE", "#6B31D6"
+            badge_text = f"高速 {self._fast_mbps:g} M"
+
+        # 卡片右下角：剩余 / 已达额度 / 已超
+        if over > 0:
+            tail_text, tail_style = f"已超 {over:.2f} TB", f"font-weight: 700; color: {COLOR_TAIL_BAD};"
+        elif abs(quota - tb) <= 1e-9:
+            tail_text, tail_style = "已达额度", f"font-weight: 700; color: {COLOR_TAIL_BAD};"
+        else:
+            tail_text = f"剩余 {quota - tb:.2f} TB"
+            tail_style = f"font-weight: 700; color: {COLOR_TAIL_OK};"
+
+        return {
+            "component": "div",
+            "props": {
+                "style": (
+                    # 两台并排；窗口收窄或超过 2 台时自动换行（最窄 240px 保底）
+                    "flex: 1 1 calc(50% - 4px); min-width: 240px; box-sizing: border-box; "
+                    "padding: 10px 12px; border-radius: 10px; "
+                    "background: rgba(var(--v-theme-surface-variant), 0.18); "
+                    "backdrop-filter: blur(10px) saturate(150%); "
+                    "-webkit-backdrop-filter: blur(10px) saturate(150%); "
+                    "border: 1px solid rgba(var(--v-theme-on-surface), 0.12); "
+                    "box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);"
+                ),
+            },
+            "content": [
+                # ① 状态点 + 主机名 …… ② 速率档徽章
+                {
+                    "component": "div",
+                    "props": {"style": "display: flex; align-items: center; gap: 7px; "
+                                       "margin-bottom: 3px;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {
+                                "style": f"width: 8px; height: 8px; border-radius: 50%; "
+                                         f"background: {color}; flex: 0 0 auto;",
+                            },
+                        },
+                        {
+                            "component": "div",
+                            "props": {"style": "font-size: 13px; font-weight: 700; "
+                                               "white-space: nowrap; overflow: hidden; "
+                                               "text-overflow: ellipsis;"},
+                            "text": str(srv.get("hostname") or srv.get("name") or "-"),
+                        },
+                        {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
+                        {
+                            "component": "span",
+                            "props": {
+                                "style": f"font-size: 11px; font-weight: 700; padding: 2px 9px; "
+                                         f"border-radius: 20px; white-space: nowrap; "
+                                         f"background: {badge_bg}; color: {badge_fg};",
+                            },
+                            "text": badge_text,
+                        },
+                    ],
+                },
+                # ③ 服务器名 + 账号
+                {
+                    "component": "div",
+                    "props": {"style": "font-size: 11px; opacity: 0.7; margin-bottom: 7px; "
+                                       "white-space: nowrap; overflow: hidden; "
+                                       "text-overflow: ellipsis;"},
+                    "text": f"{srv.get('name') or '-'} · 账号 {srv.get('account') or '-'}",
+                },
+                # ④ 已用 / 额度 / 占比
+                {
+                    "component": "div",
+                    "props": {"style": f"font-size: 22px; font-weight: 700; "
+                                       f"line-height: 1.15; color: {color};"},
+                    "content": [
+                        {"component": "span", "text": f"{tb:.2f} "},
+                        {
+                            "component": "span",
+                            "props": {"style": "font-size: 12px; font-weight: 600;"},
+                            "text": "TB",
+                        },
+                        {
+                            "component": "span",
+                            "props": {"style": "font-size: 11.5px; font-weight: 600; "
+                                               "opacity: 0.75; margin-left: 4px;"},
+                            "text": f"/ {quota:g} TB · {pct:.2f}%",
+                        },
+                    ],
+                },
+                # ⑤ 额度进度条
+                {"component": "div", "props": {"style": "margin-top: 7px;"},
+                 "content": [self.__progress_bar(tb)]},
+                # ⑥ 上下行 + 剩余/已超
+                {
+                    "component": "div",
+                    "props": {"style": "display: flex; justify-content: space-between; "
+                                       "gap: 8px; font-size: 11px; margin-top: 6px;"},
+                    "content": [
+                        {
+                            "component": "span",
+                            "props": {"style": "opacity: 0.7;"},
+                            "text": f"下行 {rx:,.1f} · 上行 {tx:,.1f} GiB",
+                        },
+                        {
+                            "component": "span",
+                            "props": {"style": tail_style},
+                            "text": tail_text,
+                        },
+                    ],
+                },
+            ],
+        }
+
+    def __progress_bar(self, tb: float) -> Dict[str, Any]:
+        """构造额度进度条节点：填充段 + 额度线 + 超量斜纹溢出段。
+
+        刻度口径（与效果图定板一致）：满刻度固定为「额度 + 溢出可视上限」，
+        **所有服务器共用同一刻度**，所以 120 TB 额度线永远落在同一个相对位置，
+        两台可以直接横向比较。代价是未超量的条看起来比「按自己的 120 TB 满刻度」短。
+
+        超量时填充段在额度线处切断（圆角收成直角），右侧接一段斜纹块；
+        斜纹块有 8px 最小宽度 —— 刚超一点点时按真实比例画几乎看不见，
+        给个下限保证「已经越线」这件事至少看得出来。
+        """
+        quota = self._quota_tb
+        scale = quota + OVERFLOW_VISUAL_CAP_TB
+        qline_pct = quota / scale * 100.0 if scale > 0 else 0.0
+        over = max(tb - quota, 0.0)
+        color = _traffic_tone(tb / quota * 100.0 if quota > 0 else 0.0)
+        fill_pct = (min(max(tb, 0.0), quota) / scale * 100.0) if scale > 0 else 0.0
+
+        children: List[Dict[str, Any]] = [
+            {
+                "component": "div",
+                "props": {
+                    "style": "position: absolute; top: 0; left: 0; height: 100%; "
+                             f"width: {fill_pct:.3f}%; background: {color}; "
+                             + ("border-radius: 5px 0 0 5px;" if over > 0
+                                else "border-radius: 5px;"),
+                },
+            }
+        ]
+
+        if over > 0:
+            ov_pct = (min(over, OVERFLOW_VISUAL_CAP_TB) / scale * 100.0) if scale > 0 else 0.0
+            children.append(
+                {
+                    "component": "div",
+                    "props": {
+                        "style": "position: absolute; top: 0; height: 100%; "
+                                 f"left: {qline_pct:.3f}%; width: {ov_pct:.3f}%; "
+                                 f"min-width: {OVERFLOW_MIN_WIDTH_PX}px; "
+                                 f"background: {OVERFLOW_HATCH}; "
+                                 "border-radius: 0 5px 5px 0;",
+                    },
+                }
+            )
+
+        # 额度线：竖线立在 100% 额度处，未超量时也显示，当「满额」参照物
+        children.append(
+            {
+                "component": "div",
+                "props": {
+                    "style": "position: absolute; top: -3px; height: 16px; width: 2px; "
+                             f"left: {qline_pct:.3f}%; margin-left: -1px; border-radius: 1px; "
+                             "background: rgba(var(--v-theme-on-surface), 0.30);",
+                },
+            }
+        )
+
+        return {
+            "component": "div",
+            "props": {
+                "style": "position: relative; height: 10px; border-radius: 5px; "
+                         "background: rgba(var(--v-theme-on-surface), 0.10);",
+            },
+            "content": children,
+        }
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册插件定时服务。"""
