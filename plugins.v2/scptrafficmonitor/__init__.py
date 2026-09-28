@@ -29,12 +29,23 @@ SCP_AUTH_URL = SCP_BASE + "/realms/scp/protocol/openid-connect/auth"
 TRAFFIC_HISTORY_KEY = "traffic_history"
 # 流量历史最多保留条数（详情页展示同样取此条数）
 TRAFFIC_HISTORY_LIMIT = 10
+# 「逐台并列卡」里每台最多列出的采样次数。
+# 采样间隔默认 6 小时 → 8 次约等于最近两天；再长卡片会高过上方的主卡片。
+HISTORY_CARD_SAMPLES = 8
+# 流量历史记录的结构版本。
+#   v1：只有合计（total_mib / total_gib / total_tb）；
+#   v2：额外带 servers[] 逐台明细（2026-09-28 起）。
+# 旧记录缺逐台数据且无法补算，升级时按这个版本号做一次性「清空重记」。
+HISTORY_SCHEMA_VERSION = 2
 # 告警状态持久化键名（避免重复通知）
 ALERT_STATE_KEY = "alert_state"
 # 最近一次查询结果缓存键名（用于详情页秒开）
 RESULT_CACHE_KEY = "last_result_cache"
-# 打开详情页时缓存的最大容忍年龄（秒）；超过则同步刷新，否则后台刷新
-PAGE_CACHE_TTL = 180
+# 打开详情页时缓存的最大容忍年龄（秒）；超过则在后台实时拉一次。
+# 2026-09-28 由 180 收到 60：SCP 接口每次请求都是当下真值（累计量可实时拉），
+# 所以把 TTL 压短就能让详情页的读数更接近「打开即最新」——
+# 页面本身仍是秒开（刷新在后台线程里做，不阻塞渲染）。
+PAGE_CACHE_TTL = 60
 
 # ---------------------------------------------------------------------------
 # 高速流量额度与速率档（详情页展示口径，均可在插件配置里覆盖）
@@ -154,7 +165,7 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -274,6 +285,9 @@ class ScpTrafficMonitor(_PluginBase):
             self._last_result = cached.get("result")
             self._last_check_time = cached.get("check_time")
             self._last_error = cached.get("error") or ""
+
+        # 旧结构（只有合计、没有逐台明细）的流量历史一次性清空重记
+        self.__migrate_history()
 
         # 立即执行一次：执行后自动关闭开关
         if config.get("run_once"):
@@ -568,7 +582,11 @@ class ScpTrafficMonitor(_PluginBase):
                                                     "账号 1 必填；若有多台机器分属不同账号，可在账号 2 填写，留空则只监控账号 1。"
                                                     "详情页按「每台一台卡片」展示高速额度进度（额度、占比、剩余、"
                                                     "上下行、速率档），额度按台独立计算，"
-                                                    "超出额度后进度条转为红色并显示溢出段。",
+                                                    "超出额度后进度条转为红色并显示溢出段。"
+                                                    "下方的流量历史同样按机器分列——每台一张小卡，"
+                                                    "卡内是该台最近几次采样的明细与增量，可与上方当前值直接对照。"
+                                                    "打开详情页若缓存超过 60 秒，会在后台重新拉取一次（不阻塞渲染），"
+                                                    "所以不必等定时任务也能看到较新的读数。",
                                         },
                                     }
                                 ],
@@ -761,23 +779,13 @@ class ScpTrafficMonitor(_PluginBase):
                 }
             )
 
-        # 流量历史（最近 TRAFFIC_HISTORY_LIMIT 条）
+        # 流量历史：逐台并列卡（方案 3，2026-09-28 定板）
+        #
+        # 旧版是一条合计趋势表（时间 / 已用 TB / 已用 GiB）。用户要求「分一下哪台机器」，
+        # 所以改为每台一张卡，卡头沿用上方服务器卡片的语言，卡内是该台自己的采样小表。
         history = self.get_data(TRAFFIC_HISTORY_KEY) or []
         if history:
-            recent = history[-TRAFFIC_HISTORY_LIMIT:][::-1]
-            rows = []
-            for rec in recent:
-                rows.append(
-                    {
-                        "component": "tr",
-                        "content": [
-                            {"component": "td", "text": str(rec.get("time") or "")},
-                            {"component": "td", "text": f"{rec.get('total_tb', 0):.3f}"},
-                            {"component": "td", "text": f"{rec.get('total_gib', 0):.1f}"},
-                        ],
-                    }
-                )
-
+            recent = history[-HISTORY_CARD_SAMPLES:]
             page_content.append(
                 {
                     "component": "VRow",
@@ -792,8 +800,8 @@ class ScpTrafficMonitor(_PluginBase):
                                         "type": "info",
                                         "variant": "tonal",
                                         "text": f"流量历史（本计费月 {period['label']}，"
-                                                f"最近 {TRAFFIC_HISTORY_LIMIT} 条，倒序；"
-                                                f"跨周期后自动只保留本计费月）",
+                                                f"按机器分列；每台最近 {len(recent)} 次采样，"
+                                                f"新的在上；跨周期后自动只保留本计费月）",
                                     },
                                 }
                             ],
@@ -801,39 +809,7 @@ class ScpTrafficMonitor(_PluginBase):
                     ],
                 }
             )
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "时间"},
-                                                        {"component": "th", "text": "已用流量 (TB)"},
-                                                        {"component": "th", "text": "已用流量 (GiB)"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {"component": "tbody", "content": rows},
-                                    ],
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
+            page_content.extend(self.__history_cards(recent))
 
         return page_content
 
@@ -864,7 +840,10 @@ class ScpTrafficMonitor(_PluginBase):
         # 🔴 判定用 pct >= 100 而不是 over > 0：恰好 120.00 TB 时 over 为 0，
         #    但此时进度条已转红、右侧已写「已达额度」，徽章若还挂「高速 2500 M」
         #    就会出现同屏自相矛盾的读数（触发限速的分界就在 120 TB 这一步）。
-        if pct >= 100.0:
+        # 🔴 v1.5.0 起再叠一条**服务端权威判据** `trafficThrottled`（`__fetch_traffic`
+        #    里读的 interface 字段）：本地按额度的推算只是兜底，服务端说限了就是限了
+        #    —— 比如额度配错（填小了）时以服务端结论为准。两者取「或」。
+        if pct >= 100.0 or srv.get("traffic_throttled") is True:
             badge_bg, badge_fg = "#FDE7E9", "#C0392B"
             badge_text = f"已限速 {self._slow_mbps:g} M"
         elif pct >= 80.0:
@@ -1130,6 +1109,279 @@ class ScpTrafficMonitor(_PluginBase):
             "content": children,
         }
 
+    # ------------------------------------------------------------------
+    # 流量历史：逐台并列卡（方案 3，2026-09-28 定板）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def __server_key(srv: Dict[str, Any]) -> str:
+        """算一台服务器的匹配键，用于「当前抓取结果 ↔ 历史记录」对账。
+
+        优先用 SCP 的服务器 id（稳定）；没有 id 时回落到「账号 + 机器名」。
+        """
+        sid = srv.get("id")
+        if sid:
+            return f"id:{sid}"
+        return f"nm:{srv.get('account') or ''}|{srv.get('name') or ''}"
+
+    @staticmethod
+    def __find_in_record(rec: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
+        """在一条历史记录里找某台服务器的快照；这条记录里没有该机器时返回 None。"""
+        for sv in rec.get("servers") or []:
+            if isinstance(sv, dict) and ScpTrafficMonitor.__server_key(sv) == key:
+                return sv
+        return None
+
+    @staticmethod
+    def __servers_from_history(recent: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """没有实时结果时（重启后 / 抓取失败），从历史里反推机器列表。
+
+        取最近一条带逐台明细的记录，字段不够的部分留空 —— 这几台卡片只用来
+        展示历史，卡头的「当前值」由历史最新一条充当。
+        """
+        for rec in reversed(recent or []):
+            out: List[Dict[str, Any]] = []
+            for sv in rec.get("servers") or []:
+                if not isinstance(sv, dict):
+                    continue
+                out.append(
+                    {
+                        "id": sv.get("id"),
+                        "name": sv.get("name") or "",
+                        "hostname": sv.get("hostname") or "",
+                        "account": sv.get("account") or "",
+                        "total_gib": sv.get("total_gib") or 0.0,
+                        "total_tb": sv.get("total_tb") or 0.0,
+                    }
+                )
+            if out:
+                return out
+        return []
+
+    def __history_cards(self, recent: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把流量历史渲染成「逐台并列卡」（方案 3）。
+
+        :param recent: 升序（旧 → 新）的历史切片，调用方已截到 HISTORY_CARD_SAMPLES 条
+        :return: 一个 flex 容器节点（内含每台一张卡）；没有可展示的机器时返回空列表
+        """
+        # 卡片按「最近一次抓取结果」里的机器出（字段最新、还带限速结论）；
+        # 重启后尚无实时结果或抓取失败时，退化成从历史里反推。
+        servers = (self._last_result or {}).get("servers") or []
+        if not servers:
+            servers = self.__servers_from_history(recent)
+        if not servers:
+            return []
+        return [
+            {
+                "component": "div",
+                "props": {"style": "display: flex; flex-wrap: wrap; gap: 8px;"},
+                "content": [self.__history_card(srv, recent) for srv in servers],
+            }
+        ]
+
+    def __history_card(self, srv: Dict[str, Any], recent: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """构造单台服务器的历史小卡（方案 3 里的一张）。
+
+        结构（沿用上方主卡片的视觉语言，只是信息密度收一档）：
+            卡头 = 状态点 + 主机名 ……（右）当前 TB · 占比
+            副行 = 机器名 + · 账号
+            卡内 = 采样明细（时间 / 已用 TB / GiB），一行一次采样，新的在上
+            卡底 = 「最近 N 次 · 累计 X GiB」+「较上次 +Δ GiB」
+
+        🔴 与主卡片同一条铁律：弱化标签一律用**带透明度的颜色**，绝不挂 ``opacity``
+        （opacity 按子树整体合成，会把同级的加粗数值一起压暗）；标签与取值必须拆成
+        独立节点，取值才可能单独加粗。
+        🔴 卡内明细用 ``display: grid`` 而不是 ``<table>``：详情页的 JSON 渲染器只保证
+        认 div/span 这类通用标签，``<tr>`` 直接挂在 div 下会被浏览器当文本丢掉
+        （table 系列标签必须有 ``<table>`` 外壳才成立）。
+        """
+        quota = self._quota_tb
+        tb_now = float(srv.get("total_tb") or 0.0)
+        pct_now = (tb_now / quota * 100.0) if quota > 0 else 0.0
+        tone = _traffic_tone(pct_now)
+        key = self.__server_key(srv)
+
+        seq = list(reversed(recent))  # 新 → 旧，与页面上其他区块的排序一致
+
+        # 明细网格：三列 =「时间(吃掉剩余宽) / 已用 TB / GiB」。
+        # 不设 column-gap，改用单元格自己的 padding 拉间距 —— 否则每行底部的
+        # 1px 分隔线会在 gap 处断开，看着像三截。
+        line = "border-bottom: 1px solid rgba(var(--v-theme-on-surface), 0.06);"
+        # 时间列是网格里唯一可收缩的列（minmax(0, 1fr)），窄卡上先让它省略，
+        # 而不是把 TB / GiB 两列挤出去
+        style_time = (f"font-size: 10.5px; color: {COLOR_FIELD_LABEL}; "
+                      "font-variant-numeric: tabular-nums; white-space: nowrap; "
+                      "overflow: hidden; text-overflow: ellipsis; "
+                      f"padding: 2.5px 10px 2.5px 0; {line}")
+        style_gib = (f"font-size: 10.5px; color: {COLOR_FIELD_LABEL}; text-align: right; "
+                     "font-variant-numeric: tabular-nums; "
+                     f"padding: 2.5px 0 2.5px 10px; {line}")
+        style_head = (f"font-size: 10px; font-weight: 600; color: {COLOR_FIELD_LABEL}; "
+                      "padding: 0 0 3px; "
+                      "border-bottom: 1px solid rgba(var(--v-theme-on-surface), 0.14);")
+        # 后两列表头右对齐，且左侧留出与数据列等宽的间距（网格没有 column-gap）
+        style_head_right = style_head.replace("padding: 0 0 3px;", "padding: 0 0 3px 10px;") \
+            + " text-align: right;"
+
+        grid_children: List[Dict[str, Any]] = [
+            {"component": "div", "props": {"style": style_head}, "text": "时间"},
+            {"component": "div", "props": {"style": style_head_right}, "text": "已用 TB"},
+            {"component": "div", "props": {"style": style_head_right}, "text": "GiB"},
+        ]
+
+        for rec in seq:
+            sv = self.__find_in_record(rec, key)
+            tb = float(sv.get("total_tb") or 0.0) if sv else None
+            gib = float(sv.get("total_gib") or 0.0) if sv else None
+            row_pct = (tb / quota * 100.0) if (tb is not None and quota > 0) else 0.0
+            time_text = str(rec.get("time") or "")
+            grid_children.append(
+                {"component": "div", "props": {"style": style_time},
+                 "text": time_text[5:] if len(time_text) >= 5 else time_text}
+            )
+            grid_children.append(
+                {
+                    "component": "div",
+                    "props": {
+                        "style": "font-size: 12.5px; font-weight: 700; text-align: right; "
+                                 "font-variant-numeric: tabular-nums; "
+                                 f"padding: 2.5px 10px; {line} "
+                                 f"color: {_traffic_tone(row_pct)};",
+                    },
+                    "text": "—" if tb is None else f"{tb:.3f}",
+                }
+            )
+            grid_children.append(
+                {"component": "div", "props": {"style": style_gib},
+                 "text": "—" if gib is None else f"{gib:,.0f}"}
+            )
+
+        # 卡底：累计 + 较上次增量（用该台在最近两次采样中的值算，缺一次就不显示 Δ）
+        latest = self.__find_in_record(seq[0], key) if seq else None
+        prev = self.__find_in_record(seq[1], key) if len(seq) > 1 else None
+        cur_gib = float(latest.get("total_gib") or 0.0) if latest else None
+        prev_gib = float(prev.get("total_gib") or 0.0) if prev else None
+
+        foot: List[Dict[str, Any]] = []
+        if cur_gib is None:
+            foot.append({"component": "span",
+                         "props": {"style": f"color: {COLOR_FIELD_LABEL};"},
+                         "text": f"最近 {len(seq)} 次采样中没有该机器的记录"})
+        else:
+            foot.append({"component": "span",
+                         "props": {"style": f"color: {COLOR_FIELD_LABEL};"},
+                         "text": f"最近 {len(seq)} 次 · 累计 "})
+            foot.append({"component": "span",
+                         "props": {"style": f"font-weight: 700; color: {COLOR_FIELD_VALUE}; "
+                                            "font-variant-numeric: tabular-nums;"},
+                         "text": f"{cur_gib:,.1f}"})
+            foot.append({"component": "span",
+                         "props": {"style": f"color: {COLOR_FIELD_LABEL};"},
+                         "text": " GiB"})
+            if prev_gib is not None:
+                delta = cur_gib - prev_gib
+                foot.append({"component": "span",
+                             "props": {"style": f"color: {COLOR_FIELD_LABEL};"},
+                             "text": " · 较上次 "})
+                foot.append({"component": "span",
+                             "props": {"style": f"font-weight: 700; color: {COLOR_FIELD_VALUE}; "
+                                                "font-variant-numeric: tabular-nums;"},
+                             "text": f"+{delta:,.1f}"})
+
+        return {
+            "component": "div",
+            "props": {
+                "style": (
+                    # 与上方主卡片同款「两台并排 / 窄了自动换行」，但底色更淡一档，
+                    # 免得历史区比当前值区还抢眼
+                    "flex: 1 1 calc(50% - 4px); min-width: 300px; box-sizing: border-box; "
+                    "padding: 10px 12px 9px; border-radius: 10px; "
+                    "background: rgba(var(--v-theme-surface-variant), 0.10); "
+                    "border: 1px solid rgba(var(--v-theme-on-surface), 0.10);"
+                ),
+            },
+            "content": [
+                # 卡头：状态点 + 主机名 …… 当前值
+                {
+                    "component": "div",
+                    "props": {"style": "display: flex; align-items: center; gap: 7px;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"style": f"width: 8px; height: 8px; border-radius: 50%; "
+                                               f"background: {tone}; flex: 0 0 auto;"},
+                        },
+                        {
+                            "component": "div",
+                            "props": {"style": "font-size: 12.5px; font-weight: 700; "
+                                               "white-space: nowrap; overflow: hidden; "
+                                               "text-overflow: ellipsis;"},
+                            "text": str(srv.get("hostname") or srv.get("name") or "-"),
+                        },
+                        {"component": "div", "props": {"style": "flex: 1 1 auto;"}},
+                        {
+                            "component": "span",
+                            "props": {"style": "font-size: 11.5px; font-weight: 700; "
+                                               "white-space: nowrap; "
+                                               "font-variant-numeric: tabular-nums; "
+                                               f"color: {tone};"},
+                            "text": f"{tb_now:.3f} TB · {pct_now:.2f}%",
+                        },
+                    ],
+                },
+                # 副行：机器名 + 账号（与主卡片第 ③ 行同一套拆分方式）
+                {
+                    "component": "div",
+                    "props": {"style": "display: flex; align-items: baseline; "
+                                       "flex-wrap: wrap; gap: 2px 7px; "
+                                       "margin: 2px 0 7px; font-size: 11px; "
+                                       "font-variant-numeric: tabular-nums;"},
+                    "content": [
+                        {
+                            "component": "span",
+                            "props": {"style": "font-weight: 600; letter-spacing: 0.2px; "
+                                               f"color: {COLOR_FIELD_NAME}; "
+                                               "white-space: nowrap; max-width: 100%; "
+                                               "overflow: hidden; text-overflow: ellipsis;"},
+                            "text": str(srv.get("name") or "-"),
+                        },
+                        {
+                            "component": "span",
+                            "props": {"style": "white-space: nowrap;"},
+                            "content": [
+                                {"component": "span",
+                                 "props": {"style": f"font-weight: 600; "
+                                                    f"color: {COLOR_FIELD_LABEL};"},
+                                 "text": "· 账号 "},
+                                {"component": "span",
+                                 "props": {"style": "font-size: 11.5px; font-weight: 700; "
+                                                    f"color: {COLOR_FIELD_VALUE};"},
+                                 "text": str(srv.get("account") or "-")},
+                            ],
+                        },
+                    ],
+                },
+                # 卡内明细网格
+                {
+                    "component": "div",
+                    "props": {"style": "display: grid; "
+                                       "grid-template-columns: minmax(0, 1fr) auto auto;"},
+                    "content": grid_children,
+                },
+                # 卡底
+                #
+                # 🔴 这里**不能**用 display:flex —— flex 容器会把每个 span 当成独立
+                #    flex item，文本节点里用来分隔的空格被折叠掉，结果「…累计」和
+                #    数值会粘成「…累计3,807.4」。用普通行内布局，靠文本自带的空格
+                #    分隔即可（换行仍由浏览器在空格处自动处理）。
+                {
+                    "component": "div",
+                    "props": {"style": f"display: block; font-size: 10.5px; margin-top: 7px; "
+                                       f"color: {COLOR_FIELD_LABEL};"},
+                    "content": foot,
+                },
+            ],
+        }
+
     def get_service(self) -> List[Dict[str, Any]]:
         """注册插件定时服务。"""
         if self._enabled and self._username and self._password:
@@ -1271,6 +1523,11 @@ class ScpTrafficMonitor(_PluginBase):
         偶发查询失败导致的数值回落误判成重置，把历史整段清掉。周期标识由本地
         ``billing_period()`` 按重置日推算，是确定性的。
 
+        **逐台明细**：从 v2（``HISTORY_SCHEMA_VERSION``）起每条记录除合计外还带
+        ``servers[]``（每台的 id / name / hostname / account / rx_mib / tx_mib /
+        total_* ）。合计值仍然写在顶层，这样「跨周期判断」「去重」这些只看合计的
+        逻辑不用改；详情页的历史区则按 ``servers[]`` 拆成逐台并列卡。
+
         :return: 本次是否发生了跨周期重置（调用方据此清零告警状态）
         """
         total_mib = result.get("total_mib") or 0
@@ -1305,13 +1562,32 @@ class ScpTrafficMonitor(_PluginBase):
             if abs(float(last.get("total_gib") or 0) - total_gib) < 0.05:
                 return rolled
 
+        # 逐台明细：只留展示需要的字段，历史体积可控（10 条 × N 台）
+        servers_snapshot: List[Dict[str, Any]] = []
+        for srv in result.get("servers") or []:
+            servers_snapshot.append(
+                {
+                    "id": srv.get("id"),
+                    "name": str(srv.get("name") or ""),
+                    "hostname": str(srv.get("hostname") or ""),
+                    "account": str(srv.get("account") or ""),
+                    "rx_mib": srv.get("rx_mib") or 0,
+                    "tx_mib": srv.get("tx_mib") or 0,
+                    "total_mib": srv.get("total_mib") or 0,
+                    "total_gib": srv.get("total_gib") or 0.0,
+                    "total_tb": srv.get("total_tb") or 0.0,
+                }
+            )
+
         history.append(
             {
+                "schema": HISTORY_SCHEMA_VERSION,
                 "time": now_str,
                 "cycle": period["key"],
                 "total_mib": total_mib,
                 "total_gib": total_gib,
                 "total_tb": total_tb,
+                "servers": servers_snapshot,
             }
         )
 
@@ -1320,6 +1596,32 @@ class ScpTrafficMonitor(_PluginBase):
 
         self.save_data(TRAFFIC_HISTORY_KEY, history)
         return rolled
+
+    def __migrate_history(self) -> None:
+        """把旧版（schema < 2）的流量历史一次性清空。
+
+        旧记录只有两台合计、没有逐台明细，且**无法事后补算**（逐台数据在记录那一刻
+        才有）。留着只会在逐台卡片里显示一列「—」，不如清掉重记 ——
+        真机当时那 10 条本来也只是 3 天内的样本。
+        """
+        try:
+            history = self.get_data(TRAFFIC_HISTORY_KEY)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"SCP流量监控：读取流量历史失败，{e}")
+            return
+        if not history:
+            return
+        # 全部记录都已经带 v2 结构就什么都不做（幂等）
+        if all(
+            isinstance(rec, dict) and int(rec.get("schema") or 1) >= HISTORY_SCHEMA_VERSION
+            for rec in history
+        ):
+            return
+        self.save_data(TRAFFIC_HISTORY_KEY, [])
+        logger.info(
+            f"SCP流量监控：流量历史升级为逐台明细（schema {HISTORY_SCHEMA_VERSION}），"
+            f"旧记录 {len(history)} 条已清空，将从下一次检查开始重新记录"
+        )
 
     def __fetch_traffic(self) -> Tuple[Optional[Dict[str, Any]], str]:
         """登录 SCP 并抓取所有账号下所有服务器本计费月已用流量。
@@ -1408,6 +1710,12 @@ class ScpTrafficMonitor(_PluginBase):
                 rx_mib = sum(i.get("rxMonthlyInMiB") or 0 for i in ifaces)
                 tx_mib = sum(i.get("txMonthlyInMiB") or 0 for i in ifaces)
                 total_mib = rx_mib + tx_mib
+                # 服务端权威字段（2026-09-28 实测）：
+                #   trafficThrottled —— 是否已被限速，服务端直接给结论；
+                #   speedInMBits     —— **网口速率档**（实测恒为 2500），不是瞬时吞吐。
+                # 多网口时按「任一被限速 / 最大速率档」归并。
+                throttled = any(bool(i.get("trafficThrottled")) for i in ifaces)
+                speed_mbits = max([i.get("speedInMBits") or 0 for i in ifaces] or [0])
 
                 servers.append(
                     {
@@ -1422,6 +1730,8 @@ class ScpTrafficMonitor(_PluginBase):
                         "tx_gib": tx_mib / 1024.0,
                         "total_gib": total_mib / 1024.0,
                         "total_tb": (total_mib / 1024.0) / 1024.0,
+                        "traffic_throttled": throttled,
+                        "speed_mbits": speed_mbits,
                     }
                 )
 
