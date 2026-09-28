@@ -764,10 +764,12 @@ class ScpTrafficMonitor(_PluginBase):
             badge_bg, badge_fg = "#EFE7FE", "#6B31D6"
             badge_text = f"高速 {self._fast_mbps:g} M"
 
-        # 卡片右下角：剩余 / 已达额度 / 已超
-        if over > 0:
+        # 卡片右下角：剩余 / 已达额度 / 已超。
+        # 阈值用 0.005（显示精度 0.01 的一半）而不是 0 —— 否则浮点误差下会出现
+        # 「已超 0.00 TB」这种自相矛盾的读数。
+        if over >= 0.005:
             tail_text, tail_style = f"已超 {over:.2f} TB", f"font-weight: 700; color: {COLOR_TAIL_BAD};"
-        elif abs(quota - tb) <= 1e-9:
+        elif pct >= 100.0:
             tail_text, tail_style = "已达额度", f"font-weight: 700; color: {COLOR_TAIL_BAD};"
         else:
             tail_text = f"剩余 {quota - tb:.2f} TB"
