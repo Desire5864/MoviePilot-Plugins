@@ -165,7 +165,7 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1293,8 +1293,18 @@ class ScpTrafficMonitor(_PluginBase):
                 "style": (
                     # 与上方主卡片同款「两台并排 / 窄了自动换行」，但底色更淡一档，
                     # 免得历史区比当前值区还抢眼
+                    #
+                    # 🔴 右侧内边距 12 → 56px（2026-09-28，1.5.1）：详情页右下的
+                    # 齿轮设置按钮是**面板外壳的浮层**（不在本插件页面树里，插件
+                    # 挪不了它），它锚定在对话框右下角内侧 12px，换算到内容坐标系
+                    # 就是恒定压住「内容最下 46.6px × 最右 48px」那一小块 ——
+                    # 与对话框在视口里的位置、与视口高矮都无关。原先这一小块压掉
+                    # 了本卡最后一行 GiB 数字的下半截（6.6px，占字高 73%）。
+                    # 横向让开 48px 即可，取 56 留 8px 余量；本卡已 300px 起且
+                    # 时间列可收缩，让开这 56px 不会换行，也不占任何高度
+                    # （对话框高 = 内容高 + 固定头尾，所以「让宽」不影响垂直布局）。
                     "flex: 1 1 calc(50% - 4px); min-width: 300px; box-sizing: border-box; "
-                    "padding: 10px 12px 9px; border-radius: 10px; "
+                    "padding: 10px 56px 9px 12px; border-radius: 10px; "
                     "background: rgba(var(--v-theme-surface-variant), 0.10); "
                     "border: 1px solid rgba(var(--v-theme-on-surface), 0.10);"
                 ),
