@@ -59,9 +59,13 @@ OVERFLOW_HATCH = "repeating-linear-gradient(45deg, #C0392B 0 3px, #7E1B0F 3px 6p
 # 语义色（卡片右下角的「剩余 / 已超」）
 COLOR_TAIL_OK = "#2E7D32"
 COLOR_TAIL_BAD = "#C0392B"
-# 卡片底行「下行 / 上行」的标签色：用带透明度的**颜色**而不是 opacity，
-# 这样同级加粗的数值不会被一起压暗（opacity 按子树整体合成）
+# 卡片里「标签 / 取值」两级文字色。一律用带透明度的**颜色**而不是 opacity：
+# opacity 按子树整体合成，挂在容器上会把同级加粗的数值一起压暗（加粗就白加了）。
 COLOR_FIELD_LABEL = "rgba(var(--v-theme-on-surface), 0.62)"
+# 机器名（v2202… 这种长串）
+COLOR_FIELD_NAME = "rgba(var(--v-theme-on-surface), 0.80)"
+# 真正要看清的取值（账号 / 速率档数字）
+COLOR_FIELD_VALUE = "rgba(var(--v-theme-on-surface), 0.94)"
 
 # ---------------------------------------------------------------------------
 # 计费周期
@@ -150,7 +154,7 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -843,6 +847,10 @@ class ScpTrafficMonitor(_PluginBase):
 
         配色即语义：<80% 主题主色、80–100% 橙、>=100% 红；
         超量后有 4 处联动变红 —— 状态点、大号数字、速率徽章、右侧「已超 X TB」。
+
+        文字层级统一为「标签弱化 + 取值加粗」，弱化一律用带透明度的颜色而不是
+        opacity（opacity 会把子树一起压暗）。第 ③ 行（机器名 + 账号）与第 ⑥ 行
+        （下行 / 上行）都按这个规则拆节点，见各自下面的注释。
         """
         quota = self._quota_tb
         tb = float(srv.get("total_tb") or 0.0)
@@ -925,12 +933,46 @@ class ScpTrafficMonitor(_PluginBase):
                     ],
                 },
                 # ③ 服务器名 + 账号
+                #
+                # 🔴 旧写法是「整行一个节点 + opacity: 0.7 + 11px」：标签和取值一起被压暗，
+                #    想单独加粗某一截都做不到，窄卡上也只剩一个省略号。
+                # 现在拆成「机器名 / 账号」两段独立节点，取值加粗、标签用**颜色**弱化；
+                # 两段都 nowrap，靠 flex-wrap 在窄卡上整段换行（「· 账号 X」绑成一体，
+                # 不会出现行首孤零零一个「·」）。
                 {
                     "component": "div",
-                    "props": {"style": "font-size: 11px; opacity: 0.7; margin-bottom: 7px; "
-                                       "white-space: nowrap; overflow: hidden; "
-                                       "text-overflow: ellipsis;"},
-                    "text": f"{srv.get('name') or '-'} · 账号 {srv.get('account') or '-'}",
+                    "props": {"style": "display: flex; align-items: baseline; "
+                                       "flex-wrap: wrap; gap: 2px 7px; "
+                                       "margin-bottom: 7px; font-size: 12px; "
+                                       "font-variant-numeric: tabular-nums;"},
+                    "content": [
+                        {
+                            "component": "span",
+                            "props": {"style": f"font-weight: 600; letter-spacing: 0.2px; "
+                                               f"color: {COLOR_FIELD_NAME}; "
+                                               "white-space: nowrap; max-width: 100%; "
+                                               "overflow: hidden; text-overflow: ellipsis;"},
+                            "text": str(srv.get("name") or "-"),
+                        },
+                        {
+                            "component": "span",
+                            "props": {"style": "white-space: nowrap;"},
+                            "content": [
+                                {
+                                    "component": "span",
+                                    "props": {"style": f"font-weight: 600; "
+                                                       f"color: {COLOR_FIELD_LABEL};"},
+                                    "text": "· 账号 ",
+                                },
+                                {
+                                    "component": "span",
+                                    "props": {"style": "font-size: 12.5px; font-weight: 700; "
+                                                       f"color: {COLOR_FIELD_VALUE};"},
+                                    "text": str(srv.get("account") or "-"),
+                                },
+                            ],
+                        },
+                    ],
                 },
                 # ④ 已用 / 额度 / 占比
                 {
