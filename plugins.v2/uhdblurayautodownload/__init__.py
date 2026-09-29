@@ -284,7 +284,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.25.0"
+    plugin_version = "2.24.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -652,55 +652,55 @@ class UhdBlurayAutoDownload(_PluginBase):
                             {"component": "VChip", "props": {"size": "small", "variant": "text"}, "text": "全局设置"}
                         ],
                     },
-                    # 三个开关（v2.25.0 起）：由「三栏平分、左右贴边」改为**整组水平居中**。
-                    # 做法是收成一个 12 栏 VCol，里面用居中 flex 容器排三个开关 ——
-                    # 结构上不再依赖 VRow 的 justify/cols=auto，一行 CSS 就能定死居中与间距。
                     {
                         "component": "VRow",
                         "props": {"dense": True, "align": "center", "class": "mb-2"},
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "div",
+                                        "component": "VSwitch",
                                         "props": {
-                                            "class": "d-flex align-center justify-center flex-wrap",
-                                            "style": "gap: 12px 64px;",
+                                            "model": "enabled",
+                                            "label": "启用插件",
+                                            "color": "primary",
+                                            "hideDetails": True,
+                                            "density": "compact",
                                         },
-                                        "content": [
-                                            {
-                                                "component": "VSwitch",
-                                                "props": {
-                                                    "model": "enabled",
-                                                    "label": "启用插件",
-                                                    "color": "primary",
-                                                    "hideDetails": True,
-                                                    "density": "compact",
-                                                },
-                                            },
-                                            {
-                                                "component": "VSwitch",
-                                                "props": {
-                                                    "model": "notify",
-                                                    "label": "发送通知",
-                                                    "color": "primary",
-                                                    "hideDetails": True,
-                                                    "density": "compact",
-                                                },
-                                            },
-                                            {
-                                                "component": "VSwitch",
-                                                "props": {
-                                                    "model": "run_once",
-                                                    "label": "立即执行一次",
-                                                    "color": "primary",
-                                                    "hideDetails": True,
-                                                    "density": "compact",
-                                                },
-                                            },
-                                        ],
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "notify",
+                                            "label": "发送通知",
+                                            "color": "primary",
+                                            "hideDetails": True,
+                                            "density": "compact",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "run_once",
+                                            "label": "立即执行一次",
+                                            "color": "primary",
+                                            "hideDetails": True,
+                                            "density": "compact",
+                                        },
                                     }
                                 ],
                             },
