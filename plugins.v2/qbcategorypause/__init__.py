@@ -36,6 +36,13 @@ STOP_TIME_DATA_KEY = "stopped_time_map"
 # 持久化迁移任务队列的键名
 MIGRATE_DATA_KEY = "migrate_jobs"
 
+# 迁移任务「进行中」的状态集合（这些任务永远不会被裁剪）
+MIGRATE_ACTIVE_STATES = ("queued", "copying", "verifying", "swapping")
+
+# 迁移队列里最多保留多少条「已结束」（done / failed）历史记录。
+# 渲染层本来就只展示最近 20 条，存储层也要收敛，否则队列会随版本无限膨胀。
+MIGRATE_KEEP_FINISHED = 50
+
 # qB 容器路径前缀 -> MoviePilot 容器路径前缀
 # （两个容器的挂载点不同名，插件跑在 MP 容器里要靠这张表换算真实路径）
 QB_TO_MP_PATH_MAP = (
@@ -63,7 +70,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.5.3"
+    plugin_version = "1.5.4"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -101,6 +108,12 @@ class QbCategoryPause(_PluginBase):
     _migrate_verify: bool = True
     # 迁移工作线程是否在跑
     _migrate_running: bool = False
+    # 🔴 迁移队列的读写锁：`__enqueue`（用户点按钮）与 worker（复制中的进度回写）
+    # 都会「读队列 → 改 → 写回」，没有这把锁两个线程会互相覆盖。
+    # 用 RLock（可重入）：`__load_jobs` / `__save_jobs` 自己也上锁，
+    # 于是「一整段读-改-写」既能被锁保护、又不会自己把自己锁死。
+    # ⚠️ 复制/校验这种长耗时的动作**绝不能**持锁，否则用户点迁移会卡住整个线程。
+    _migrate_lock: threading.RLock = threading.RLock()
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -1206,10 +1219,70 @@ class QbCategoryPause(_PluginBase):
             return None
 
     def __load_jobs(self) -> Dict[str, Dict[str, Any]]:
-        return self.get_data(MIGRATE_DATA_KEY) or {}
+        with self._migrate_lock:
+            return self.get_data(MIGRATE_DATA_KEY) or {}
 
     def __save_jobs(self, jobs: Dict[str, Dict[str, Any]]) -> None:
-        self.save_data(MIGRATE_DATA_KEY, jobs)
+        with self._migrate_lock:
+            self.save_data(MIGRATE_DATA_KEY, jobs)
+
+    def __get_job(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        """读取队列里的单条任务（副本，改了不会影响存储）。"""
+        if not torrent_hash:
+            return None
+        job = self.__load_jobs().get(torrent_hash)
+        return dict(job) if job else None
+
+    def __update_job(self, torrent_hash: str, **patch) -> None:
+        """只更新队列里的**一条**任务，其余记录原样保留。
+
+        🔴 必须「写前重新读取 + 只合并自己那几个字段」，绝不能拿一份旧快照整表回写 ——
+        worker 在复制开始前 load 的那份快照不含后来新入队的任务，
+        整表写回会把它们抹掉：1.5.3 及之前「复制期间点迁移，任务活不过 1 秒」就是此因。
+        整个读-改-写在 `_migrate_lock` 内完成，同时点多个迁移也不会互相覆盖。
+        """
+        if not torrent_hash:
+            return
+        if patch.get("state") in ("done", "failed") and "end_ts" not in patch:
+            # 记下结束时刻，供裁剪时按「真正结束的先后」保留最近若干条
+            patch["end_ts"] = datetime.now().timestamp()
+        with self._migrate_lock:
+            jobs = self.__load_jobs()
+            job = jobs.get(torrent_hash)
+            if not job:
+                job = {"hash": torrent_hash}
+                jobs[torrent_hash] = job
+            job.update(patch)
+            self.__save_jobs(self.__trim_jobs(jobs, keep_hash=torrent_hash))
+
+    @staticmethod
+    def __trim_jobs(jobs: Dict[str, Dict[str, Any]],
+                    keep_hash: str = None) -> Dict[str, Dict[str, Any]]:
+        """收敛队列体积：进行中的任务全部保留，已结束的只留最近 MIGRATE_KEEP_FINISHED 条。
+
+        :param keep_hash: 本条任务一定会保留（刚结束的那条，别让它被自己挤掉）
+        """
+        active: Dict[str, Dict[str, Any]] = {}
+        finished: List[Tuple[int, Dict[str, Any]]] = []
+        for index, (torrent_hash, job) in enumerate(jobs.items()):
+            if job.get("state") in MIGRATE_ACTIVE_STATES:
+                active[torrent_hash] = job
+            else:
+                finished.append((index, job))
+        # 时间相同时（同一轮里批量结束）用入队次序兜底：后入队的算更新。
+        # 少了这个兜底，稳定排序会把「并列里最旧的」当成最新的留下。
+        finished.sort(key=lambda item: (item[1].get("end_ts")
+                                        or item[1].get("ts") or 0, item[0]),
+                      reverse=True)
+        kept: Dict[str, Dict[str, Any]] = {}
+        for _index, job in finished[:MIGRATE_KEEP_FINISHED]:
+            torrent_hash = job.get("hash")
+            if torrent_hash:
+                kept[torrent_hash] = job
+        kept.update(active)
+        if keep_hash and keep_hash in jobs:
+            kept[keep_hash] = jobs[keep_hash]
+        return kept
 
     def __torrent_brief(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
         """在已配置的下载器里定位种子，返回它所属下载器与关键字段。"""
@@ -1265,85 +1338,99 @@ class QbCategoryPause(_PluginBase):
             message=f"新加入 {added} 个，跳过 {skipped} 个（已在队列或已不存在）")
 
     def __enqueue(self, hashes: List[str]) -> Tuple[int, int]:
-        """写入迁移队列，并确保后台线程在跑。"""
-        jobs = self.__load_jobs()
+        """写入迁移队列，并确保后台线程在跑。
+
+        🔴 整段「读队列 → 判断 → 写回」都在 `_migrate_lock` 内：没有锁时
+        「同时点好几个迁移」的并发请求会各自读到同一份旧值，后写的赢（前面的任务消失）。
+        """
         added = skipped = 0
-        for torrent_hash in hashes:
-            if not torrent_hash:
-                continue
-            exist = jobs.get(torrent_hash)
-            if exist and exist.get("state") in (
-                    "queued", "copying", "verifying", "swapping"):
-                skipped += 1
-                continue
-            brief = self.__torrent_brief(torrent_hash)
-            if not brief:
-                skipped += 1
-                continue
-            jobs[torrent_hash] = {
-                "hash": torrent_hash,
-                "name": brief.get("name") or torrent_hash,
-                "downloader": brief.get("downloader") or "",
-                "category": brief.get("category") or "",
-                "state": "queued",
-                "total": int(brief.get("size") or 0),
-                "done": 0,
-                "message": "排队中",
-                "ts": datetime.now().timestamp(),
-            }
-            added += 1
-        self.__save_jobs(jobs)
-        if added:
-            self.__start_worker()
+        with self._migrate_lock:
+            jobs = self.__load_jobs()
+            for torrent_hash in hashes:
+                if not torrent_hash:
+                    continue
+                exist = jobs.get(torrent_hash)
+                if exist and exist.get("state") in MIGRATE_ACTIVE_STATES:
+                    skipped += 1
+                    continue
+                brief = self.__torrent_brief(torrent_hash)
+                if not brief:
+                    skipped += 1
+                    continue
+                jobs[torrent_hash] = {
+                    "hash": torrent_hash,
+                    "name": brief.get("name") or torrent_hash,
+                    "downloader": brief.get("downloader") or "",
+                    "category": brief.get("category") or "",
+                    "state": "queued",
+                    "total": int(brief.get("size") or 0),
+                    "done": 0,
+                    "message": "排队中",
+                    "ts": datetime.now().timestamp(),
+                }
+                added += 1
+            if added:
+                self.__save_jobs(self.__trim_jobs(jobs))
+                self.__start_worker()
         return added, skipped
 
     def __start_worker(self) -> None:
         """启动后台迁移线程（已有线程在跑时不重复启动）。"""
-        if self._migrate_running:
-            return
-        self._migrate_running = True
+        with self._migrate_lock:
+            if self._migrate_running:
+                return
+            self._migrate_running = True
         threading.Thread(target=self.__migrate_worker,
                          name="QbCategoryPauseMigrate", daemon=True).start()
 
     def __migrate_worker(self) -> None:
-        """后台工作线程：按入队顺序逐个迁移。"""
+        """后台工作线程：按入队顺序逐个迁移。
+
+        🔴 「没待办 → 退出」的判断与把 `_migrate_running` 置回 False 必须在同一把锁内，
+        否则中间那一小段窗口里入队的任务会两边都漏：worker 判定队列为空准备退出，
+        而入队的线程此刻看到 `_migrate_running` 还是 True 就不再另起线程。
+        （复制期间入队的任务由此能正常续跑，不会再丢。）
+        """
         try:
             while True:
-                jobs = self.__load_jobs()
-                pending = [job for job in jobs.values()
-                           if job.get("state") == "queued"]
-                if not pending:
-                    break
+                with self._migrate_lock:
+                    pending = [job for job in self.__load_jobs().values()
+                               if job.get("state") == "queued"]
+                    if not pending:
+                        self._migrate_running = False
+                        return
                 pending.sort(key=lambda job: job.get("ts") or 0)
                 job = pending[0]
+                torrent_hash = job.get("hash")
                 try:
-                    self.__migrate_one(job, jobs)
+                    self.__migrate_one(torrent_hash)
                 except Exception as e:
                     logger.error(f"QB分类活动暂停：迁移 {job.get('name')} 异常：{e}")
-                    job["state"] = "failed"
-                    job["message"] = f"异常：{e}"
-                    self.__save_jobs(jobs)
+                    self.__update_job(torrent_hash, state="failed",
+                                      message=f"异常：{e}")
         finally:
-            self._migrate_running = False
+            with self._migrate_lock:
+                self._migrate_running = False
 
-    def __migrate_one(self, job: Dict[str, Any],
-                      jobs: Dict[str, Dict[str, Any]]) -> None:
-        """迁移单个种子。任一步失败都保留原任务，不制造"两头空"。"""
-        torrent_hash = job.get("hash")
+    def __migrate_one(self, torrent_hash: str) -> None:
+        """迁移单个种子。任一步失败都保留原任务，不制造"两头空"。
+
+        🔴 只认 hash，**不接收也不持有队列快照**：每一步写入都走 `__update_job`
+        （写前重读、只改自己那条），否则会把复制期间新入队的任务整表抹掉。
+        """
+        job = self.__get_job(torrent_hash) or {}
         name = job.get("name") or torrent_hash
 
         brief = self.__torrent_brief(torrent_hash)
         if not brief:
-            job["state"] = "failed"
-            job["message"] = "找不到该种子，可能已被删除"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message="找不到该种子，可能已被删除")
             return
 
         client = self.__qb_client(brief["downloader"])
         if not client:
-            job["state"] = "failed"
-            job["message"] = f"无法连接下载器 {brief['downloader']}"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message=f"无法连接下载器 {brief['downloader']}")
             return
 
         target_qb = self._migrate_target
@@ -1352,49 +1439,39 @@ class QbCategoryPause(_PluginBase):
         dst_mp = os.path.join(target_mp, name)
 
         if not os.path.exists(src_mp):
-            job["state"] = "failed"
-            job["message"] = f"源路径不存在：{src_mp}"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message=f"源路径不存在：{src_mp}")
             return
         if os.path.abspath(src_mp) == os.path.abspath(dst_mp):
-            job["state"] = "failed"
-            job["message"] = "源路径与目标路径相同，无需迁移"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message="源路径与目标路径相同，无需迁移")
             return
 
         # ① 复制
-        job["state"] = "copying"
-        job["message"] = f"复制到 {dst_mp}"
-        self.__save_jobs(jobs)
-        if not self.__copy_tree(src_mp, dst_mp, job, jobs):
+        self.__update_job(torrent_hash, state="copying", message=f"复制到 {dst_mp}")
+        if not self.__copy_tree(src_mp, dst_mp, torrent_hash):
             return
 
         # ② 逐块校验（只比大小验不出静默损坏）
         if self._migrate_verify:
-            job["state"] = "verifying"
-            job["message"] = "逐块校验中"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="verifying", message="逐块校验中")
             ok, detail = self.__verify_pieces(client, torrent_hash, target_mp)
             if not ok:
-                job["state"] = "failed"
-                job["message"] = f"校验未通过（{detail}），原任务未动"
-                self.__save_jobs(jobs)
+                self.__update_job(torrent_hash, state="failed",
+                                  message=f"校验未通过（{detail}），原任务未动")
                 return
-            job["message"] = f"校验通过：{detail}"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, message=f"校验通过：{detail}")
 
         # ③ 导出 .torrent 备份 —— 删掉原任务后这是唯一的回滚凭据
         try:
             torrent_bytes = client.torrents_export(torrent_hash=torrent_hash)
         except Exception as e:
-            job["state"] = "failed"
-            job["message"] = f"导出种子失败：{e}"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message=f"导出种子失败：{e}")
             return
         if not torrent_bytes:
-            job["state"] = "failed"
-            job["message"] = "导出种子为空，原任务未动"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message="导出种子为空，原任务未动")
             return
         try:
             backup_dir = os.path.join(self.get_data_path(), "torrents")
@@ -1414,21 +1491,17 @@ class QbCategoryPause(_PluginBase):
                                f"失败（可能已存在）：{e}")
 
         # ⑤ 删除原任务
-        job["state"] = "swapping"
-        job["message"] = "删除原任务"
-        self.__save_jobs(jobs)
+        self.__update_job(torrent_hash, state="swapping", message="删除原任务")
         try:
             client.torrents_delete(delete_files=self._migrate_delete_files,
                                    torrent_hashes=torrent_hash)
         except Exception as e:
-            job["state"] = "failed"
-            job["message"] = f"删除原任务失败：{e}（内容已复制，原任务未动）"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message=f"删除原任务失败：{e}（内容已复制，原任务未动）")
             return
 
         # ⑥ 以新分类重新添加
-        job["message"] = "重新添加中"
-        self.__save_jobs(jobs)
+        self.__update_job(torrent_hash, message="重新添加中")
         try:
             client.torrents_add(
                 torrent_files=torrent_bytes,
@@ -1438,10 +1511,10 @@ class QbCategoryPause(_PluginBase):
                 is_paused=False,
             )
         except Exception as e:
-            job["state"] = "failed"
-            job["message"] = (f"重新添加失败：{e}；种子已备份到插件数据目录 "
-                              f"torrents/{torrent_hash}.torrent，可手动恢复")
-            self.__save_jobs(jobs)
+            self.__update_job(
+                torrent_hash, state="failed",
+                message=(f"重新添加失败：{e}；种子已备份到插件数据目录 "
+                         f"torrents/{torrent_hash}.torrent，可手动恢复"))
             return
 
         # ⑦ 复查生效状态
@@ -1453,25 +1526,28 @@ class QbCategoryPause(_PluginBase):
         if infos:
             info = infos[0]
             progress = float(info.get("progress") or 0)
-            job["state"] = "done"
-            job["message"] = (f"{info.get('state')} / {progress * 100:.0f}% / "
-                              f"{info.get('category')} / {info.get('save_path')}")
+            self.__update_job(
+                torrent_hash, state="done",
+                message=(f"{info.get('state')} / {progress * 100:.0f}% / "
+                         f"{info.get('category')} / {info.get('save_path')}"))
         else:
-            job["state"] = "done"
-            job["message"] = "已重新添加，请刷新页面确认"
-        self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="done",
+                              message="已重新添加，请刷新页面确认")
         logger.info(f"QB分类活动暂停：迁移完成 {name} → {dst_mp}")
 
-    def __copy_tree(self, src: str, dst: str, job: Dict[str, Any],
-                    jobs: Dict[str, Dict[str, Any]]) -> bool:
-        """把源目录（或单文件）复制到目标位置，并把进度写进任务记录。"""
+    def __copy_tree(self, src: str, dst: str, torrent_hash: str) -> bool:
+        """把源目录（或单文件）复制到目标位置，并把进度写进任务记录。
+
+        🔴 进度只回写**自己那一条**任务的 total / done（`__update_job` 写前重读）。
+        不要持有队列快照整表回写 —— 那正是「复制期间点迁移，任务活不过 1 秒」的成因。
+        """
         saved_at = [0.0]
 
-        def flush(force: bool = False) -> None:
+        def flush(force: bool = False, **patch) -> None:
             now = time.time()
             if force or now - saved_at[0] >= 1.0:
                 saved_at[0] = now
-                self.__save_jobs(jobs)
+                self.__update_job(torrent_hash, **patch)
 
         try:
             if os.path.isdir(src):
@@ -1482,7 +1558,7 @@ class QbCategoryPause(_PluginBase):
                         pairs.append((full, os.path.relpath(full, src)))
                 os.makedirs(dst, exist_ok=True)
                 total = sum(os.path.getsize(s) for s, _ in pairs)
-                job["total"] = total
+                flush(force=True, total=total, done=0)
                 copied = 0
                 for source, rel in pairs:
                     target = os.path.join(dst, rel)
@@ -1492,22 +1568,19 @@ class QbCategoryPause(_PluginBase):
                     if not self.__copy_file(source, target):
                         raise IOError(f"复制失败：{source}")
                     copied += os.path.getsize(target)
-                    job["done"] = copied
-                    flush()
+                    flush(done=copied)
+                flush(force=True, done=copied)
             else:
                 parent = os.path.dirname(dst)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
                 if not self.__copy_file(src, dst):
                     raise IOError(f"复制失败：{src}")
-                job["done"] = os.path.getsize(dst)
-                job["total"] = job.get("total") or job["done"]
-            flush(force=True)
+                flush(force=True, done=os.path.getsize(dst))
             return True
         except Exception as e:
-            job["state"] = "failed"
-            job["message"] = f"复制失败：{e}"
-            self.__save_jobs(jobs)
+            self.__update_job(torrent_hash, state="failed",
+                              message=f"复制失败：{e}")
             return False
 
     @staticmethod
@@ -1582,7 +1655,7 @@ class QbCategoryPause(_PluginBase):
         ordered = sorted(jobs.values(),
                          key=lambda job: job.get("ts") or 0, reverse=True)
         active = sum(1 for job in ordered
-                     if job.get("state") in ("queued", "copying", "verifying", "swapping"))
+                     if job.get("state") in MIGRATE_ACTIVE_STATES)
         finished = sum(1 for job in ordered if job.get("state") == "done")
         failed = sum(1 for job in ordered if job.get("state") == "failed")
 
