@@ -164,6 +164,11 @@ def get_cloud_space(client, black_dir: str = "") -> str:
 
         try:
             info = client.get_space_info(full_path)
+            # 本地文件夹挂载：挂载根可能是陈旧缓存，改取所在文件系统的实时值
+            if _is_local_mount(drive):
+                local_info = _local_mount_space_info(client, full_path, info)
+                if local_info:
+                    info = local_info
             total = getattr(info, "totalSpace", 0) or 0
             used = getattr(info, "usedSpace", 0) or 0
             space_info += f"{name}：{convert_bytes(used)}/{convert_bytes(total)}\n"
@@ -460,6 +465,78 @@ def space_logo_data_uri(name: str) -> str:
     return "data:image/png;base64," + "".join(b64)
 
 
+LOCAL_FS_CLOUD = "LocalFsAPI"
+
+
+def _is_local_mount(drive: Any) -> bool:
+    """
+    判断某个挂载点是否为「本地文件夹」类型（LocalFsAPI）。
+
+    这类挂载不是云盘，而是把本机目录挂进 CD2；CD2 对它们的空间信息有一套特殊处理，
+    详见 _local_mount_space_info。
+
+    :param drive: get_sub_files 返回的挂载点对象
+
+    :return bool: 是本地文件夹挂载返回 True
+    """
+    if getattr(drive, "isLocal", False):
+        return True
+    cloud_api = getattr(drive, "CloudAPI", None)
+    return str(getattr(cloud_api, "name", "") or "") == LOCAL_FS_CLOUD
+
+
+def _local_mount_space_info(client, mount_path: str, root_info: Any) -> Optional[Any]:
+    """
+    取本地文件夹挂载（LocalFsAPI）**可信**的空间信息。
+
+    🔴 为什么要绕这一下（2026-09-29 实测）：
+    CD2 对本地文件夹挂载的**根路径**返回的空间信息会陈旧，与所在文件系统严重不符，
+    直接用它会让详情页「剩余」虚高。实测同一时刻、同一块盘（NAS volume2 上的 /download）：
+      · 挂载根 get_space_info("/download")        → used 84.14 GB / free 800.01 GB  ❌
+      · 子路径 get_space_info("/download/SSD")    → used 465.44 GB / free 418.70 GB ✅
+        （与 NAS 上 `df -B1 /volume2` 的 Used / Available **逐字节相同**）
+    也就是说：挂载根那份是缓存值，**挂载根以下的任意路径返回的是实时 statvfs**。
+
+    做法：任取一个子目录查一次；只有它与挂载根属于**同一个文件系统**（totalSpace 相等）
+    才采用，避免本地目录里嵌了别的云盘挂载时取错盘。
+
+    :param client (CloudDriveClient): 已认证的 CloudDrive 客户端
+    :param mount_path (str): 本地挂载根路径，如 "/download"
+    :param root_info: 挂载根的空间信息（取不到子路径时的回退值）
+
+    :return: 可信的空间信息；拿不到时返回 None，调用方沿用挂载根的值
+    """
+    root_total = getattr(root_info, "totalSpace", 0) or 0
+    try:
+        children = list(client.get_sub_files(mount_path))
+    except Exception as e:
+        logger.warning(
+            f"【CloudDrive】列举本地挂载 {mount_path} 失败，沿用挂载根空间信息：{e}"
+        )
+        return None
+
+    for child in children:
+        if not getattr(child, "isDirectory", False):
+            continue
+        child_name = (getattr(child, "name", "") or "").strip()
+        if not child_name:
+            continue
+        try:
+            info = client.get_space_info(
+                f"{mount_path.rstrip('/')}/{child_name}"
+            )
+        except Exception:
+            continue
+        if not info:
+            continue
+        child_total = getattr(info, "totalSpace", 0) or 0
+        if root_total and child_total != root_total:
+            # 不是同一个文件系统（本地目录里嵌了别的挂载），不能用
+            continue
+        return info
+    return None
+
+
 def get_cloud_space_items(client, black_dir: str = "") -> List[Dict[str, Any]]:
     """
     获取云盘空间明细（结构化），供详情页图形化排版使用。
@@ -470,6 +547,9 @@ def get_cloud_space_items(client, black_dir: str = "") -> List[Dict[str, Any]]:
          "total_text": str, "logo": str}
     容量单位已用 convert_bytes 格式化，`used`/`total` 保留原始字节数便于算占用率；
     `logo` 是该云盘的图标 data URI（按名称匹配，取不到时为空串）。
+
+    本地文件夹挂载（LocalFsAPI）会走 _local_mount_space_info 取实时值，
+    避免 CD2 挂载根的陈旧数据把「剩余」算虚。
 
     :param client (CloudDriveClient): CloudDriveClient 实例
     :param black_dir (str): 黑名单目录，逗号分隔
@@ -500,6 +580,11 @@ def get_cloud_space_items(client, black_dir: str = "") -> List[Dict[str, Any]]:
 
         try:
             info = client.get_space_info(full_path)
+            # 本地文件夹挂载：挂载根可能是陈旧缓存，改取所在文件系统的实时值
+            if _is_local_mount(drive):
+                local_info = _local_mount_space_info(client, full_path, info)
+                if local_info:
+                    info = local_info
             total = getattr(info, "totalSpace", 0) or 0
             used = getattr(info, "usedSpace", 0) or 0
             items.append(
