@@ -82,7 +82,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.5.5"
+    plugin_version = "1.5.6"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1499,6 +1499,28 @@ class QbCategoryPause(_PluginBase):
             }
         return None
 
+    def __resolve_source(self, brief: Dict[str, Any], name: str) -> str:
+        """定位种子内容在磁盘上的**根**（映射成 MoviePilot 容器视角）。
+
+        🔴 为什么不直接用 `content_path`：qB 对「种子内只有 1 个文件」的种子返回的
+        是*文件*路径（哪怕该文件在磁盘上还带一层以种子名命名的顶层目录）。直接拿它
+        当源根，复制阶段会被判成「单文件」而丢掉顶层目录，校验阶段再按
+        `<目标>/<种子内相对路径>` 去找就报「N 个文件缺失」。
+
+        取法（三形态通吃）：
+        1. 优先 `save_path/种子名` —— 多文件种子、以及「单文件但带顶层目录」的种子，
+           这一层都是磁盘上真实存在的目录；
+        2. 取不到时退回 `content_path` —— 对应「文件直接躺在 save_path 下」的真单文件种子。
+
+        :return: 源根路径；两者都取不到时返回空串
+        """
+        save_path = self.__map_qb_path(brief.get("save_path") or "")
+        if save_path and name:
+            root = os.path.join(save_path, name)
+            if os.path.isdir(root):
+                return root
+        return self.__map_qb_path(brief.get("content_path") or "")
+
     def api_migrate_torrent(self, hash: str = None,
                             apikey: str = None) -> schemas.Response:
         """API：把单个种子加入迁移队列。"""
@@ -1623,15 +1645,20 @@ class QbCategoryPause(_PluginBase):
                               message=f"无法连接下载器 {brief['downloader']}")
             return
 
-        src_mp = self.__map_qb_path(brief.get("content_path") or "")
-        if not os.path.exists(src_mp):
+        # 🔴 源根不能直接用 content_path：qB 对「种子内只有 1 个文件」的种子返回的是
+        #    *文件*路径，而不是它所在的那层目录。照搬会让复制走「单文件」分支、丢掉
+        #    顶层目录，随后校验按「<目标>/<种子内相对路径>」找不到文件，报「N 个文件缺失」。
+        #    所以优先取「save_path/种子名」这层真目录，取不到才退回 content_path。
+        src_mp = self.__resolve_source(brief, name)
+        if not src_mp or not os.path.exists(src_mp):
             self.__update_job(torrent_hash, state="failed",
-                              message=f"源路径不存在：{src_mp}")
+                              message=f"源路径不存在：{src_mp or '无法定位种子内容'}")
             return
 
         # 源路径正好就是主目标下的同名位置时，搬了等于原地不动
         primary_mp = self.__map_qb_path(self._migrate_target)
-        if os.path.abspath(src_mp) == os.path.abspath(os.path.join(primary_mp, name)):
+        if os.path.abspath(src_mp) == os.path.abspath(
+                os.path.join(primary_mp, os.path.basename(src_mp.rstrip("/")))):
             self.__update_job(torrent_hash, state="failed",
                               message="源路径与主目标路径相同，无需迁移")
             return
@@ -1646,7 +1673,9 @@ class QbCategoryPause(_PluginBase):
             return
         target_qb = chosen["qb"]
         target_mp = chosen["mp"]
-        dst_mp = os.path.join(target_mp, name)
+        # 目标名必须跟源的实际形态对齐：目录型用种子名，真单文件型用文件名。
+        # 一律用种子名的话，真单文件会变成「无扩展名的裸文件」，校验必然失败。
+        dst_mp = os.path.join(target_mp, os.path.basename(src_mp.rstrip("/")))
         if os.path.abspath(src_mp) == os.path.abspath(dst_mp):
             self.__update_job(torrent_hash, state="failed",
                               message="源路径与选中的目标路径相同，无需迁移")
