@@ -445,7 +445,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.1"
+    plugin_version = "2.0.2"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -923,6 +923,13 @@ class ChdbitsHrMonitor(_PluginBase):
                     "captions": [c for c in (detail,) if c],
                     "pills": [_pill(f"周期 {hr_cycle or '-'}")],
                 })
+                continue
+
+            if status_raw in ("待删除", "已完成") and not record:
+                # 本轮刚删掉的任务：completed_map / cycle_map 记录都已清空，
+                # 卡片没有任何可展示的进度口径。正常路径不会走到这里（删除
+                # 成功时已从 compare_items 摘掉），留作兜底，避免退化成
+                # 「数据缺失」这种看起来像插件报错的文案。
                 continue
 
             if status_raw == "未达阈值":
@@ -1820,6 +1827,19 @@ class ChdbitsHrMonitor(_PluginBase):
                     )[:DELETE_LOG_LIMIT]
                     deleted_log = dict(keep)
                 self.save_data(DELETE_LOG_DATA_KEY, deleted_log)
+                # ── 保险闸门 ⑥：已删除的任务从本轮展示清单里摘掉 ────────
+                # 上面刚把它们的 completed_map / cycle_map 记录清空，
+                # 若 compare_items 里还留着这一条，详情页会因为两个 map 都
+                # 查不到 H&R 周期，把卡片退化成「数据缺失 · 0.0%」——用户刚
+                # 看到「已删除」，转头又看到一张「数据缺失」，会当成插件报错
+                # （2026-09-30 实测：删除 Shadow.Force 后卡片仍显示数据缺失）。
+                # 删除结果已在「最近删除」区块留档，卡片本身无需再保留。
+                deleted_hashes = {str(h) for h in delete_hashes if h}
+                compare_items = [
+                    item for item in compare_items
+                    if str(item.get("hash") or "") not in deleted_hashes
+                ]
+                self._last_compare_items = compare_items
                 if self._notify:
                     self.post_message(
                         mtype=NotificationType.SiteMessage,
