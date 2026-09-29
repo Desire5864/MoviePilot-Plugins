@@ -239,11 +239,12 @@
     "name": "CloudDrive2储存",
     "description": "使存储支持 CloudDrive2，grpc 原生 API 操作。魔改 UI 版本，重排版详情页指标卡。",
     "labels": "云盘",
-    "version": "1.0.6",
+    "version": "1.0.7",
     "author": "Desire5864",
     "system_version": ">=2.15.2",
     "level": 1,
     "history": {
+      "v1.0.7": "修正本地文件夹挂载（download / downloads / Storage）的容量显示：CD2 对本地挂载根返回的是陈旧缓存值，改为取所在文件系统的实时占用，详情页「剩余」与磁盘实际可用一致。（三改：Desire5864）",
       "v1.0.6": "存储空间云盘卡右侧新增圆形品牌图标：115 / 123 / 天翼取自站点 favicon，Storage 与 downloads 用 Acer、download 用西数，图标 base64 内嵌不依赖外链；无匹配时回退首字母。（三改：Desire5864）",
       "v1.0.5": "存储空间云盘卡改为「数字主导」版式：占用率放大为主角，名称缩到右侧，进度条退化为 3px 细装饰条，色彩更克制。（三改：Desire5864）",
       "v1.0.4": "存储空间云盘卡改为「环形指示器 + 右侧文字」布局：32px 细圆环替代横条显示占用率，剩余空间移入环右侧，降低页面色彩噪音。（三改：Desire5864）",
