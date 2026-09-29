@@ -43,6 +43,18 @@ MIGRATE_ACTIVE_STATES = ("queued", "copying", "verifying", "swapping")
 # 渲染层本来就只展示最近 20 条，存储层也要收敛，否则队列会随版本无限膨胀。
 MIGRATE_KEEP_FINISHED = 50
 
+# 🔴 迁移前的空间校验余量（字节）。
+# 判断「装得下」用的是 `剩余空间 - 本次需要 >= MIGRATE_SPACE_RESERVE`，
+# 而不是简单的 `剩余空间 > 本次需要`：文件系统元数据、目录项、以及复制过程中
+# 目标侧的临时膨胀都要占地方，恰好卡满会把盘写爆 —— 写爆的后果是复制中途失败
+# 且目标目录留下半份残文件。
+MIGRATE_SPACE_RESERVE = 1024 ** 3  # 1 GiB
+
+# 备用迁移目录的默认值（qB 视角路径）。
+# 升级前的旧配置里**没有**这个键，此时按默认值启用备用目录；用户在面板里把它
+# 清空成 "" 才是「明确不要备用」。这样「加备用路径」这个需求不需要用户再手动配一次。
+DEFAULT_MIGRATE_TARGET_ALT = "/下载"
+
 # qB 容器路径前缀 -> MoviePilot 容器路径前缀
 # （两个容器的挂载点不同名，插件跑在 MP 容器里要靠这张表换算真实路径）
 QB_TO_MP_PATH_MAP = (
@@ -70,7 +82,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.5.4"
+    plugin_version = "1.5.5"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -98,6 +110,8 @@ class QbCategoryPause(_PluginBase):
     # ---- 迁移相关（把种子内容搬到另一处存储后重新做种）----
     # 目标根目录（qB 容器视角路径，如 /download）
     _migrate_target: str = ""
+    # 备用目标根目录（qB 容器视角路径，如 /下载）：主目录剩余空间不足时自动改用
+    _migrate_target_alt: str = ""
     # 迁移后归入的新分类
     _migrate_category: str = ""
     # 重新添加时跳过哈希校验
@@ -133,6 +147,7 @@ class QbCategoryPause(_PluginBase):
         self._resume_minutes = 60
         self._last_paused_hashes = []
         self._migrate_target = ""
+        self._migrate_target_alt = ""
         self._migrate_category = ""
         self._migrate_skip_check = False
         self._migrate_delete_files = False
@@ -163,6 +178,11 @@ class QbCategoryPause(_PluginBase):
 
         # 迁移配置
         self._migrate_target = str(config.get("migrate_target") or "").strip()
+        # 键缺失（老配置）→ 用默认备用目录；显式空串 → 尊重「关闭备用」的意图
+        alt_raw = config.get("migrate_target_alt")
+        self._migrate_target_alt = (
+            DEFAULT_MIGRATE_TARGET_ALT if alt_raw is None else str(alt_raw).strip()
+        )
         self._migrate_category = str(config.get("migrate_category") or "").strip()
         self._migrate_skip_check = bool(config.get("migrate_skip_check"))
         self._migrate_delete_files = bool(config.get("migrate_delete_files"))
@@ -372,12 +392,31 @@ class QbCategoryPause(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "migrate_target",
-                                            "label": "迁移目标目录（qB 视角路径）",
+                                            "label": "迁移主目标目录（qB 视角路径）",
                                             "placeholder": "例如 /download，留空则不显示迁移按钮",
                                         },
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "migrate_target_alt",
+                                            "label": "迁移备用目标目录（主目录空间不足时自动使用）",
+                                            "placeholder": "例如 /下载，留空则空间不足时不迁移",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 6},
@@ -472,6 +511,7 @@ class QbCategoryPause(_PluginBase):
             "resume_enabled": False,
             "resume_minutes": 60,
             "migrate_target": "",
+            "migrate_target_alt": DEFAULT_MIGRATE_TARGET_ALT,
             "migrate_category": "",
             "migrate_skip_check": False,
             "migrate_delete_files": False,
@@ -734,7 +774,10 @@ class QbCategoryPause(_PluginBase):
                                             "style": "opacity:.7;",
                                         },
                                         "text": f"目标目录 {self._migrate_target}"
-                                                f" → 分类 {self._migrate_category or '（未设置）'}",
+                                                f" → 分类 {self._migrate_category or '（未设置）'}"
+                                                + (f"；空间不足时自动改用 "
+                                                   f"{self._migrate_target_alt}"
+                                                   if self._migrate_target_alt else ""),
                                     },
                                 ],
                             }
@@ -1192,6 +1235,153 @@ class QbCategoryPause(_PluginBase):
                 return mp_prefix + path[len(qb_prefix):]
         return path
 
+    @staticmethod
+    def __fmt_size(num: Any) -> str:
+        """把字节数格式化成人类可读文本（用于任务说明与日志）。"""
+        try:
+            size = float(num or 0)
+        except (TypeError, ValueError):
+            return "0 B"
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024:
+                return f"{int(size)} B" if unit == "B" else f"{size:.2f} {unit}"
+            size /= 1024
+        return f"{size:.2f} PB"
+
+    @staticmethod
+    def __disk_free(path: str) -> Optional[Tuple[int, int, str]]:
+        """取 path 所在文件系统的剩余空间。
+
+        :param path: 允许尚不存在（例如首次迁移到某个新分类目录），
+                     这时上溯到最近存在的祖先目录再探测 —— 同一分区结论一致。
+        :return: (剩余字节, 总量字节, 实际用于探测的路径)；完全探测不到时返回 None
+        """
+        probe = path
+        while probe and not os.path.exists(probe):
+            parent = os.path.dirname(probe)
+            if not parent or parent == probe:
+                break
+            probe = parent
+        try:
+            usage = shutil.disk_usage(probe)
+            return usage.free, usage.total, probe
+        except Exception as e:
+            logger.warning(f"QB分类活动暂停：读取 {path} 所在分区剩余空间失败：{e}")
+            return None
+
+    @staticmethod
+    def __path_dev(path: str) -> Optional[int]:
+        """取路径所在文件系统的设备号（用于判断两个目录是否同一分区）。"""
+        try:
+            return os.stat(path).st_dev
+        except OSError:
+            return None
+
+    @staticmethod
+    def __same_fs(dev: Optional[int], total: int, free: int,
+                  primary: Optional[Tuple[Optional[int], int, int]]) -> bool:
+        """判断候选目录与主目录是否落在同一文件系统。
+
+        同一文件系统 = 备用目录带不来额外空间，配了也没用（还可能误导用户
+        以为「换了个地方就有地方了」）。两个判据取或：
+
+        1. 总量与剩余都一致 —— 同一文件系统在同一时刻读出来必然一致。
+           🔴 这个判据不能省：本环境实测 `/` 与 `/下载` 的 `st_dev` **不同**
+           （1048618 vs 124）却是同一块盘，只看设备号会漏判。
+        2. 设备号相同。
+        """
+        if primary is None:
+            return False
+        primary_dev, primary_total, primary_free = primary
+        if total == primary_total and abs(free - primary_free) < 1024 * 1024:
+            return True
+        return dev is not None and primary_dev is not None and dev == primary_dev
+
+    @staticmethod
+    def __scan_tree(path: str) -> Tuple[int, List[Tuple[str, str]]]:
+        """统计待复制内容的**真实**字节数，顺带产出文件清单供复制阶段复用。
+
+        用真实文件大小而不是种子报告的 size：稀疏文件、部分下载、硬链接都会
+        让两者不一致，而空间校验必须按实际要写过去的字节算。
+        清单一起返回是为了避免复制时再遍历一遍目录（大目录遍历很贵）。
+
+        :return: (总字节数, [(源文件绝对路径, 相对路径)；单文件时为空列表])
+        """
+        if os.path.isdir(path):
+            pairs: List[Tuple[str, str]] = []
+            total = 0
+            for root, _dirs, names in os.walk(path):
+                for filename in names:
+                    full = os.path.join(root, filename)
+                    try:
+                        total += os.path.getsize(full)
+                    except OSError:
+                        # 单个文件取不到大小不中断统计，复制阶段会报出具体失败
+                        continue
+                    pairs.append((full, os.path.relpath(full, path)))
+            return total, pairs
+        try:
+            return os.path.getsize(path), []
+        except OSError:
+            return 0, []
+
+    def __pick_target(self, src_mp: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """迁移前挑一个装得下的目标目录：主目录优先，不够就改用备用目录。
+
+        判断标准是 `剩余空间 - 本次需要 >= MIGRATE_SPACE_RESERVE`（留安全余量，
+        不是恰好卡满）。两边都不够、没配备用、或备用与主目录同分区时返回 None，
+        说明文本直接写进任务记录，让用户看得见差多少。
+
+        :return: (选中方案 或 None, 说明文本)
+        """
+        need, pairs = self.__scan_tree(src_mp)
+        notes: List[str] = []
+        candidates: List[Dict[str, Any]] = []
+        primary: Optional[Tuple[Optional[int], int, int]] = None
+
+        # 配置项本身就是 qB 视角路径，要换算成 MP 视角才能探测剩余空间
+        # （两个容器挂载点不同名）。
+        for index, (label, qb_path) in enumerate((("主目录", self._migrate_target),
+                                                  ("备用目录", self._migrate_target_alt))):
+            if not qb_path:
+                continue
+            mp_path = self.__map_qb_path(qb_path)
+            probe = self.__disk_free(mp_path)
+            if not probe:
+                notes.append(f"{label} {qb_path} 读不到剩余空间")
+                continue
+            free, total, real = probe
+            dev = self.__path_dev(real)
+            if index > 0 and self.__same_fs(dev, total, free, primary):
+                # 同一块盘：换个名字并不会多出空间，留着只会误导用户
+                notes.append(f"{label} {qb_path} 与主目录在同一分区，按无备用处理")
+                continue
+            if index == 0:
+                primary = (dev, total, free)
+            candidates.append({"label": label, "qb": qb_path, "mp": mp_path,
+                               "free": free, "total": total, "real": real,
+                               "need": need})
+
+        if not candidates:
+            return None, "；".join(notes) or "没有可用的迁移目标目录"
+
+        for candidate in candidates:
+            spare = candidate["free"] - need
+            if spare >= MIGRATE_SPACE_RESERVE:
+                detail = (f"{candidate['label']} {candidate['qb']} 剩余 "
+                          f"{self.__fmt_size(candidate['free'])}，本次需要 "
+                          f"{self.__fmt_size(need)}")
+                if not os.path.exists(candidate["mp"]):
+                    detail += f"（目标目录尚不存在，按 {candidate['real']} 估算）"
+                candidate["plan"] = (need, pairs)
+                return candidate, detail
+            notes.append(f"{candidate['label']} {candidate['qb']} 剩余 "
+                         f"{self.__fmt_size(candidate['free'])}，需要 "
+                         f"{self.__fmt_size(need)}，差 {self.__fmt_size(-spare)}")
+
+        return None, (f"空间不足：{'；'.join(notes)}"
+                      f"（另需预留 {self.__fmt_size(MIGRATE_SPACE_RESERVE)}）")
+
     def __qb_client(self, downloader_name: str) -> Optional[qbittorrentapi.Client]:
         """构造指定下载器的原生 qbittorrentapi 客户端。
 
@@ -1433,26 +1623,46 @@ class QbCategoryPause(_PluginBase):
                               message=f"无法连接下载器 {brief['downloader']}")
             return
 
-        target_qb = self._migrate_target
-        target_mp = self.__map_qb_path(target_qb)
         src_mp = self.__map_qb_path(brief.get("content_path") or "")
-        dst_mp = os.path.join(target_mp, name)
-
         if not os.path.exists(src_mp):
             self.__update_job(torrent_hash, state="failed",
                               message=f"源路径不存在：{src_mp}")
             return
+
+        # 源路径正好就是主目标下的同名位置时，搬了等于原地不动
+        primary_mp = self.__map_qb_path(self._migrate_target)
+        if os.path.abspath(src_mp) == os.path.abspath(os.path.join(primary_mp, name)):
+            self.__update_job(torrent_hash, state="failed",
+                              message="源路径与主目标路径相同，无需迁移")
+            return
+
+        # ① 空间校验：剩余空间必须大于本次迁移所需（并留安全余量），
+        #    主目录装不下就自动改用备用目录；两边都装不下就干脆不动 ——
+        #    宁可这次不迁，也不能写爆目标盘或留下半份残文件。
+        chosen, space_detail = self.__pick_target(src_mp)
+        if not chosen:
+            self.__update_job(torrent_hash, state="failed",
+                              message=f"{space_detail}，本次未迁移")
+            return
+        target_qb = chosen["qb"]
+        target_mp = chosen["mp"]
+        dst_mp = os.path.join(target_mp, name)
         if os.path.abspath(src_mp) == os.path.abspath(dst_mp):
             self.__update_job(torrent_hash, state="failed",
-                              message="源路径与目标路径相同，无需迁移")
+                              message="源路径与选中的目标路径相同，无需迁移")
             return
 
-        # ① 复制
-        self.__update_job(torrent_hash, state="copying", message=f"复制到 {dst_mp}")
-        if not self.__copy_tree(src_mp, dst_mp, torrent_hash):
+        # ② 复制（复用空间校验时已扫好的文件清单，不重复遍历目录）
+        used_alt = chosen["label"] == "备用目录"
+        self.__update_job(
+            torrent_hash, state="copying", target=target_mp, used_alt=used_alt,
+            space_need=chosen["need"], space_free=chosen["free"],
+            message=f"复制到 {dst_mp}（{chosen['label']}：{space_detail}）")
+        if not self.__copy_tree(src_mp, dst_mp, torrent_hash,
+                                chosen.get("plan")):
             return
 
-        # ② 逐块校验（只比大小验不出静默损坏）
+        # ③ 逐块校验（只比大小验不出静默损坏）
         if self._migrate_verify:
             self.__update_job(torrent_hash, state="verifying", message="逐块校验中")
             ok, detail = self.__verify_pieces(client, torrent_hash, target_mp)
@@ -1462,7 +1672,7 @@ class QbCategoryPause(_PluginBase):
                 return
             self.__update_job(torrent_hash, message=f"校验通过：{detail}")
 
-        # ③ 导出 .torrent 备份 —— 删掉原任务后这是唯一的回滚凭据
+        # ④ 导出 .torrent 备份 —— 删掉原任务后这是唯一的回滚凭据
         try:
             torrent_bytes = client.torrents_export(torrent_hash=torrent_hash)
         except Exception as e:
@@ -1481,7 +1691,7 @@ class QbCategoryPause(_PluginBase):
         except Exception as e:
             logger.warning(f"QB分类活动暂停：备份种子文件失败（不阻断流程）：{e}")
 
-        # ④ 确保目标分类存在
+        # ⑤ 确保目标分类存在
         if self._migrate_category:
             try:
                 client.torrents_create_category(
@@ -1490,7 +1700,7 @@ class QbCategoryPause(_PluginBase):
                 logger.warning(f"QB分类活动暂停：创建分类 {self._migrate_category} "
                                f"失败（可能已存在）：{e}")
 
-        # ⑤ 删除原任务
+        # ⑥ 删除原任务
         self.__update_job(torrent_hash, state="swapping", message="删除原任务")
         try:
             client.torrents_delete(delete_files=self._migrate_delete_files,
@@ -1500,7 +1710,7 @@ class QbCategoryPause(_PluginBase):
                               message=f"删除原任务失败：{e}（内容已复制，原任务未动）")
             return
 
-        # ⑥ 以新分类重新添加
+        # ⑦ 以新分类重新添加
         self.__update_job(torrent_hash, message="重新添加中")
         try:
             client.torrents_add(
@@ -1517,7 +1727,11 @@ class QbCategoryPause(_PluginBase):
                          f"torrents/{torrent_hash}.torrent，可手动恢复"))
             return
 
-        # ⑦ 复查生效状态
+        # ⑧ 复查生效状态
+        # 🔴 结尾的说明必须带上「实际落在哪个目录、是主目录还是备用目录」：
+        # 这四个阶段（copying/verifying/swapping/重新添加）会反复覆盖 message，
+        # 不在这里补一句，用户翻队列就只看到「已重新添加」，根本不知道换过盘。
+        where = f"{chosen['label']} {target_mp}"
         time.sleep(2)
         try:
             infos = client.torrents_info(torrent_hashes=torrent_hash)
@@ -1529,15 +1743,20 @@ class QbCategoryPause(_PluginBase):
             self.__update_job(
                 torrent_hash, state="done",
                 message=(f"{info.get('state')} / {progress * 100:.0f}% / "
-                         f"{info.get('category')} / {info.get('save_path')}"))
+                         f"{info.get('category')} / {info.get('save_path')}"
+                         f"（{where}）"))
         else:
             self.__update_job(torrent_hash, state="done",
-                              message="已重新添加，请刷新页面确认")
-        logger.info(f"QB分类活动暂停：迁移完成 {name} → {dst_mp}")
+                              message=f"已重新添加（{where}），请刷新页面确认")
+        logger.info(f"QB分类活动暂停：迁移完成 {name} → {dst_mp}"
+                    f"（{chosen['label']}）")
 
-    def __copy_tree(self, src: str, dst: str, torrent_hash: str) -> bool:
+    def __copy_tree(self, src: str, dst: str, torrent_hash: str,
+                    plan: Optional[Tuple[int, List[Tuple[str, str]]]] = None) -> bool:
         """把源目录（或单文件）复制到目标位置，并把进度写进任务记录。
 
+        :param plan: 空间校验阶段已扫好的 (总字节数, 文件清单)，传进来就不再重复
+                     遍历目录；为 None 时自己扫一遍（留作兜底）。
         🔴 进度只回写**自己那一条**任务的 total / done（`__update_job` 写前重读）。
         不要持有队列快照整表回写 —— 那正是「复制期间点迁移，任务活不过 1 秒」的成因。
         """
@@ -1550,14 +1769,9 @@ class QbCategoryPause(_PluginBase):
                 self.__update_job(torrent_hash, **patch)
 
         try:
+            total, pairs = plan if plan else self.__scan_tree(src)
             if os.path.isdir(src):
-                pairs: List[Tuple[str, str]] = []
-                for root, _dirs, names in os.walk(src):
-                    for filename in names:
-                        full = os.path.join(root, filename)
-                        pairs.append((full, os.path.relpath(full, src)))
                 os.makedirs(dst, exist_ok=True)
-                total = sum(os.path.getsize(s) for s, _ in pairs)
                 flush(force=True, total=total, done=0)
                 copied = 0
                 for source, rel in pairs:
@@ -1576,7 +1790,7 @@ class QbCategoryPause(_PluginBase):
                     os.makedirs(parent, exist_ok=True)
                 if not self.__copy_file(src, dst):
                     raise IOError(f"复制失败：{src}")
-                flush(force=True, done=os.path.getsize(dst))
+                flush(force=True, total=total, done=os.path.getsize(dst))
             return True
         except Exception as e:
             self.__update_job(torrent_hash, state="failed",
