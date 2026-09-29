@@ -23,6 +23,10 @@ PROCESSED_LIMIT = 500
 INTRO_MIGRATED_KEY = "intro_migrated_to_tmdb"
 # 默认下载标签（站点未单独配置 tag 时使用）
 DOWNLOAD_TAG = "UHD自动下载"
+# 推送后给新任务设置的默认上传限速（KB/s），0 = 不限速。
+# 原盘体积大、做种时间长，不限制的话很容易把上行带宽占满，
+# 因此默认给一个保守值，用户可在配置页改（0 关闭）。
+DEFAULT_UPLOAD_LIMIT_KB = 100
 
 # 站点阀门配置键（v2.11.0 起）：单个数组键取代「每站点一个布尔键」。
 # 元素沿用 _site_switch_key() 生成的站点键名（如 enable_ptchdbits_co），
@@ -280,7 +284,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.23.0"
+    plugin_version = "2.24.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -438,6 +442,8 @@ class UhdBlurayAutoDownload(_PluginBase):
     _enabled: bool = False
     _notify: bool = False
     _downloader: str = ""
+    # 推送后给新任务设置的上传限速（KB/s），0 = 不限速
+    _upload_limit_kb: float = DEFAULT_UPLOAD_LIMIT_KB
     # 各站点开关状态：域名 -> 是否启用（采集）
     _site_enabled: Dict[str, bool] = {}
     # 下载分类 / 路径 / 推送开关的表单覆盖值（v2.12.0 起）：域名 -> {category/save_path/push_enabled}
@@ -479,6 +485,7 @@ class UhdBlurayAutoDownload(_PluginBase):
         self._enabled = False
         self._notify = False
         self._downloader = ""
+        self._upload_limit_kb = DEFAULT_UPLOAD_LIMIT_KB
         self._site_enabled = {}
         self._interval_minutes = 15
         self._latest_count = 5
@@ -499,6 +506,19 @@ class UhdBlurayAutoDownload(_PluginBase):
         self._enabled = bool(config.get("enabled"))
         self._notify = bool(config.get("notify"))
         self._downloader = str(config.get("downloader") or "").strip()
+
+        # 上传限速（KB/s）：老配置里没有这个键时回退默认值；
+        # 空串/非法值/负数同样回退默认值，只有显式的 0 才表示「不限速」。
+        raw_limit = config.get("upload_limit_kb", DEFAULT_UPLOAD_LIMIT_KB)
+        if raw_limit is None or str(raw_limit).strip() == "":
+            raw_limit = DEFAULT_UPLOAD_LIMIT_KB
+        try:
+            limit_value = float(raw_limit)
+        except (TypeError, ValueError):
+            limit_value = float(DEFAULT_UPLOAD_LIMIT_KB)
+        self._upload_limit_kb = limit_value if limit_value >= 0 else float(
+            DEFAULT_UPLOAD_LIMIT_KB
+        )
 
         # 站点阀门（v2.11.0 起）：
         #   新版 = 单个数组键 enable_sites，元素为 _site_switch_key(domain)
@@ -606,6 +626,7 @@ class UhdBlurayAutoDownload(_PluginBase):
             "downloader": "",
             "interval_minutes": 15,
             "latest_count": 5,
+            "upload_limit_kb": DEFAULT_UPLOAD_LIMIT_KB,
             "push_mode": PUSH_MODE_ALL,
             "run_once": False,
             SITE_VALVE_KEY: self.__default_enabled_keys(),
@@ -798,6 +819,31 @@ class UhdBlurayAutoDownload(_PluginBase):
                                                 {"title": "免费优先（先推免费，收费排后）", "value": PUSH_MODE_FREE_FIRST},
                                                 {"title": "只推免费（收费直接跳过）", "value": PUSH_MODE_FREE_ONLY},
                                             ],
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    # 上传限速：推送到 QB 成功后给该任务单独设限速（qB 的「单任务限速」）
+                    {
+                        "component": "VRow",
+                        "props": {"class": "mb-2"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "upload_limit_kb",
+                                            "label": "上传限速（KB/s）",
+                                            "placeholder": f"默认{DEFAULT_UPLOAD_LIMIT_KB}，填 0 表示不限速",
+                                            "type": "number",
+                                            "density": "compact",
+                                            "persistentHint": True,
+                                            "hint": "推送成功后给该任务单独设上传限速，避免做种占满上行带宽",
                                         },
                                     }
                                 ],
@@ -1355,6 +1401,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                     "variant": "tonal",
                                     "text": f"下载器：{self._downloader or '未配置'}；"
                                             f"检查间隔：{self._interval_minutes} 分钟；"
+                                            f"上传限速：{self.__upload_limit_text()}；"
                                             f"采集站点：{self.__enabled_site_text()}；"
                                             f"推送站点：{self.__push_site_text()}；"
                                             f"最近检查：{self._last_check_time or '尚未检查'}",
@@ -2782,31 +2829,10 @@ class UhdBlurayAutoDownload(_PluginBase):
         :param title: 站点种子标题
         :return: QB 任务名；未找到返回空字符串
         """
-        if not downloader_obj or not title:
+        torrent = UhdBlurayAutoDownload.__find_qb_torrent_obj(downloader_obj, title)
+        if torrent is None:
             return ""
-
-        try:
-            result = downloader_obj.get_torrents()
-        except Exception as err:
-            logger.warning(f"UHD原盘自动下载：查询 QB 任务名失败：{err}")
-            return ""
-
-        if isinstance(result, tuple):
-            torrents, error = result
-            if error:
-                return ""
-        else:
-            torrents = result
-
-        torrent = UhdBlurayAutoDownload.__pick_qb_torrent(
-            list(torrents or []), "", title
-        )
-        if not torrent:
-            return ""
-        try:
-            return str(torrent.get("name") or "")
-        except AttributeError:
-            return str(getattr(torrent, "name", "") or "")
+        return UhdBlurayAutoDownload.__qb_torrent_field(torrent, "name")
 
     @staticmethod
     def __extract_cn_title(subtitle: str) -> str:
@@ -2878,14 +2904,137 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         # 推送到 QB（标签按站点配置，未配置时回退到默认标签）
         tag = str(site_conf.get("tag") or DOWNLOAD_TAG)
-        success, _ = downloader_obj.add_torrent(
-            content=res.content,
-            download_dir=site_conf.get("save_path"),
-            category=site_conf.get("category"),
-            tag=tag,
-            is_paused=False,
+        try:
+            result = downloader_obj.add_torrent(
+                content=res.content,
+                download_dir=site_conf.get("save_path"),
+                category=site_conf.get("category"),
+                tag=tag,
+                is_paused=False,
+            )
+        except Exception as err:
+            logger.error(f"UHD原盘自动下载：推送种子到下载器失败，{err}")
+            return False
+
+        # add_torrent 返回 (是否成功, 新种子ID列表)；兼容只返回布尔值的旧实现
+        if isinstance(result, tuple) and len(result) == 2:
+            success, tids = result
+        else:
+            success, tids = bool(result), []
+
+        if success:
+            # 给刚推送的任务设上传限速（配置为 0 时不动作）
+            self.__apply_upload_limit(
+                downloader_obj, tids, str(torrent.get("title") or "")
+            )
+        return bool(success)
+
+    def __apply_upload_limit(self, downloader_obj: Any, tids: Any,
+                             title: str) -> None:
+        """给刚推送到 QB 的任务单独设置上传限速。
+
+        限速单位 KB/s（配置为 0 或负数时不动作）。走 qB 的「单任务限速」，
+        不影响其它任务，也不改下载器的全局限速设置。
+
+        QB 的 torrents/add 是异步落库的，刚添加完可能还查不到 hash，
+        因此拿不到种子 ID 时先按任务名回查，再短暂重试几次。
+
+        :param downloader_obj: 下载器实例
+        :param tids: add_torrent 返回的种子 ID 列表
+        :param title: 站点种子标题（用于回查任务）
+        """
+        limit = self._upload_limit_kb or 0
+        if limit <= 0:
+            return
+
+        if not downloader_obj or not hasattr(downloader_obj, "change_torrent"):
+            logger.warning(
+                f"UHD原盘自动下载：当前下载器不支持上传限速，已跳过（{title[:60]}）"
+            )
+            return
+
+        tid_list = [str(t) for t in (tids or []) if t]
+        for attempt in range(3):
+            if not tid_list and title:
+                torrent = self.__find_qb_torrent_obj(downloader_obj, title)
+                if torrent is not None:
+                    tid_list = [self.__qb_torrent_field(torrent, "hash")]
+                    tid_list = [t for t in tid_list if t]
+            if tid_list:
+                break
+            # 种子还没在 QB 里落库，稍等一下再回查
+            time.sleep(1)
+
+        if not tid_list:
+            logger.warning(
+                f"UHD原盘自动下载：未能在下载器中定位刚推送的任务，"
+                f"上传限速未设置（{title[:60]}）"
+            )
+            return
+
+        try:
+            ok = downloader_obj.change_torrent(
+                hash_string="|".join(tid_list),
+                upload_limit=float(limit),
+            )
+        except Exception as err:
+            logger.error(f"UHD原盘自动下载：设置上传限速失败，{err}")
+            return
+
+        limit_text = _format_speed(limit * 1024)
+        if ok:
+            logger.info(
+                f"UHD原盘自动下载：已设置上传限速 {limit_text}（{title[:60]}）"
+            )
+        else:
+            logger.warning(
+                f"UHD原盘自动下载：上传限速 {limit_text} 未能生效（{title[:60]}）"
+            )
+
+    @staticmethod
+    def __qb_torrent_field(torrent: Any, key: str, default: str = "") -> str:
+        """读取 QB 任务对象上的字段（兼容 dict 与对象两种形态）。
+
+        :param torrent: QB 任务对象
+        :param key: 字段名
+        :param default: 读不到时的回退值
+        :return: 字段值字符串
+        """
+        try:
+            value = torrent.get(key, default)
+        except AttributeError:
+            value = getattr(torrent, key, default)
+        return str(value if value is not None else default)
+
+    @staticmethod
+    def __find_qb_torrent_obj(downloader_obj: Any, title: str) -> Optional[Any]:
+        """从 QB 任务列表中按标题匹配出目标任务对象。
+
+        匹配策略复用 __pick_qb_torrent（任务名精确 → 归一化包含 → 关键词重合）。
+
+        :param downloader_obj: 下载器实例
+        :param title: 站点种子标题
+        :return: 匹配到的 QB 任务对象；未找到返回 None
+        """
+        if not downloader_obj or not title:
+            return None
+
+        try:
+            result = downloader_obj.get_torrents()
+        except Exception as err:
+            logger.warning(f"UHD原盘自动下载：查询 QB 任务失败：{err}")
+            return None
+
+        if isinstance(result, tuple):
+            torrents, error = result
+            if error:
+                return None
+        else:
+            torrents = result
+
+        return UhdBlurayAutoDownload.__pick_qb_torrent(
+            list(torrents or []), "", title
         )
-        return success
 
     @staticmethod
     def __parse_list_page(html: str, filter_mode: str,
@@ -3284,6 +3433,16 @@ class UhdBlurayAutoDownload(_PluginBase):
             for domain, site_conf in cls._site_configs.items()
             if site_conf.get("default_enabled", True)
         ]
+
+    def __upload_limit_text(self) -> str:
+        """返回上传限速的展示文本，用于详情页概览。
+
+        :return: 形如 "100 KB/s"；配置为 0 或负数时返回 "不限速"
+        """
+        limit = self._upload_limit_kb or 0
+        if limit <= 0:
+            return "不限速"
+        return _format_speed(limit * 1024) or "不限速"
 
     def __enabled_site_text(self) -> str:
         """返回「已勾选采集」的站点名称文本，用于详情页概览。
