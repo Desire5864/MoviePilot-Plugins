@@ -39,6 +39,17 @@ MIGRATE_DATA_KEY = "migrate_jobs"
 # 迁移任务「进行中」的状态集合（这些任务永远不会被裁剪）
 MIGRATE_ACTIVE_STATES = ("queued", "copying", "verifying", "swapping")
 
+# 迁移条目「状态」列的徽章配色（Vuetify 色名）。
+# done 绿 / failed 红 / 进行中紫（面板主色）/ 排队灰；表里没有的取值兜底成 grey。
+MIGRATE_STATE_COLORS = {
+    "done": "success",
+    "failed": "error",
+    "queued": "grey",
+    "copying": "primary",
+    "verifying": "primary",
+    "swapping": "primary",
+}
+
 # 迁移队列里最多保留多少条「已结束」（done / failed）历史记录。
 # 渲染层本来就只展示最近 20 条，存储层也要收敛，否则队列会随版本无限膨胀。
 MIGRATE_KEEP_FINISHED = 50
@@ -82,7 +93,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.5.6"
+    plugin_version = "1.5.8"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1769,11 +1780,15 @@ class QbCategoryPause(_PluginBase):
         if infos:
             info = infos[0]
             progress = float(info.get("progress") or 0)
+            # 🔴 括号里只留「主目录 / 备用目录」这个标签：`save_path` 已经写在
+            #    前一段，再把 `where`（标签 **+ 路径**）整段塞进来，页面上就会
+            #    出现 `/download（主目录 /download）` 这种同一路径写两遍的冗余
+            #    （2026-09-30 在真机截图上发现的）。
             self.__update_job(
                 torrent_hash, state="done",
                 message=(f"{info.get('state')} / {progress * 100:.0f}% / "
                          f"{info.get('category')} / {info.get('save_path')}"
-                         f"（{where}）"))
+                         f"（{chosen['label']}）"))
         else:
             self.__update_job(torrent_hash, state="done",
                               message=f"已重新添加（{where}），请刷新页面确认")
@@ -1889,8 +1904,46 @@ class QbCategoryPause(_PluginBase):
             return False, f"{bad} / {len(hashes)} 个数据块不一致"
         return True, f"{index} 个数据块全部一致"
 
+    @staticmethod
+    def __job_summary(job: Dict[str, Any]) -> str:
+        """迁移条目第二行的小字摘要。
+
+        「状态」「进度」已经各自成列，完成态 message 开头那两段
+        （`stoppedUP / 100%`）就是重复信息，这里剥掉只留分类与落地位置：
+
+            `stoppedUP / 100% / 本地保种 / /download（主目录）`
+                -> `本地保种 · /download（主目录）`
+
+        其余形态（排队中、逐块校验中、各种失败原因）原样保留。
+        """
+        msg = str(job.get("message") or "").strip()
+        parts = msg.split(" / ")
+        if len(parts) >= 3 and parts[1].endswith("%"):
+            # 分类为空时上游会写出字面量 `None`，这里一并滤掉，别让它在页面上露脸。
+            parts = [part for part in parts[2:] if part and part != "None"]
+            # 🔴 1.5.8 之前写进队列的**老记录**，末段是 `/download（主目录 /download）`
+            #    —— 路径写了两遍（新写入的已经只留标签）。历史记录不改库，在渲染层折叠：
+            #    括号内形如「标签 路径」、且路径与括号外那段重合时，只留标签。
+            if parts:
+                head, sep, tail = parts[-1].rpartition("（")
+                if sep and tail.endswith("）"):
+                    label, _, inner = tail[:-1].partition(" ")
+                    if inner and head.endswith(inner):
+                        parts[-1] = f"{head}（{label}）"
+            msg = " · ".join(parts)
+        return msg or "—"
+
     def __render_migrate_jobs(self) -> List[dict]:
-        """渲染迁移队列区块。"""
+        """渲染迁移队列区块。
+
+        排版取向（方案 3「徽章双行」，2026-09-30 起）：
+        「种子名称」独占第一行并单行省略（`title` 悬浮看全名），第二行是灰色小字摘要；
+        「状态」独立成列用徽章表示，「进度」只留百分比。
+
+        旧排版四列平铺、说明列只占 16% 宽，长种子名会折成三行并把**整行**撑到
+        64px —— 行高由最高的那一列决定，于是名称列右边一片空白、最右侧却挤成一团。
+        改成两行后行高由内容决定（真机实测 44px，旧版 64px），一屏能多看好几条。
+        """
         jobs = self.__load_jobs()
         if not jobs:
             return []
@@ -1907,13 +1960,56 @@ class QbCategoryPause(_PluginBase):
             total = job.get("total") or 0
             done_bytes = job.get("done") or 0
             percent = f"{done_bytes * 100.0 / total:.1f}%" if total else "-"
+            state = str(job.get("state") or "")
+            name = str(job.get("name") or "")
+            summary = self.__job_summary(job)
             rows.append({
                 "component": "tr",
                 "content": [
-                    {"component": "td", "text": job.get("name") or ""},
-                    {"component": "td", "text": job.get("state") or ""},
-                    {"component": "td", "text": percent},
-                    {"component": "td", "text": job.get("message") or ""},
+                    {
+                        # 🔴 `max-width:0` 不能去掉：表格是自适应布局，单元格不加这个
+                        #    约束时会被 nowrap 的长名字撑开，`text-truncate` 的省略号
+                        #    不生效，表现为整张表横向溢出。
+                        "component": "td",
+                        "props": {"style": "max-width:0;"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-truncate", "title": name},
+                                "text": name,
+                            },
+                            {
+                                "component": "div",
+                                "props": {
+                                    "class": "text-truncate text-caption "
+                                             "text-medium-emphasis",
+                                    "style": "margin-top:2px;",
+                                    "title": summary,
+                                },
+                                "text": summary,
+                            },
+                        ],
+                    },
+                    {
+                        "component": "td",
+                        "props": {"style": "white-space:nowrap;"},
+                        "content": [
+                            {
+                                "component": "VChip",
+                                "props": {
+                                    "size": "x-small",
+                                    "variant": "tonal",
+                                    "color": MIGRATE_STATE_COLORS.get(state, "grey"),
+                                },
+                                "text": state or "—",
+                            }
+                        ],
+                    },
+                    {
+                        "component": "td",
+                        "props": {"style": "white-space:nowrap;"},
+                        "text": percent,
+                    },
                 ],
             })
 
@@ -1956,10 +2052,15 @@ class QbCategoryPause(_PluginBase):
                                             {
                                                 "component": "tr",
                                                 "content": [
-                                                    {"component": "th", "text": "种子名称"},
-                                                    {"component": "th", "text": "阶段"},
-                                                    {"component": "th", "text": "进度"},
-                                                    {"component": "th", "text": "说明"},
+                                                    {"component": "th",
+                                                     "props": {"style": "width:100%;"},
+                                                     "text": "种子名称"},
+                                                    {"component": "th",
+                                                     "props": {"style": "width:96px;"},
+                                                     "text": "状态"},
+                                                    {"component": "th",
+                                                     "props": {"style": "width:84px;"},
+                                                     "text": "进度"},
                                                 ],
                                             }
                                         ],
