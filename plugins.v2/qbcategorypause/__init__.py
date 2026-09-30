@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import shutil
 import threading
@@ -184,6 +185,48 @@ def _pill(text: str, kind: str = "grey") -> dict:
         )},
         "text": text,
     }
+
+
+def _parse_categories(raw: Any) -> List[str]:
+    """把「监控分类」的配置值统一解析成分类名列表（去空、去重、保序）。
+
+    1.7.0 起配置页把这一项从手输框换成了多选控件，于是配置值的格式换代了：
+
+    · 数组      —— 多选控件存下来的，如 ``["SSD", "辅种"]``
+    · 字符串    —— 1.6.0 及以前的手输框存下来的，逗号或换行分隔，如 ``"SSD,辅种"``
+    · JSON 串   —— 个别前端会把数组序列化成字符串，如 ``'["SSD", "辅种"]'``
+
+    三种都要认。**不能只认数组** —— 老用户的配置是字符串，只认数组等于升级后
+    监控分类被清空（表现为「插件忽然不监控任何分类了」）。
+
+    :param raw: 配置里的原始值（可能是 None / str / list）
+    :return: 干净的分类名列表
+    """
+    if raw is None:
+        return []
+
+    if isinstance(raw, (list, tuple, set)):
+        candidates = [str(item) for item in raw]
+    else:
+        text = str(raw).strip()
+        candidates = None
+        # 只在「像 JSON 数组」时才尝试解析，避免把分类名里的中括号当语法
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, list):
+                candidates = [str(item) for item in parsed]
+        if candidates is None:
+            candidates = text.replace("\n", ",").split(",")
+
+    result: List[str] = []
+    for candidate in candidates:
+        name = str(candidate).strip()
+        if name and name not in result:
+            result.append(name)
+    return result
 
 
 def _sep() -> dict:
@@ -529,7 +572,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.5.9"
+    plugin_version = "1.7.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -606,13 +649,26 @@ class QbCategoryPause(_PluginBase):
         self._enabled = bool(config.get("enabled"))
         self._notify = bool(config.get("notify"))
         self._downloaders = config.get("downloaders") or []
-        # 分类支持逗号或换行分隔
-        categories_raw = config.get("categories") or ""
-        self._categories = [
-            category.strip()
-            for category in str(categories_raw).replace("\n", ",").split(",")
-            if category.strip()
-        ]
+        # 监控分类：支持「数组」（1.7.0 多选控件）与「逗号/换行分隔的字符串」（旧手输框）
+        categories_raw = config.get("categories")
+        self._categories = _parse_categories(categories_raw)
+        # 🔴 格式迁移：配置页的多选控件值必须是数组，喂字符串进去会渲染成**空白**，
+        # 用户会以为「监控分类被清空了」。所以发现是旧格式就顺手回写成数组。
+        # 只改 categories 这一个键，其余字段以库里现存的原样带上，不做任何顺带修改。
+        # 写一次之后库里就是数组了，条件不再成立 ⇒ 幂等，不会每次加载都写库。
+        if not isinstance(categories_raw, (list, tuple, set)):
+            stored = self.get_config()
+            base = stored if isinstance(stored, dict) else dict(config)
+            if not isinstance(base.get("categories"), (list, tuple, set)):
+                try:
+                    self.update_config({**base, "categories": self._categories})
+                    logger.info(
+                        f"QB分类活动暂停：监控分类配置格式已迁移为数组：{self._categories}"
+                    )
+                except Exception as err:
+                    # 迁移失败不影响运行：解析结果已经在 self._categories 里了，
+                    # 只是下次打开配置弹窗时多选框仍会显示为空（需要用户重选一次）。
+                    logger.error(f"QB分类活动暂停：监控分类格式迁移失败：{err}")
         try:
             self._interval = max(5, int(config.get("interval") or 30))
         except (TypeError, ValueError):
@@ -678,6 +734,10 @@ class QbCategoryPause(_PluginBase):
 
         :return: Vuetify 表单结构与默认配置
         """
+        # 「监控分类」的候选项 = qB 里**实际存在**的分类。这一步是只读的，
+        # 失败也给空列表、绝不抛异常 —— get_form 是打开配置弹窗时的同步路径，
+        # 异常抛出去弹窗就直接打不开了。
+        category_options = self.__category_options()
         return [
             {
                 "component": "VForm",
@@ -733,7 +793,7 @@ class QbCategoryPause(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VSelect",
@@ -750,26 +810,34 @@ class QbCategoryPause(_PluginBase):
                                         },
                                     }
                                 ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
+                            },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        # 候选项取自 qB 实际分类，从「手输」改成「勾选」：
+                                        # 名字只能从真实分类里挑，杜绝手敲错别字/空格导致的
+                                        # 「配了但永远匹配不上」的静默失效。
+                                        "component": "VSelect",
                                         "props": {
+                                            "multiple": True,
+                                            "chips": True,
+                                            "clearable": True,
                                             "model": "categories",
                                             "label": "监控分类",
-                                            "placeholder": "用,分隔多个分类，例如：刷流,PT下载",
+                                            "items": [
+                                                {"title": name, "value": name}
+                                                for name in category_options
+                                            ],
+                                            "placeholder": (
+                                                "从 qB 实际分类中勾选"
+                                                if category_options else "未能读取 qB 分类"
+                                            ),
                                         },
                                     }
                                 ],
-                            }
+                            },
                         ],
                     },
                     {
@@ -953,7 +1021,7 @@ class QbCategoryPause(_PluginBase):
             "enabled": False,
             "notify": False,
             "downloaders": [],
-            "categories": "",
+            "categories": [],
             "interval": 30,
             "resume_enabled": False,
             "resume_minutes": 60,
@@ -1187,7 +1255,11 @@ class QbCategoryPause(_PluginBase):
         return result
 
     def __collect_uploading_torrents(self) -> Optional[Dict[str, List[Dict[str, str]]]]:
-        """收集各下载器中 uploading（正在上传）状态的种子。
+        """收集各下载器中「监控分类」里 uploading（正在上传）的种子。
+
+        只统计 self._categories 里的分类 —— 与 __pause_active_torrents 保持同一口径。
+        （1.6.0 修复：此前不筛分类，别的分类里正在上传的种子也会被列出来，
+        看着像「插件在监控它」，实际那些种子永远不会被暂停。）
 
         :return: 下载器名称到种子明细列表的映射；获取失败时返回 None
         """
@@ -1214,6 +1286,10 @@ class QbCategoryPause(_PluginBase):
 
             items: List[Dict[str, str]] = []
             for torrent in torrents:
+                # 🔴 只认监控分类（与 __pause_active_torrents 同一口径）——
+                # 漏了这句，详情页会把「压根本不会被暂停」的其它分类种子也列出来。
+                if (torrent.get("category") or "") not in self._categories:
+                    continue
                 if torrent.get("state") not in ACTIVE_STATES:
                     continue
                 items.append(
@@ -1641,6 +1717,70 @@ class QbCategoryPause(_PluginBase):
         except Exception as e:
             logger.error(f"QB分类活动暂停：连接下载器 {downloader_name} 失败：{e}")
             return None
+
+    def __category_options(self) -> List[str]:
+        """配置页「监控分类」的候选项：qB 里的实际分类，外加当前已配置的分类。
+
+        🔴 为什么要带上「当前已配置的」：qB 掉线时这里只能拿到空列表，若不兜底，
+        用户原本勾好的分类会从控件里消失、看着像配置被清了。已配置的一律保留。
+
+        查询范围：选了下载器就只查已选的；一个都没选（首次打开配置页）时查全部 ——
+        否则第一次配置时下拉是空的，等于让人无从选起。
+
+        本方法在 get_form() 里被同步调用，所以只读、不建连接、不抛异常。
+
+        :return: 候选分类名列表（qB 里的在前，仅存在于配置里的在后）
+        """
+        try:
+            configs = DownloaderHelper().get_configs()
+        except Exception as err:
+            logger.error(f"QB分类活动暂停：读取下载器列表失败：{err}")
+            configs = {}
+
+        # 已配置的下载器里，只保留确实还存在的（配置可能指向已被删掉的下载器）
+        names = [name for name in self._downloaders if name in configs] or list(configs.keys())
+
+        found: List[str] = []
+        for name in names:
+            for category in self.__qb_categories(name):
+                if category not in found:
+                    found.append(category)
+        # 已在配置里的分类永远保留 —— 哪怕它在 qB 里已被改名或删除，
+        # 也不能让用户的选择凭空消失（否则一保存就把监控项弄丢了）
+        for category in self._categories:
+            if category not in found:
+                found.append(category)
+        return found
+
+    def __qb_categories(self, downloader_name: str) -> List[str]:
+        """读单个下载器在 qB 里的实际分类名（升序）。
+
+        走面板**已经缓存**的那个连接（`Qbittorrent.qbc`），不自己新建客户端 ——
+        qbittorrentapi 每 auth_log_in 一次都会在 qB 侧留一个会话，而 get_form
+        是「每打开一次配置弹窗就执行一次」，自己建会白白堆会话。
+        只认 qbittorrent 类型：其它下载器没有「分类」这个概念。
+        任何异常都吞掉并返回空列表（原因见 __category_options 的说明）。
+
+        :param downloader_name: 下载器名称
+        :return: 分类名列表；失败时空列表
+        """
+        try:
+            services = DownloaderHelper().get_services(name_filters=[downloader_name])
+        except Exception as err:
+            logger.error(f"QB分类活动暂停：获取下载器 {downloader_name} 失败：{err}")
+            return []
+        for service_info in services.values():
+            if not DownloaderHelper().is_downloader(service_type="qbittorrent",
+                                                    service=service_info):
+                continue
+            client = getattr(service_info.instance, "qbc", None)
+            if client is None:
+                continue
+            try:
+                return sorted(str(name) for name in client.torrents_categories().keys())
+            except Exception as err:
+                logger.error(f"QB分类活动暂停：读取下载器 {downloader_name} 的分类失败：{err}")
+        return []
 
     def __load_jobs(self) -> Dict[str, Dict[str, Any]]:
         with self._migrate_lock:
