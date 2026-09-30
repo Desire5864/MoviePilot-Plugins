@@ -79,6 +79,442 @@ QB_TO_MP_PATH_MAP = (
 )
 
 
+# ===========================================================================
+# 详情页排版（方案 A1 + B1 + C3 + D4，2026-09-30 起）
+#
+# 为什么不用 VAlert / VTable：
+#   · VAlert 的 `text` 只能给一段纯文本，做不了「彩色分段 + 右侧徽章」；
+#   · VTable 表头固定 54px、行高由最高的那一列决定，长种子名会把整行撑高，
+#     `table-layout` 再自适应也会让名称列右边留一大片空白；
+#   · 实测内容宽 1240px / 可见高 587px 下，原结构总高 1744px，要滚 2.9 屏。
+# 改用「div / span + inline style」自己拼版（面板渲染器对原生标签是直通的，
+# 本仓库的 chdbitshrmonitor / scptrafficmonitor 都这么写，含 conic-gradient 环）。
+#
+# 四个板块：
+#   A1  合并摘要条      配置 + 计数合进一条 48px 的蓝条（原本三条 alert = 216px）
+#   B1  单行卡          正在上传：紫色竖条 + 分类 + 名称 + 徽章 + 动效点（48px）
+#   C3  双行行卡        已停止：主行给眼睛看、副行给状态看（56px/条）
+#   D4  队列压行        异常给完整两行，完成态压成一行，其余折成一条汇总
+#
+# 色板全部取自面板自身主题的实拍采样（真机截图逐像素取众数），不是估的。
+# ===========================================================================
+
+# 插件 ID：拼事件回调用（`events.click.api` 走的是 `plugin/<ID>/<method>`）
+_PLUGIN_ID = "QbCategoryPause"
+
+# 语义条：底色 / 图标底色 / 文字色 / 图标字符
+_PAGE_BAR_COLORS = {
+    "info": ("#DDEEF7", "#16B1FF", "#0E6A93", "i"),
+    "success": ("#E4F2DD", "#56CA00", "#33691E", "\u2713"),
+    "warning": ("#F6EEDD", "#FFB400", "#7A5A00", "!"),
+    "error": ("#F5E4E5", "#FF4C51", "#9E2226", "i"),
+}
+
+_PAGE_TEXT = "#3A3541"
+_PAGE_MUT = "#8B8794"
+_PAGE_PRIMARY = "#8D51F9"
+
+# 🔴 分组之间的竖直间距。面板原本靠 VRow/VCol 撑出 24px，改用裸 div 后要自己给。
+_PAGE_GAP = 14
+
+# 🔴 右下角那颗 56px 悬浮齿轮（距右下各 12px）的让位通道。
+# 它是**固定在弹窗可见区右下角**的，不随内容滚动 —— 也就是说内容右侧那一条
+# 68px 会被它扫过，凡是排到右边的元素（按钮、进度列、汇总行尾）都要让开。
+_PAGE_FAB_CHANNEL = 68
+
+# 完成态在队列里最多平铺几条，其余折成一行汇总（D4 的核心）
+_PAGE_DONE_PREVIEW = 3
+
+# 徽章配色（自带底色，不依赖面板主题）
+_PAGE_CHIP = {
+    "ok": "background:#E4F2DD;color:#3E8E1F;",
+    "bad": "background:#F5E4E5;color:#C62828;",
+    "solid": "background:#FF4C51;color:#FFFFFF;",
+    "info": "background:#DDEEF7;color:#0E7FA8;",
+    "warn": "background:#F6EEDD;color:#8A6500;",
+    "pri": "background:#EDE4FE;color:#6B34C9;",
+    "grey": "background:#ECEBEF;color:#6E6878;",
+}
+
+# 迁移任务状态 -> 徽章配色 / 中文名
+_PAGE_STATE_CHIP = {
+    "done": "ok",
+    "failed": "bad",
+    "queued": "grey",
+    "copying": "pri",
+    "verifying": "pri",
+    "swapping": "pri",
+}
+_PAGE_STATE_LABEL = {
+    "done": "完成",
+    "failed": "失败",
+    "queued": "排队",
+    "copying": "复制中",
+    "verifying": "校验中",
+    "swapping": "切换中",
+}
+
+# qB 已停止状态 -> 中文名
+_PAGE_STOPPED_LABEL = {
+    "stoppedUP": "已停止",
+    "stoppedDL": "已停止",
+    "pausedUP": "已暂停",
+    "pausedDL": "已暂停",
+}
+
+# 单行省略三件套。⚠️ `min-width:0` 不能省：flex 子项的默认 `min-width:auto`
+# 会被 nowrap 的长名字顶开，省略号不生效、整行横向溢出。
+_PAGE_ELL = "min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+
+
+def _clip(text: Any, limit: int) -> str:
+    """截断成一行，超出补省略号（用于已经写死长度的位置）。"""
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit] + "\u2026"
+
+
+def _pill(text: str, kind: str = "grey") -> dict:
+    """小圆角徽章。"""
+    return {
+        "component": "span",
+        "props": {"style": (
+            "flex:0 0 auto;white-space:nowrap;font-size:12px;font-weight:600;"
+            "padding:2px 9px;border-radius:11px;"
+            + _PAGE_CHIP.get(kind, _PAGE_CHIP["grey"])
+        )},
+        "text": text,
+    }
+
+
+def _sep() -> dict:
+    """信息之间的中圆点分隔。"""
+    return {"component": "span", "props": {"style": "margin:0 8px;color:#B7B4BE;"},
+            "text": "\u00b7"}
+
+
+def _vsep() -> dict:
+    """条内竖分隔线。"""
+    return {"component": "span", "props": {"style": (
+        "flex:0 0 1px;width:1px;height:22px;background:rgba(0,0,0,.10);margin:0 2px;"
+    )}}
+
+
+def _bar_icon(kind: str) -> dict:
+    """条左侧的实心圆图标。"""
+    _, accent, _, glyph = _PAGE_BAR_COLORS[kind]
+    italic = ";font-style:italic;" if kind in ("info", "error") else ""
+    return {
+        "component": "span",
+        "props": {"style": (
+            "flex:0 0 19px;width:19px;height:19px;border-radius:50%;"
+            f"background:{accent};color:#fff;font-size:12px;line-height:19px;"
+            f"text-align:center;font-weight:700{italic}"
+        )},
+        "text": glyph,
+    }
+
+
+def _bar(kind: str, parts: List[dict], right: Optional[List[dict]] = None,
+         height: int = 48, gap: int = _PAGE_GAP) -> dict:
+    """一条彩色信息条（A1 / 组头 / 队列统计都用它）。
+
+    :param kind: info / success / warning / error
+    :param parts: 中间那段的 inline 内容（会被单行省略）
+    :param right: 右端固定不缩的徽章或按钮
+    """
+    bg, _, fg, _ = _PAGE_BAR_COLORS[kind]
+    content = [_bar_icon(kind), {
+        "component": "div",
+        "props": {"style": (
+            "flex:1 1 auto;min-width:0;font-size:13px;"
+            "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+        )},
+        "content": parts,
+    }]
+    if right:
+        content.append(_vsep())
+        content.extend(right)
+    # 🔴 右端有徽章 / 按钮时，右侧要多留一条齿轮通道。
+    #    那颗齿轮是**固定在可见区右下角**的，会随滚动扫过整页 ——
+    #    不是只有最后一块会被压：实测汇总条右端能到 x1360，而齿轮占 x1328~1384，
+    #    滚到那一段时徽章尾巴会被啃掉。所以每条带右端内容的条都要让位。
+    pad_right = 16 + _PAGE_FAB_CHANNEL if right else 16
+    return {
+        "component": "div",
+        "props": {"style": (
+            "display:flex;align-items:center;gap:12px;box-sizing:border-box;"
+            f"background:{bg};border-radius:5px;padding:0 {pad_right}px 0 16px;"
+            f"min-height:{height}px;font-size:13px;color:{fg};margin-bottom:{gap}px;"
+        )},
+        "content": content,
+    }
+
+
+def _kv(key: str, value: Any) -> List[dict]:
+    """「键 值」两个同色片段（键加粗）。"""
+    return [
+        {"component": "span", "props": {"style": "font-weight:600;"}, "text": key},
+        {"component": "span", "text": " " + str(value)},
+    ]
+
+
+# --------------------------------------------------------------- B1 正在上传
+
+def _pulse() -> dict:
+    """正在上传的动效点（静态三根竖条，面板里本来就只是装饰）。"""
+    bars = [
+        {"component": "span", "props": {"style": (
+            f"display:inline-block;width:3px;height:{h}px;"
+            f"background:{_PAGE_PRIMARY};border-radius:2px;"
+        )}}
+        for h in (6, 13, 9)
+    ]
+    return {"component": "span", "props": {"style": (
+        "flex:0 0 auto;display:inline-flex;gap:3px;align-items:flex-end;height:14px;"
+    )}, "content": bars}
+
+
+def _group_caption(name: str, count: int) -> dict:
+    """当有多个下载器 / 多条任务时，给这一组一个轻量标题。"""
+    return {
+        "component": "div",
+        "props": {"style": (
+            "display:flex;align-items:center;gap:8px;font-size:12px;"
+            f"color:{_PAGE_MUT};font-weight:600;margin-bottom:8px;"
+        )},
+        "content": [
+            {"component": "span", "text": name},
+            _pill(str(count), "grey"),
+        ],
+    }
+
+
+def _upload_card(item: Dict[str, str]) -> dict:
+    """B1 · 单行卡：紫色竖条 + 分类徽章 + 种子名（单行省略）+ 状态 + 动效点。"""
+    name = str(item.get("name") or "")
+    category = str(item.get("category") or "(无分类)")
+    return {
+        "component": "div",
+        "props": {"style": (
+            "display:flex;align-items:center;gap:12px;box-sizing:border-box;"
+            "height:48px;background:#FFFFFF;border:1px solid #E6E5E9;"
+            f"border-radius:8px;padding-right:{14 + _PAGE_FAB_CHANNEL}px;"
+            f"overflow:hidden;font-size:14px;"
+            f"color:{_PAGE_TEXT};margin-bottom:{_PAGE_GAP}px;"
+        )},
+        "content": [
+            {"component": "span", "props": {"style": (
+                f"flex:0 0 3px;width:3px;height:48px;background:{_PAGE_PRIMARY};"
+            )}},
+            _pill(category, "pri"),
+            {"component": "div", "props": {
+                "style": "flex:1 1 auto;" + _PAGE_ELL + "font-size:14px;",
+                "title": name,
+            }, "text": name},
+            _pill("上传中", "pri"),
+            _pulse(),
+        ],
+    }
+
+
+# --------------------------------------------------------------- C3 已停止
+
+def _migrate_btn(item: Dict[str, str]) -> dict:
+    """单条「迁移」按钮（保留 VBtn —— 只有它带得动面板那套事件回调）。"""
+    return {
+        "component": "VBtn",
+        "props": {"size": "x-small", "color": "primary", "variant": "tonal",
+                  "style": "flex:0 0 auto;"},
+        "text": "迁移",
+        "events": {"click": {
+            "api": f"plugin/{_PLUGIN_ID}/migrate_torrent",
+            "method": "get",
+            "params": {"apikey": settings.API_TOKEN,
+                       "hash": str(item.get("hash") or "")},
+        }},
+    }
+
+
+def _stop_row(item: Dict[str, str], stop_time_map: Dict[str, float],
+              now_ts: float, resume_minutes: int, show_migrate: bool,
+              downloader: str = "") -> dict:
+    """C3 · 双行行卡：主行给眼睛看（分类 / 名称 / 状态 / 迁移），副行给状态看。"""
+    name = str(item.get("name") or "")
+    category = str(item.get("category") or "(无分类)")
+    stop_ts = stop_time_map.get(str(item.get("hash") or ""))
+    if stop_ts:
+        elapsed = int((now_ts - stop_ts) / 60)
+        remain = max(0, resume_minutes - elapsed)
+        # 「已停止」只在副行出现一次 —— 主行的状态徽章已经说了同一件事，
+        # 原来写成「恢复倒计时 已停止 58 分钟，剩余 662 分钟」两处重复。
+        countdown = f"已停止 {elapsed} 分钟 · 剩余 {remain} 分钟"
+    else:
+        countdown = "未记录停止时间"
+    if downloader:
+        countdown = f"{downloader} \u00b7 {countdown}"
+
+    line1 = [
+        {"component": "span", "props": {
+            "style": f"flex:0 0 64px;width:64px;font-size:12px;color:{_PAGE_MUT};" + _PAGE_ELL,
+            "title": category,
+        }, "text": category},
+        {"component": "div", "props": {
+            "style": "flex:1 1 auto;" + _PAGE_ELL + f"font-size:14px;color:{_PAGE_TEXT};",
+            "title": name,
+        }, "text": name},
+        _pill(_PAGE_STOPPED_LABEL.get(str(item.get("state") or ""), "已停止"), "warn"),
+    ]
+    if show_migrate:
+        line1.append(_migrate_btn(item))
+
+    return {
+        "component": "div",
+        "props": {"style": (
+            "display:flex;flex-direction:column;justify-content:center;"
+            "box-sizing:border-box;min-height:56px;padding:7px 0;"
+            "border-bottom:1px solid #EFEEF1;"
+        )},
+        "content": [
+            {"component": "div",
+             "props": {"style": "display:flex;align-items:center;gap:12px;"},
+             "content": line1},
+            {"component": "div", "props": {
+                "style": "font-size:11px;color:#A9A6AF;margin:3px 0 0 76px;" + _PAGE_ELL,
+                "title": countdown,
+            }, "text": countdown},
+        ],
+    }
+
+
+# --------------------------------------------------------------- D4 迁移队列
+
+def _queue_row(job: Dict[str, Any], summary: str, two_line: bool) -> dict:
+    """队列一行。
+
+    `two_line=True` 给「异常 / 进行中」用：第一行是种子名，第二行是原因或落地位置。
+    完成态走 `two_line=False`：一条 36px 的单行，只留名字 + 徽章 + 百分比 ——
+    20 条里 19 条都是 `完成 / 100.0%`，副标题也一字不差，没必要占两行。
+    """
+    state = str(job.get("state") or "")
+    name = str(job.get("name") or "")
+    total = job.get("total") or 0
+    done_bytes = job.get("done") or 0
+    percent = f"{done_bytes * 100.0 / total:.1f}%" if total else "-"
+
+    if two_line and summary:
+        sub_style = ("font-size:11px;margin-top:2px;"
+                     + ("color:#C62828;" if state == "failed" else f"color:{_PAGE_MUT};"))
+        left = {
+            "component": "div",
+            "props": {"style": "flex:1 1 auto;min-width:0;"},
+            "content": [
+                {"component": "div", "props": {
+                    "style": _PAGE_ELL + f"font-size:14px;color:{_PAGE_TEXT};",
+                    "title": name,
+                }, "text": name},
+                {"component": "div", "props": {
+                    "style": _PAGE_ELL + sub_style, "title": summary,
+                }, "text": summary},
+            ],
+        }
+    else:
+        left = {"component": "div", "props": {
+            "style": "flex:1 1 auto;" + _PAGE_ELL + f"font-size:14px;color:{_PAGE_TEXT};",
+            "title": name,
+        }, "text": name}
+
+    return {
+        "component": "div",
+        "props": {"style": (
+            "display:flex;align-items:center;gap:12px;box-sizing:border-box;"
+            f"min-height:{56 if two_line else 36}px;padding:6px 0;"
+            "border-bottom:1px solid #EFEEF1;"
+        )},
+        "content": [
+            left,
+            _pill(_PAGE_STATE_LABEL.get(state, state or "\u2014"),
+                  _PAGE_STATE_CHIP.get(state, "grey")),
+            {"component": "span", "props": {"style": (
+                "flex:0 0 68px;width:68px;text-align:right;font-size:12px;"
+                f"color:{_PAGE_MUT};font-variant-numeric:tabular-nums;"
+            )}, "text": percent},
+        ],
+    }
+
+
+def _queue_blocks(ordered: List[Dict[str, Any]], make_summary) -> List[dict]:
+    """D4 · 队列区块 = 统计条 + 异常/进行中完整行 + 最近完成态 + 折叠汇总行。
+
+    :param ordered: 已按时间倒序排列的任务列表（调用方已截到最近 20 条）
+    :param make_summary: `(job) -> str`，取第二行的小字摘要
+    """
+    def state_of(job):
+        return str(job.get("state") or "")
+
+    active = [j for j in ordered if state_of(j) in MIGRATE_ACTIVE_STATES]
+    failed = [j for j in ordered if state_of(j) == "failed"]
+    done = [j for j in ordered if state_of(j) == "done"]
+    # ⚠️ 按状态分流，不要用 `j not in active` —— dict 的 `in` 走值比较，
+    #    两条内容完全一样的记录会被误判成「已出现过」而漏掉。
+    others = [j for j in ordered
+              if state_of(j) not in MIGRATE_ACTIVE_STATES
+              and state_of(j) not in ("failed", "done")]
+    shown_done = done[:_PAGE_DONE_PREVIEW]
+    rest_done = len(done) - len(shown_done)
+
+    # 统计条：只要有失败就整条转红（和原版行为一致），右端挂总数
+    parts: List[dict] = []
+    parts += [{"component": "span", "text": "进行中 "},
+              {"component": "span", "props": {"style": "font-weight:700;"},
+               "text": str(len(active))}, _sep()]
+    parts += [{"component": "span", "text": "已完成 "},
+              {"component": "span", "props": {"style": "font-weight:700;"},
+               "text": str(len(done))}]
+    if failed:
+        parts += [_sep(), {"component": "span", "text": "失败 "},
+                  {"component": "span", "props": {"style": "font-weight:700;"},
+                   "text": str(len(failed))}]
+
+    blocks = [_bar("error" if failed else "info", parts,
+                   [_pill(f"共 {len(ordered)} 条", "grey")], height=46)]
+
+    rows = [_queue_row(j, make_summary(j), True) for j in failed + active + others]
+    rows += [_queue_row(j, make_summary(j), False) for j in shown_done]
+    if rows:
+        blocks.append({
+            "component": "div",
+            "props": {"style": (
+                f"margin-bottom:{_PAGE_GAP}px;padding-right:{_PAGE_FAB_CHANNEL}px;"
+            )},
+            "content": rows,
+        })
+
+    if rest_done:
+        fold: List[dict] = [
+            {"component": "span", "props": {"style": "font-weight:700;"},
+             "text": "\u2713"},
+            {"component": "span", "text": f" 其余 {rest_done} 条已完成"},
+        ]
+        if shown_done:
+            latest = str(shown_done[0].get("name") or "")
+            fold.append({"component": "span", "props": {
+                "style": "font-weight:400;margin-left:12px;opacity:.72;" + _PAGE_ELL,
+                "title": latest,
+            }, "text": "最近：" + _clip(latest, 42)})
+        blocks.append({
+            "component": "div",
+            "props": {"style": (
+                "display:flex;align-items:center;box-sizing:border-box;"
+                "min-height:36px;border-radius:6px;background:#E4F2DD;"
+                f"color:#33691E;font-size:13px;font-weight:600;margin-bottom:0;"
+                f"padding-left:14px;padding-right:{_PAGE_FAB_CHANNEL}px;"
+            )},
+            "content": fold,
+        })
+
+    return blocks
+
+
 class QbCategoryPause(_PluginBase):
     """QB 分类做种上传监控暂停插件。
 
@@ -93,7 +529,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.5.8"
+    plugin_version = "1.5.9"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -530,46 +966,22 @@ class QbCategoryPause(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页面。
+        """返回插件详情页面（方案 A1 + B1 + C3 + D4）。
+
+        排版取向：**不再用 VAlert / VTable**，整页由四个板块的 div 拼成 ——
+        A1 合并摘要条 / B1 正在上传单行卡 / C3 已停止双行行卡 / D4 队列压行。
+        原结构（3 条 alert + 3 张表）实测总高 1744px、可见区只有 587px，要滚 2.9 屏；
+        现在把「每条信息只讲一遍」作为准则，配置、计数、状态各归其位。
 
         :return: Vuetify 详情页结构
         """
         if not self._enabled:
             return None
 
-        # 展示当前配置概览
+        page_content: List[dict] = []
+
         downloaders_text = "、".join(self._downloaders) if self._downloaders else "未配置"
         categories_text = "、".join(self._categories) if self._categories else "未配置"
-        resume_text = (
-            f"已启用（停止超过 {self._resume_minutes} 分钟自动恢复）"
-            if self._resume_enabled
-            else "未启用"
-        )
-
-        page_content: List[dict] = [
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info",
-                                    "variant": "tonal",
-                                    "text": f"监控下载器：{downloaders_text}；"
-                                            f"监控分类：{categories_text}；"
-                                            f"检查间隔：{self._interval} 秒；"
-                                            f"自动恢复：{resume_text}",
-                                },
-                            }
-                        ],
-                    }
-                ],
-            }
-        ]
 
         # 实时查询各下载器中 uploading（正在上传）的种子
         uploading_info = self.__collect_uploading_torrents()
@@ -577,349 +989,160 @@ class QbCategoryPause(_PluginBase):
         if fetch_failed:
             # 取不到数据时只降级提示，不要 return —— 否则「已停止」列表与
             # 迁移队列也会被一起吞掉，下载器短暂掉线就看不到迁移入口了。
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "warning",
-                                        "variant": "tonal",
-                                        "text": "未能获取下载器数据，请检查下载器配置与连接状态。",
-                                    },
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
             uploading_info = {}
+        total_uploading = sum(len(items) for items in uploading_info.values())
 
-        total_count = sum(len(items) for items in uploading_info.values())
+        stopped_info = self.__collect_stopped_torrents() or {}
+        total_stopped = sum(len(items) for items in stopped_info.values())
+
+        job_list = sorted(self.__load_jobs().values(),
+                          key=lambda job: job.get("ts") or 0, reverse=True)
+        failed_jobs = sum(1 for job in job_list
+                          if str(job.get("state") or "") == "failed")
+
+        # ---------------- 板块 A1 · 合并摘要条 ----------------
+        # 配置原本独占一条 56px 的 alert、两条统计各占一条 —— 三条加起来 216px，
+        # 而它们讲的都是「静态配置 + 两个数字」。合并成一条，数字做成右侧徽章。
+        cfg_parts: List[dict] = []
+        cfg_parts += _kv("监控", downloaders_text)
+        cfg_parts.append(_sep())
+        cfg_parts += _kv("分类", categories_text)
+        cfg_parts.append(_sep())
+        cfg_parts += _kv("间隔", f"{self._interval}s")
+        cfg_parts.append(_sep())
+        cfg_parts += _kv("自动恢复",
+                         f"{self._resume_minutes}min" if self._resume_enabled else "未启用")
+        if fetch_failed:
+            cfg_parts.append(_sep())
+            cfg_parts.append({"component": "span",
+                              "props": {"style": "font-weight:600;"},
+                              "text": "下载器数据获取失败"})
+
+        count_pills = [_pill(f"上传 {total_uploading}",
+                             "ok" if total_uploading else "grey")]
+        if total_stopped:
+            count_pills.append(_pill(f"已停止 {total_stopped}", "warn"))
+        if failed_jobs:
+            count_pills.append(_pill(f"失败 {failed_jobs}", "solid"))
         page_content.append(
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "success" if total_count else "info",
-                                    "variant": "tonal",
-                                    "text": (
-                                        f"当前 uploading（正在上传）任务总数：{total_count}"
-                                        if not fetch_failed
-                                        else "下载器数据获取失败，uploading 数量未知"
-                                    ),
-                                },
-                            }
-                        ],
-                    }
-                ],
-            }
-        )
+            _bar("warning" if fetch_failed else "info", cfg_parts, count_pills))
 
-        # 按下载器展示分类统计与明细
-        # 注意：没有 uploading 任务时不能提前 return —— 否则下面的「已停止」列表
-        # 与迁移队列会被一起吞掉，页面只剩两条提示，迁移入口直接消失。
-        for downloader_name, items in (uploading_info.items() if total_count else ()):
-            if not items:
-                continue
+        # ---------------- 板块 B1 · 正在上传（单行卡） ----------------
+        if fetch_failed:
+            page_content.append(_bar("warning", [{
+                "component": "span",
+                "text": "未能获取下载器数据，请检查下载器配置与连接状态。",
+            }], height=44))
+        else:
+            groups = [(name, items) for name, items in uploading_info.items() if items]
+            # 只有「一个下载器一条任务」时才不分组标题 —— 那是最常见的形态，
+            # 让它保持 48px 一张卡，不为一个标签多花 30px。
+            need_caption = len(groups) > 1 or any(len(items) > 1 for _, items in groups)
+            for group_name, items in groups:
+                if need_caption:
+                    page_content.append(_group_caption(group_name, len(items)))
+                for item in items:
+                    page_content.append(_upload_card(item))
 
-            # 分类统计
-            category_counter: Dict[str, int] = {}
-            for item in items:
-                category_counter[item["category"]] = category_counter.get(item["category"], 0) + 1
-            category_summary = "；".join(
-                f"{category}：{count}" for category, count in sorted(
-                    category_counter.items(), key=lambda pair: pair[1], reverse=True
-                )
-            )
-
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "info",
-                                        "variant": "tonal",
-                                        "text": f"【{downloader_name}】共 {len(items)} 个，"
-                                                f"分类统计：{category_summary}",
-                                    },
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
-
-            # 明细表格
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VTable",
-                                    "props": {"density": "compact"},
-                                    "content": [
-                                        {
-                                            "component": "thead",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "th", "text": "分类"},
-                                                        {"component": "th", "text": "状态"},
-                                                        {"component": "th", "text": "种子名称"},
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                        {
-                                            "component": "tbody",
-                                            "content": [
-                                                {
-                                                    "component": "tr",
-                                                    "content": [
-                                                        {"component": "td", "text": item["category"]},
-                                                        {"component": "td", "text": item["state"]},
-                                                        {"component": "td", "text": item["name"]},
-                                                    ],
-                                                }
-                                                for item in items
-                                            ],
-                                        },
-                                    ],
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
-
-        # 展示已停止（stoppedUP）任务及自动恢复倒计时
-        stopped_info = self.__collect_stopped_torrents()
-        if stopped_info:
+        # ---------------- 板块 C3 · 已停止任务（双行行卡） ----------------
+        if total_stopped:
+            show_migrate = bool(self._migrate_target)
             stop_time_map: Dict[str, float] = self.get_data(STOP_TIME_DATA_KEY) or {}
             now_ts = datetime.now().timestamp()
-            total_stopped = sum(len(items) for items in stopped_info.values())
-            page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "warning",
-                                        "variant": "tonal",
-                                        "text": f"当前已停止（stoppedUP）任务总数：{total_stopped}"
-                                                + (
-                                                    f"；自动恢复已启用，停止超过 {self._resume_minutes} 分钟将自动恢复"
-                                                    if self._resume_enabled
-                                                    else "；自动恢复未启用"
-                                                ),
-                                    },
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
 
-            show_migrate = bool(self._migrate_target)
-
-            # 批量迁移入口
+            stop_parts: List[dict] = [
+                {"component": "span", "props": {"style": "font-weight:700;"},
+                 "text": str(total_stopped)},
+                {"component": "span", "text": " 个任务已停止"},
+            ]
+            if self._resume_enabled:
+                stop_parts.append(_sep())
+                stop_parts.append({
+                    "component": "span",
+                    "text": f"超 {self._resume_minutes} 分钟自动恢复"})
             if show_migrate:
-                page_content.append(
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VBtn",
-                                        "props": {
-                                            "size": "small",
-                                            "color": "primary",
-                                            "variant": "flat",
-                                            "prepend-icon": "mdi-content-duplicate",
-                                        },
-                                        "text": f"迁移全部已停止（{total_stopped} 个）",
-                                        "events": {
-                                            "click": {
-                                                "api": f"plugin/{self.__class__.__name__}"
-                                                       f"/migrate_all",
-                                                "method": "get",
-                                                "params": {"apikey": settings.API_TOKEN},
-                                            }
-                                        },
-                                    },
-                                    {
-                                        "component": "span",
-                                        "props": {
-                                            "class": "text-caption ms-3",
-                                            "style": "opacity:.7;",
-                                        },
-                                        "text": f"目标目录 {self._migrate_target}"
-                                                f" → 分类 {self._migrate_category or '（未设置）'}"
-                                                + (f"；空间不足时自动改用 "
-                                                   f"{self._migrate_target_alt}"
-                                                   if self._migrate_target_alt else ""),
-                                    },
-                                ],
-                            }
-                        ],
-                    }
-                )
+                stop_parts.append(_sep())
+                stop_parts.append({
+                    "component": "span", "props": {"style": "opacity:.8;"},
+                    "text": f"目标 {self._migrate_target} → "
+                            f"{self._migrate_category or '（未设置）'}"})
 
-            for downloader_name, items in stopped_info.items():
-                if not items:
-                    continue
-                rows = []
-                for item in items:
-                    stop_ts = stop_time_map.get(item["hash"])
-                    if stop_ts:
-                        elapsed_minutes = int((now_ts - stop_ts) / 60)
-                        remain_minutes = max(0, self._resume_minutes - elapsed_minutes)
-                        countdown = f"已停止 {elapsed_minutes} 分钟，剩余 {remain_minutes} 分钟"
-                    else:
-                        countdown = "未记录"
-                    cells = [
-                        {"component": "td", "text": item["category"]},
-                        {"component": "td", "text": item["state"]},
-                        {"component": "td", "text": countdown},
-                        {"component": "td", "text": item["name"]},
-                    ]
-                    if show_migrate:
-                        cells.append({
-                            "component": "td",
-                            "content": [
-                                {
-                                    "component": "VBtn",
-                                    "props": {
-                                        "size": "x-small",
-                                        "color": "primary",
-                                        "variant": "tonal",
-                                    },
-                                    "text": "迁移",
-                                    "events": {
-                                        "click": {
-                                            "api": f"plugin/{self.__class__.__name__}"
-                                                   f"/migrate_torrent",
-                                            "method": "get",
-                                            "params": {
-                                                "apikey": settings.API_TOKEN,
-                                                "hash": item["hash"],
-                                            },
-                                        }
-                                    },
-                                }
-                            ],
-                        })
-                    rows.append({"component": "tr", "content": cells})
+            stop_right: List[dict] = []
+            if show_migrate:
+                # 批量迁移入口。⚠️ 这是这个页面存在的意义所在，任何降级分支
+                # 都不能把它吞掉（1.5.1 修过一次，别退回去）。
+                stop_right.append({
+                    "component": "VBtn",
+                    "props": {"size": "small", "color": "primary",
+                              "variant": "flat", "style": "flex:0 0 auto;"},
+                    "text": f"迁移全部已停止（{total_stopped} 个）",
+                    "events": {"click": {
+                        "api": f"plugin/{_PLUGIN_ID}/migrate_all",
+                        "method": "get",
+                        "params": {"apikey": settings.API_TOKEN},
+                    }},
+                })
+            page_content.append(_bar("warning", stop_parts, stop_right))
 
-                head_cells = [
-                    {"component": "th", "text": "分类"},
-                    {"component": "th", "text": "状态"},
-                    {"component": "th", "text": "恢复倒计时"},
-                    {"component": "th", "text": "种子名称"},
-                ]
-                if show_migrate:
-                    head_cells.append({"component": "th", "text": "操作"})
+            stop_rows = [
+                _stop_row(item, stop_time_map, now_ts, self._resume_minutes,
+                          show_migrate, downloader_name)
+                for downloader_name, items in stopped_info.items()
+                for item in items
+            ]
+            if stop_rows:
+                page_content.append({
+                    "component": "div",
+                    "props": {"style": (
+                        f"margin-bottom:{_PAGE_GAP}px;"
+                        f"padding-right:{_PAGE_FAB_CHANNEL}px;"
+                    )},
+                    "content": stop_rows,
+                })
 
-                page_content.append(
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTable",
-                                        "props": {"density": "compact"},
-                                        "content": [
-                                            {
-                                                "component": "thead",
-                                                "content": [
-                                                    {
-                                                        "component": "tr",
-                                                        "content": head_cells,
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "tbody",
-                                                "content": rows,
-                                            },
-                                        ],
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                )
-
-        # 迁移队列状态
+        # ---------------- 板块 D4 · 迁移队列 ----------------
         page_content.extend(self.__render_migrate_jobs())
 
         # 面板在对话框右下角内侧 12px 固定着一个 56px 的齿轮悬浮按钮（VFab），它不在
-        # 插件页面树里、插件改不了它，实测它恒定压住「内容最下 46.6px × 最右 48px」。
-        # 所以让页面最下面那一块往左让出一点 —— 选「让宽」而不是补底部空白：
-        # 不占高度，也不受视口高矮影响（矮窗口补空白会顶穿）。
+        # 插件页面树里、插件改不了它。它**不随内容滚动**，所以内容右侧那一条 68px
+        # 始终会被它扫过 —— 页面里排到右边的元素都得让开，不只是最后一块。
+        # （各板块自己已经用 _PAGE_FAB_CHANNEL 让过位；这里再兜底一次，防止某个
+        #   分支下最后一块是条信息条、右端徽章正好落在齿轮下面。）
         self.__avoid_fab(page_content)
 
         return page_content
 
     @staticmethod
-    def __avoid_fab(page_content: List[dict], gap: int = 56) -> None:
+    def __avoid_fab(page_content: List[dict], gap: int = _PAGE_FAB_CHANNEL) -> None:
         """把页面最下面那一块往左让出 gap 像素，避开右下角的齿轮悬浮按钮。
 
-        只处理最后一块：按钮锚定的是内容右下角，只有滚到底时最后一块的右下角
-        才会被压。中间那些块滚动时位置随意，不需要动。
-
         :param page_content: get_page 的页面结构（原地修改）
-        :param gap: 让出的宽度；实测压住区宽 48px，取 56 留 8px 余量
+        :param gap: 让出的宽度；实测压住区宽 48px，取 68 留余量
         """
         if not page_content:
             return
         block = page_content[-1]
         if not isinstance(block, dict):
             return
-        # 一块的结构是 VRow -> content[VCol]，VCol 直接就是 VRow 的孩子，
-        # 别再往 VCol 的 content 里找一层（那里是 VTable/VAlert）。
-        for col in block.get("content") or []:
-            if not isinstance(col, dict) or col.get("component") != "VCol":
-                continue
-            props = col.setdefault("props", {})
+
+        def _pad(props: dict) -> bool:
             style = (props.get("style") or "").strip()
-            if "padding-right" not in style:
-                props["style"] = (style + f";padding-right:{gap}px;").lstrip(";")
+            if "padding-right" in style:
+                return True
+            props["style"] = (style + f";padding-right:{gap}px;").lstrip(";")
+            return True
+
+        # 新结构：最后一块自己就是容器 div
+        if block.get("component") == "div":
+            _pad(block.setdefault("props", {}))
             return
+
+        # 旧结构兼容：VRow -> content[VCol]（VCol 直接是 VRow 的孩子，
+        # 别再往 VCol 的 content 里找一层，那里是 VTable / VAlert）
+        for col in block.get("content") or []:
+            if isinstance(col, dict) and col.get("component") == "VCol":
+                _pad(col.setdefault("props", {}))
+                return
 
     def __collect_stopped_torrents(self) -> Optional[Dict[str, List[Dict[str, str]]]]:
         """收集各下载器中已停止（stoppedUP）状态的种子。
@@ -1934,145 +2157,29 @@ class QbCategoryPause(_PluginBase):
         return msg or "—"
 
     def __render_migrate_jobs(self) -> List[dict]:
-        """渲染迁移队列区块。
+        """渲染迁移队列区块（方案 D4，2026-09-30 起）。
 
-        排版取向（方案 3「徽章双行」，2026-09-30 起）：
-        「种子名称」独占第一行并单行省略（`title` 悬浮看全名），第二行是灰色小字摘要；
-        「状态」独立成列用徽章表示，「进度」只留百分比。
+        排版取向：**异常给完整两行，正常态压成一行**。
 
-        旧排版四列平铺、说明列只占 16% 宽，长种子名会折成三行并把**整行**撑到
-        64px —— 行高由最高的那一列决定，于是名称列右边一片空白、最右侧却挤成一团。
-        改成两行后行高由内容决定（真机实测 44px，旧版 64px），一屏能多看好几条。
+        旧版是「一张表 20 行、每行两行文字」，实测 986px —— 占可见区 587px 的 168%，
+        光这一块就要滚一屏半。而 20 行里 19 行状态是 `done`、进度是 `100.0%`，
+        16 行的副标题一字不差都是「本地保种 · /download（主目录）」：
+        病根不是行高，是**信息重复**。所以这里按状态分流：
+
+          · 失败 / 进行中 → 两行（种子名 + 原因或落地位置），进度只留百分比；
+          · 完成态       → 一行 36px，只留名字 + 徽章 + 百分比，最多平铺 3 条；
+          · 其余完成态   → 折成一条绿色汇总行（「✓ 其余 N 条已完成 · 最近：…」）。
+
+        折叠行是**静态文案**，没有做「点击展开」：面板的页面树没有可用的展开组件，
+        而插件自己翻转状态后页面不会自动重取，做出来会是个点了没反应的假按钮。
         """
         jobs = self.__load_jobs()
         if not jobs:
             return []
 
         ordered = sorted(jobs.values(),
-                         key=lambda job: job.get("ts") or 0, reverse=True)
-        active = sum(1 for job in ordered
-                     if job.get("state") in MIGRATE_ACTIVE_STATES)
-        finished = sum(1 for job in ordered if job.get("state") == "done")
-        failed = sum(1 for job in ordered if job.get("state") == "failed")
-
-        rows = []
-        for job in ordered[:20]:
-            total = job.get("total") or 0
-            done_bytes = job.get("done") or 0
-            percent = f"{done_bytes * 100.0 / total:.1f}%" if total else "-"
-            state = str(job.get("state") or "")
-            name = str(job.get("name") or "")
-            summary = self.__job_summary(job)
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {
-                        # 🔴 `max-width:0` 不能去掉：表格是自适应布局，单元格不加这个
-                        #    约束时会被 nowrap 的长名字撑开，`text-truncate` 的省略号
-                        #    不生效，表现为整张表横向溢出。
-                        "component": "td",
-                        "props": {"style": "max-width:0;"},
-                        "content": [
-                            {
-                                "component": "div",
-                                "props": {"class": "text-truncate", "title": name},
-                                "text": name,
-                            },
-                            {
-                                "component": "div",
-                                "props": {
-                                    "class": "text-truncate text-caption "
-                                             "text-medium-emphasis",
-                                    "style": "margin-top:2px;",
-                                    "title": summary,
-                                },
-                                "text": summary,
-                            },
-                        ],
-                    },
-                    {
-                        "component": "td",
-                        "props": {"style": "white-space:nowrap;"},
-                        "content": [
-                            {
-                                "component": "VChip",
-                                "props": {
-                                    "size": "x-small",
-                                    "variant": "tonal",
-                                    "color": MIGRATE_STATE_COLORS.get(state, "grey"),
-                                },
-                                "text": state or "—",
-                            }
-                        ],
-                    },
-                    {
-                        "component": "td",
-                        "props": {"style": "white-space:nowrap;"},
-                        "text": percent,
-                    },
-                ],
-            })
-
-        return [
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "error" if failed else "info",
-                                    "variant": "tonal",
-                                    "text": f"迁移队列：进行中 {active} 个，"
-                                            f"已完成 {finished} 个，失败 {failed} 个"
-                                            f"（最多显示最近 20 条）",
-                                },
-                            }
-                        ],
-                    }
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VTable",
-                                "props": {"density": "compact"},
-                                "content": [
-                                    {
-                                        "component": "thead",
-                                        "content": [
-                                            {
-                                                "component": "tr",
-                                                "content": [
-                                                    {"component": "th",
-                                                     "props": {"style": "width:100%;"},
-                                                     "text": "种子名称"},
-                                                    {"component": "th",
-                                                     "props": {"style": "width:96px;"},
-                                                     "text": "状态"},
-                                                    {"component": "th",
-                                                     "props": {"style": "width:84px;"},
-                                                     "text": "进度"},
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                    {"component": "tbody", "content": rows},
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            },
-        ]
+                         key=lambda job: job.get("ts") or 0, reverse=True)[:20]
+        return _queue_blocks(ordered, self.__job_summary)
 
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
