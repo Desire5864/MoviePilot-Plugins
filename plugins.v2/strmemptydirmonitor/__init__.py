@@ -1,14 +1,31 @@
-"""strm 媒体库空目录巡检插件。
+"""strm 媒体库巡检插件：115 分享有效性检测 + 空目录巡检。
 
-定时扫描 strm 库中「整棵子树里不含任何 .strm 文件」的目录（下称"死树"），
-在插件详情页列出清单并可通过通知提醒；**清理动作只放在详情页的手动按钮上，
-不做任何自动删除**。
+两件事，按「先检测 115 链接，再检查空文件夹」的顺序串成**组合巡检**：
+
+1. **115 分享检测**（只读）—— 遍历库里所有 ``.strm``，解析出里面的 115 分享，
+   按 ``(share_code, receive_code)`` 去重后并发查 115 接口，判定每个分享是
+   **有效 / 已失效（取消·过期·违规·不存在·访问码错误） / 未知（风控或网络异常）**；
+   并顺带算出「只剩失效 strm 的目录」——这批目录一旦清掉失效文件就会变成空目录。
+2. **空目录巡检** —— 扫描「整棵子树里不含任何 .strm 文件」的目录（下称"死树"）。
+
+**清理动作一律只放在详情页的手动按钮上，不做任何自动删除。**
 
 设计前提（很重要，别搞错）：
     本插件服务的 ``/volume1/movie_strm`` **不是刮削库** —— 目录由用户手工整理、
-    挂的是 115 分享链接，``.strm`` 由 NanShare 容器生成（内容是该分享的直链）。
+    挂的是 115 分享链接，``.strm`` 由 NanShare 容器生成（内容是该分享的直链，
+    形如 ``http://172.17.0.1:8115/api/?share_code=<分享码>&id=<文件id>&receive_code=<提取码>``）。
     所以空目录的成因在「115 分享链路」上（分享被取消/过期、分享里没有正片、
     转存或再分享失败），**不是刮削规则问题**。
+
+115 检测的几个实测要点（都写进了代码，别凭感觉改）：
+    * 检测接口 ``https://webapi.115.com/share/snap`` **匿名即可访问**，与带登录
+      Cookie 返回完全一致，所以插件零配置；代价是风控概率略高。
+    * 判定看 ``state`` + ``errno``：``state=true`` 且 ``share_state=1`` 才算有效；
+      ``state=false`` 时 ``errno`` 给的就是原因（990002 参数错误 / 4100008 访问码错误 /
+      4100012 请输入访问码 …）。
+    * 🔴 ``state=false`` 且 ``errno=0`` 的是**服务端内部错误**（实测 115 用它表达
+      "服务器开小差了"），**绝不能当成分享失效** —— 一律记为「未知」。
+    * 必须**绕开系统代理**直连 115，走代理会被拒或超时。
 
 清理的三道保险（都在代码里）：
     1. 删前对每个目标**重新实时复查**，只要子树里出现任何一个 ``.strm`` 就跳过；
@@ -18,11 +35,17 @@
 """
 
 import fnmatch
+import json
 import os
 import shutil
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlencode
+from urllib.request import ProxyHandler, Request, build_opener
 
 from app.core.config import settings
 from app.log import logger
@@ -34,6 +57,7 @@ _PLUGIN_ID = "StrmEmptyDirMonitor"
 
 # 持久化键名
 LAST_RESULT_KEY = "last_result"
+CHECK_RESULT_KEY = "last_check115"
 CLEAN_LOG_KEY = "clean_log"
 # 清理日志最多保留条数
 CLEAN_LOG_LIMIT = 20
@@ -53,6 +77,30 @@ MAX_STORED_ROOTS = 500
 
 # 详情页右下角那颗 56px 悬浮齿轮会扫过整页右侧，右端内容要让出通道
 _FAB_CHANNEL = 56
+
+# --------------------------------------------------------------- 115 检测常量
+
+# 115 分享信息接口（匿名可访问）
+CHECK_URL = "https://webapi.115.com/share/snap"
+CHECK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# 读 .strm 时只取前 N 字节：内容就是一行 URL，远小于这个值
+STRM_READ_BYTES = 512
+# 每个分享最多保留的样本路径条数（落库体积的闸门）
+SAMPLE_PER_SHARE = 10
+# 落库的失效/未知分享条数上限
+MAX_STORED_SHARES = 300
+# 单个目录最多记几个分享键（防极端情况下 dir_keys 映射膨胀）
+MAX_KEYS_PER_DIR = 8
+# 疑似风控的响应特征：命中即判「未知」，**绝不当成失效**
+RISK_HINTS = ("频繁", "限流", "稍后再试", "开小差", "服务器繁忙", "请稍后", "too many")
+# 默认并发 / 超时
+DEFAULT_CONCURRENCY = 3
+DEFAULT_TIMEOUT = 15
+# 对「未知」结果的额外重试次数（风控是瞬时的，重试一次能捞回不少）
+DEFAULT_RETRY = 1
+# 非 .strm 的注册扩展名（只用于展示，不影响判定）
+_STRM_EXT = ".strm"
 
 
 # --------------------------------------------------------------------- 工具
@@ -143,7 +191,7 @@ def _scan_dead_trees(root: str, patterns: List[str]) -> Dict[str, Any]:
         exts_here: Dict[str, int] = {}
         for name in filenames:
             result["total_files"] += 1
-            if name.lower().endswith(".strm"):
+            if name.lower().endswith(_STRM_EXT):
                 strm_here += 1
             elif "." in name:
                 ext = name.rsplit(".", 1)[-1].lower()
@@ -241,7 +289,7 @@ def _count_strm(tree: str) -> int:
     count = 0
     for dirpath, _dirnames, filenames in os.walk(tree, onerror=lambda _e: None):
         for name in filenames:
-            if name.lower().endswith(".strm"):
+            if name.lower().endswith(_STRM_EXT):
                 count += 1
                 if count > 0:
                     return count
@@ -341,24 +389,397 @@ def _clean_dead_root(scan_root: str, target: str, trash_root: str) -> Dict[str, 
     return item
 
 
+def _move_strm_to_trash(scan_root: str, target: str, trash_root: str) -> Dict[str, Any]:
+    """把一个无效的 ``.strm`` 移入库内回收站（**只移动、不删除**）。
+
+    :param scan_root: 扫描根（用于边界校验）
+    :param target: 目标 .strm 文件路径
+    :param trash_root: 库内回收站目录
+    :return: 单条处理结果
+    """
+    item: Dict[str, Any] = {"path": target, "ok": False, "message": ""}
+
+    real_root = os.path.realpath(scan_root)
+    real_target = os.path.realpath(target)
+
+    if real_target == real_root:
+        item["message"] = "拒绝：目标是扫描根目录本身"
+        return item
+    if not real_target.startswith(real_root.rstrip("/") + os.sep):
+        item["message"] = "拒绝：目标不在扫描路径内"
+        return item
+    # 边界校验之后再看类型：只处理 .strm，绝不碰别的文件
+    if not real_target.lower().endswith(_STRM_EXT):
+        item["message"] = "拒绝：只处理 .strm 文件"
+        return item
+    if not os.path.isfile(real_target):
+        item["ok"] = True
+        item["message"] = "已不存在，跳过"
+        return item
+
+    rel = os.path.relpath(real_target, real_root)
+    dest = os.path.join(trash_root, rel)
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.exists(dest):
+            dest = f"{dest}.{datetime.now().strftime('%H%M%S%f')}"
+        shutil.move(real_target, dest)
+        item["ok"] = True
+        item["message"] = "已移入回收站"
+    except Exception as err:  # noqa: BLE001
+        item["message"] = f"移动失败：{err}"
+    return item
+
+
+# ------------------------------------------------------------- 115 检测核心
+
+
+def _looks_like_risk(text: str) -> bool:
+    """响应文本是否像「115 风控/限流」。"""
+    if not text:
+        return False
+    low = text.lower()
+    return any(hint in low for hint in RISK_HINTS)
+
+
+def _parse_strm_share(text: str) -> Optional[Dict[str, str]]:
+    """从 ``.strm`` 内容里解析出 115 分享三要素。
+
+    已知格式（NanShare 生成）::
+
+        http://172.17.0.1:8115/api/?share_code=<分享码>&id=<文件id>&receive_code=<提取码>
+
+    解析刻意写得很宽松：只要 query 里有 ``share_code`` 就认，``id`` /
+    ``receive_code`` 缺了也照样返回（后面的检测能区分「缺访问码」）。
+
+    :param text: 文件内容（前若干字节足够）
+    :return: {"share_code", "file_id", "receive_code"}；不是 115 分享则 None
+    """
+    if not text:
+        return None
+    raw = text.strip()
+    if not raw:
+        return None
+    # 正常就一行；容错取第一条含 share_code 的行
+    line = ""
+    for candidate in raw.splitlines():
+        if "share_code=" in candidate:
+            line = candidate.strip()
+            break
+    if not line:
+        return None
+
+    if "?" in line:
+        query = line.split("?", 1)[1]
+    else:
+        # 裸 query 形态：share_code=xxx&id=yyy
+        query = line[line.find("share_code="):]
+
+    params = parse_qs(query, keep_blank_values=True)
+    code = (params.get("share_code") or [""])[0].strip()
+    if not code:
+        return None
+    file_id = (params.get("id") or params.get("file_id") or [""])[0].strip()
+    receive = (params.get("receive_code") or params.get("password") or [""])[0].strip()
+    return {"share_code": code, "file_id": file_id, "receive_code": receive}
+
+
+def _share_key(info: Dict[str, str]) -> str:
+    """分享去重键：同分享码 + 同提取码才算同一个。"""
+    return f"{info.get('share_code', '')}|{info.get('receive_code', '')}"
+
+
+def _read_strm_share(path: str) -> Optional[Dict[str, str]]:
+    """读一个 ``.strm`` 并解析出分享信息（只读前 :data:`STRM_READ_BYTES` 字节）。"""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(STRM_READ_BYTES)
+    except OSError:
+        return None
+    return _parse_strm_share(raw.decode("utf-8", "replace"))
+
+
+def _collect_shares(root: str, patterns: List[str]) -> Dict[str, Any]:
+    """遍历 strm 库，收集 115 分享并按 ``(share_code, receive_code)`` 去重。
+
+    同时顺手记下每个目录的「直属 strm 数 / 直属非 strm 文件数 / 涉及的分享键」，
+    供 :func:`_find_pending_dead` 算「只剩失效 strm 的目录」用。
+
+    纯只读、可离线单测。
+
+    :param root: 扫描根目录
+    :param patterns: 排除的目录名通配列表
+    :return: 采集结果字典
+    """
+    result: Dict[str, Any] = {
+        "root": root,
+        "exists": os.path.isdir(root),
+        "strm_total": 0,
+        "strm_115": 0,
+        "strm_other": 0,
+        "unreadable": 0,
+        "errors": [],
+        "shares": {},      # key -> {"share_code","receive_code","count","samples"}
+        "dir_strm": {},    # 目录 -> 直属 .strm 数
+        "dir_other": {},   # 目录 -> 直属非 .strm 文件数
+        "dir_keys": {},    # 目录 -> 直属 .strm 涉及的分享键（去重、封顶）
+    }
+    if not result["exists"]:
+        return result
+
+    def _on_error(err: OSError) -> None:
+        if len(result["errors"]) < 50:
+            result["errors"].append(f"{type(err).__name__}: {err}")
+
+    root = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=_on_error):
+        # 剪枝必须在 topdown 模式下改 dirnames[:]，否则白走整棵被排除子树
+        dirnames[:] = [d for d in dirnames if not _is_excluded(d, patterns)]
+
+        n_strm = 0
+        n_other = 0
+        keys_here: List[str] = []
+        for name in filenames:
+            lower = name.lower()
+            if not lower.endswith(_STRM_EXT):
+                n_other += 1
+                continue
+            n_strm += 1
+            result["strm_total"] += 1
+            path = os.path.join(dirpath, name)
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read(STRM_READ_BYTES)
+            except OSError:
+                result["unreadable"] += 1
+                continue
+            info = _parse_strm_share(raw.decode("utf-8", "replace"))
+            if not info:
+                result["strm_other"] += 1
+                continue
+            result["strm_115"] += 1
+            key = _share_key(info)
+            bucket = result["shares"].get(key)
+            if bucket is None:
+                bucket = {
+                    "share_code": info["share_code"],
+                    "receive_code": info["receive_code"],
+                    "count": 0,
+                    "samples": [],
+                }
+                result["shares"][key] = bucket
+            bucket["count"] += 1
+            if len(bucket["samples"]) < SAMPLE_PER_SHARE:
+                bucket["samples"].append(path)
+            if key not in keys_here and len(keys_here) < MAX_KEYS_PER_DIR:
+                keys_here.append(key)
+
+        if n_strm:
+            result["dir_strm"][dirpath] = n_strm
+            result["dir_other"][dirpath] = n_other
+            result["dir_keys"][dirpath] = keys_here
+
+    return result
+
+
+def _check_share_115(share_code: str, receive_code: str,
+                     timeout: int = DEFAULT_TIMEOUT, cookie: str = "") -> Dict[str, Any]:
+    """查一个 115 分享的有效性（只读，不消耗任何账号权益）。
+
+    :param share_code: 分享码
+    :param receive_code: 提取码（可为空）
+    :param timeout: 单次请求超时秒数
+    :param cookie: 可选的 115 Cookie（匿名时留空，实测两者结果一致）
+    :return: {"state": valid|invalid|unknown, "reason": str, "errno": Any, ...}
+    """
+    params = {"share_code": share_code, "offset": "0", "limit": "1"}
+    if receive_code:
+        params["receive_code"] = receive_code
+    headers = {"User-Agent": CHECK_UA,
+               "Accept": "application/json, text/plain, */*"}
+    if cookie:
+        headers["Cookie"] = cookie
+    req = Request(f"{CHECK_URL}?{urlencode(params)}", headers=headers)
+
+    # 🔴 必须显式绕开系统代理直连 115：容器里 PROXY_HOST 指向局域网代理，
+    #    115 是直连站点，走代理会被拒或超时。
+    opener = build_opener(ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            body = resp.read(4096).decode("utf-8", "replace")
+    except HTTPError as err:
+        if err.code in (403, 429, 503):
+            return {"state": "unknown", "reason": f"疑似风控（HTTP {err.code}）", "errno": err.code}
+        return {"state": "unknown", "reason": f"HTTP {err.code}", "errno": err.code}
+    except Exception as err:  # noqa: BLE001 - 网络异常只回报，不影响整体流程
+        return {"state": "unknown",
+                "reason": f"请求失败：{type(err).__name__}", "errno": None}
+
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return {"state": "unknown", "reason": f"响应不是 JSON：{body[:60]}", "errno": None}
+    if not isinstance(data, dict):
+        return {"state": "unknown", "reason": "响应格式异常", "errno": None}
+
+    state = data.get("state")
+    errno = data.get("errno")
+    error = str(data.get("error") or "").strip()
+    shareinfo = (data.get("data") or {}).get("shareinfo") or {}
+
+    if state:
+        # shareinfo 缺失时不敢判失效，按有效处理（宁漏不误杀）
+        if not shareinfo:
+            return {"state": "valid", "reason": "", "errno": errno,
+                    "title": "", "violation": False}
+        share_state = shareinfo.get("share_state")
+        title = str(shareinfo.get("share_title") or "")
+        if share_state in (1, "1", None):
+            violation = bool(shareinfo.get("have_vio_file"))
+            return {"state": "valid", "errno": errno, "title": title,
+                    "violation": violation,
+                    "reason": "含违规文件" if violation else ""}
+        return {"state": "invalid", "errno": errno, "title": title,
+                "reason": f"分享状态异常（share_state={share_state}）"}
+
+    # state 为假：先用文本特征挡掉风控，再用 errno 兜住「服务端内部错误」
+    if _looks_like_risk(error):
+        return {"state": "unknown", "reason": f"疑似风控：{error}", "errno": errno}
+    if errno in (0, "0", None):
+        # 🔴 实测：115 用它表达内部错误（state=false + errno=0），
+        #    不能当成「分享失效」，否则会误报一大批。
+        return {"state": "unknown", "reason": f"115 未明确原因：{error or '空响应'}",
+                "errno": errno}
+    return {"state": "invalid", "reason": error or f"errno={errno}", "errno": errno}
+
+
+def _check_shares_concurrent(shares: Dict[str, Dict[str, Any]],
+                             concurrency: int = DEFAULT_CONCURRENCY,
+                             timeout: int = DEFAULT_TIMEOUT,
+                             cookie: str = "",
+                             retry: int = DEFAULT_RETRY) -> Dict[str, Dict[str, Any]]:
+    """并发检测一批分享，只对「未知」结果做有限重试。
+
+    :param shares: :func:`_collect_shares` 里的 ``shares`` 映射
+    :param concurrency: 并发线程数（1~16）
+    :param timeout: 单次请求超时
+    :param cookie: 可选 115 Cookie
+    :param retry: 对 unknown 的额外重试次数
+    :return: {key: 判定结果}
+    """
+    keys = list(shares)
+    results: Dict[str, Dict[str, Any]] = {}
+    if not keys:
+        return results
+
+    workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), 16))
+    total = len(keys)
+    counter = {"done": 0}
+    lock = threading.Lock()
+
+    def _one(key: str) -> Tuple[str, Dict[str, Any]]:
+        info = shares[key]
+        verdict = _check_share_115(info.get("share_code", ""),
+                                   info.get("receive_code", ""),
+                                   timeout=timeout, cookie=cookie)
+        tries = 0
+        while verdict.get("state") == "unknown" and tries < max(0, int(retry)):
+            time.sleep(1.0 + tries)          # 风控是瞬时状态，退避一下再试
+            verdict = _check_share_115(info.get("share_code", ""),
+                                       info.get("receive_code", ""),
+                                       timeout=timeout, cookie=cookie)
+            tries += 1
+        return key, verdict
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, k) for k in keys]
+        for fut in as_completed(futures):
+            try:
+                key, verdict = fut.result()
+            except Exception as err:  # noqa: BLE001
+                logger.error(f"【strm空目录巡检】115 检测线程异常：{err}")
+                continue
+            results[key] = verdict
+            with lock:
+                counter["done"] += 1
+                if counter["done"] % 50 == 0 or counter["done"] == total:
+                    logger.info(f"【strm空目录巡检】115 检测进度 "
+                                f"{counter['done']}/{total}")
+    return results
+
+
+def _find_pending_dead(collect: Dict[str, Any],
+                       verdicts: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """算出「只剩失效 strm 的目录」—— 失效文件清掉后就会变成空目录的那批。
+
+    判定条件（三条同时成立，**未知状态一律不参与**，宁可不报也不误报）：
+
+    1. 目录自身有 ``.strm``；
+    2. 该目录所有 ``.strm`` 都属于「已确认失效」的分享；
+    3. 目录里没有别的文件（有的话清完仍不空，单独标出来）。
+
+    :param collect: :func:`_collect_shares` 的返回
+    :param verdicts: :func:`_check_shares_concurrent` 的返回
+    :return: {"items": [...], "count": n, "will_empty": n}
+    """
+    invalid_keys = {k for k, v in verdicts.items() if v.get("state") == "invalid"}
+    dir_strm = collect.get("dir_strm") or {}
+    dir_other = collect.get("dir_other") or {}
+    dir_keys = collect.get("dir_keys") or {}
+    root = collect.get("root") or ""
+
+    pending = set()
+    for path, count in dir_strm.items():
+        if not count:
+            continue
+        keys = dir_keys.get(path) or []
+        if not keys:
+            continue
+        if all(k in invalid_keys for k in keys):
+            pending.add(path)
+
+    items: List[Dict[str, Any]] = []
+    for path in sorted(pending):
+        # 只保留「根」：父目录也在集合里就不用重复报
+        if os.path.dirname(path) in pending:
+            continue
+        keys = dir_keys.get(path) or []
+        other = dir_other.get(path, 0)
+        items.append({
+            "path": path,
+            "rel": os.path.relpath(path, root) if root else path,
+            "strm": dir_strm.get(path, 0),
+            "shares": len(keys),
+            "other": other,
+            "will_empty": other == 0,
+        })
+
+    return {
+        "items": items,
+        "count": len(items),
+        "will_empty": sum(1 for x in items if x["will_empty"]),
+    }
+
+
 # ------------------------------------------------------------------- 插件
 
 
 class StrmEmptyDirMonitor(_PluginBase):
-    """strm 媒体库空目录巡检。
+    """strm 媒体库巡检：115 分享有效性检测 + 空目录巡检。
 
-    定时扫描指定目录，列出「整棵子树不含 .strm」的死树目录并通知；
-    清理动作全部放在详情页的手动按钮上，带复查 / rmdir / 回收站三道保险。
+    组合巡检按「先检测 115 链接、再检查空文件夹」的顺序执行；
+    所有清理动作（空目录、失效 strm）都只放在详情页的手动按钮上，
+    带边界校验 / 复查 / rmdir / 库内回收站四道保险。
     """
 
     # 插件名称
     plugin_name = "strm库空目录巡检"
     # 插件描述
-    plugin_desc = "扫描strm媒体库，列出不含.strm的空目录并通知，可手动一键清理。"
+    plugin_desc = "检测115分享有效性、扫描strm库空目录并通知，可手动一键清理。"
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -380,8 +801,17 @@ class StrmEmptyDirMonitor(_PluginBase):
     _cron: str = DEFAULT_CRON
     # 清理开关：打开后点「清理」只预览、不真删
     _dry_run: bool = False
+    # 115 分享检测
+    _check_115: bool = True
+    _check_115_on_cron: bool = True
+    _check_concurrency: int = DEFAULT_CONCURRENCY
+    _check_timeout: int = DEFAULT_TIMEOUT
+    # 可选的 115 Cookie（留空 = 匿名检测，实测结果一致）
+    _cookie_115: str = ""
     # 最近一次扫描结果（内存缓存，供详情页免扫展示）
     _last_result: Optional[Dict[str, Any]] = None
+    # 最近一次 115 检测结果
+    _last_check: Optional[Dict[str, Any]] = None
     # 禁用重入：扫描可能跑十几秒，防止定时任务与手动按钮叠在一起
     _scan_lock = threading.RLock()
 
@@ -401,7 +831,13 @@ class StrmEmptyDirMonitor(_PluginBase):
         self._exclude = DEFAULT_EXCLUDE
         self._cron = DEFAULT_CRON
         self._dry_run = False
+        self._check_115 = True
+        self._check_115_on_cron = True
+        self._check_concurrency = DEFAULT_CONCURRENCY
+        self._check_timeout = DEFAULT_TIMEOUT
+        self._cookie_115 = ""
         self._last_result = None
+        self._last_check = None
 
         if not config:
             return
@@ -410,12 +846,26 @@ class StrmEmptyDirMonitor(_PluginBase):
         self._notify = bool(config.get("notify"))
         self._notify_only_when_found = bool(config.get("notify_only_when_found", True))
         self._dry_run = bool(config.get("dry_run"))
+        self._check_115 = bool(config.get("check_115", True))
+        self._check_115_on_cron = bool(config.get("check_115_on_cron", True))
+        self._cookie_115 = str(config.get("cookie_115") or "").strip()
         self._scan_path = str(config.get("scan_path") or DEFAULT_SCAN_PATH).strip() or DEFAULT_SCAN_PATH
         self._exclude = str(config.get("exclude") or DEFAULT_EXCLUDE).strip()
         self._cron = str(config.get("cron") or DEFAULT_CRON).strip() or DEFAULT_CRON
+        try:
+            self._check_concurrency = min(max(int(config.get("check_concurrency")
+                                                  or DEFAULT_CONCURRENCY), 1), 16)
+        except (TypeError, ValueError):
+            self._check_concurrency = DEFAULT_CONCURRENCY
+        try:
+            self._check_timeout = min(max(int(config.get("check_timeout")
+                                              or DEFAULT_TIMEOUT), 3), 120)
+        except (TypeError, ValueError):
+            self._check_timeout = DEFAULT_TIMEOUT
 
         # 恢复最近一次结果，重载后详情页立刻有东西看
         self._last_result = self.get_data(LAST_RESULT_KEY) or None
+        self._last_check = self.get_data(CHECK_RESULT_KEY) or None
 
         if config.get("run_once"):
             logger.info("【strm空目录巡检】立即执行一次")
@@ -429,6 +879,11 @@ class StrmEmptyDirMonitor(_PluginBase):
                 "exclude": self._exclude,
                 "cron": self._cron,
                 "dry_run": self._dry_run,
+                "check_115": self._check_115,
+                "check_115_on_cron": self._check_115_on_cron,
+                "check_concurrency": self._check_concurrency,
+                "check_timeout": self._check_timeout,
+                "cookie_115": self._cookie_115,
                 "run_once": False,
             }.items()})
             self.update_config(stored)
@@ -447,7 +902,7 @@ class StrmEmptyDirMonitor(_PluginBase):
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册定时扫描服务。"""
+        """注册定时巡检服务。"""
         if self._enabled and self._cron:
             return [{
                 "id": _PLUGIN_ID,
@@ -471,6 +926,21 @@ class StrmEmptyDirMonitor(_PluginBase):
                 "description": "只读扫描一次扫描路径，列出整棵子树不含 .strm 的死树目录。",
             },
             {
+                "path": "/check115",
+                "endpoint": self.api_check115,
+                "methods": ["GET"],
+                "summary": "检测 115 分享有效性",
+                "description": "解析库里所有 .strm 的 115 分享，去重后并发检测，"
+                               "列出已失效 / 已取消 / 已过期 / 违规 / 不存在的分享，只报告不清理。",
+            },
+            {
+                "path": "/inspect",
+                "endpoint": self.api_inspect,
+                "methods": ["GET"],
+                "summary": "组合巡检（先测 115 再查空目录）",
+                "description": "先跑一遍 115 分享检测，再扫一遍空目录，结果一起返回。",
+            },
+            {
                 "path": "/clean",
                 "endpoint": self.api_clean,
                 "methods": ["GET"],
@@ -478,12 +948,31 @@ class StrmEmptyDirMonitor(_PluginBase):
                 "description": "清理指定死树（path 参数）或全部死树（all=1）。"
                                "零文件目录用 rmdir，含文件目录移入库内回收站。",
             },
+            {
+                "path": "/clean_invalid",
+                "endpoint": self.api_clean_invalid,
+                "methods": ["GET"],
+                "summary": "清理失效的 strm 文件",
+                "description": "把失效分享对应的 .strm 移入库内 @recycle 回收站"
+                               "（key 指定单个分享，all=1 表示全部）。只移动、不删除。",
+            },
         ]
 
     def api_scan(self) -> Dict[str, Any]:
-        """API：立即扫描一次（只读）。"""
-        result = self.check(manual=True)
+        """API：立即扫描一次空目录（只读）。"""
+        result = self.check(manual=True, with_115=False)
         return {"success": True, "data": result or {}}
+
+    def api_check115(self) -> Dict[str, Any]:
+        """API：立即执行一次 115 分享检测（只读，不清理）。"""
+        result = self.check_115(manual=True)
+        return {"success": True, "data": result or {}}
+
+    def api_inspect(self) -> Dict[str, Any]:
+        """API：组合巡检 —— 先检测 115 链接，再检查空文件夹。"""
+        check = self.check_115(manual=True)
+        scan = self.check(manual=True, with_115=False)
+        return {"success": True, "data": {"check115": check or {}, "scan": scan or {}}}
 
     def api_clean(self, path: str = "", all: str = "", apikey: str = "") -> Dict[str, Any]:
         """API：清理死树。
@@ -494,6 +983,16 @@ class StrmEmptyDirMonitor(_PluginBase):
         :return: 清理结果
         """
         return self.clean(path=path, clean_all=str(all) in ("1", "true", "True"))
+
+    def api_clean_invalid(self, key: str = "", all: str = "", apikey: str = "") -> Dict[str, Any]:
+        """API：清理失效的 strm（只移动到库内回收站）。
+
+        :param key: 单个分享键 ``share_code|receive_code``
+        :param all: 传 "1" 表示清理全部失效分享下的 strm
+        :param apikey: 面板事件回调自动带上的鉴权参数
+        :return: 处理结果
+        """
+        return self.clean_invalid(key=key, clean_all=str(all) in ("1", "true", "True"))
 
     # ------------------------------------------------------------- 表单与页面
 
@@ -509,9 +1008,12 @@ class StrmEmptyDirMonitor(_PluginBase):
                             "type": "info",
                             "variant": "tonal",
                             "class": "mb-2",
-                            "text": "扫描「整棵子树不含任何 .strm 文件」的目录（死树）。"
-                                    "清理动作只在详情页手动触发：零文件目录用 rmdir 删除，"
-                                    "含文件目录移动到库内 @recycle 回收站，绝不直接删文件。",
+                            "text": "① 115 分享检测：解析库里每个 .strm 的分享码，"
+                                    "去重后并发查 115 接口，列出已失效（取消/过期/违规/"
+                                    "不存在/访问码错误）的分享与受影响的文件，**只报告不清理**。"
+                                    "② 空目录巡检：扫描「整棵子树不含任何 .strm」的目录。"
+                                    "两者的清理动作都只在详情页手动触发，"
+                                    "且一律移入库内 @recycle 回收站或 rmdir 空目录，绝不直接删文件。",
                         },
                     },
                     {
@@ -534,7 +1036,7 @@ class StrmEmptyDirMonitor(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [{"component": "VSwitch", "props": {
                                     "model": "notify_only_when_found",
-                                    "label": "仅在发现死树时通知"}}],
+                                    "label": "仅在发现问题时通知"}}],
                             },
                         ],
                     },
@@ -576,7 +1078,7 @@ class StrmEmptyDirMonitor(_PluginBase):
                                     "component": "VTextField",
                                     "props": {
                                         "model": "cron",
-                                        "label": "扫描周期",
+                                        "label": "巡检周期",
                                         "placeholder": "5位cron表达式",
                                         "hint": DEFAULT_CRON,
                                         "persistent-hint": True,
@@ -592,13 +1094,79 @@ class StrmEmptyDirMonitor(_PluginBase):
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [{"component": "VSwitch", "props": {
-                                    "model": "dry_run", "label": "清理时只预览不删除"}}],
+                                    "model": "check_115", "label": "启用 115 分享检测"}}],
                             },
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [{"component": "VSwitch", "props": {
-                                    "model": "run_once", "label": "立即扫描一次"}}],
+                                    "model": "check_115_on_cron",
+                                    "label": "定时任务里也检测 115"}}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{"component": "VSwitch", "props": {
+                                    "model": "dry_run", "label": "清理时只预览不删除"}}],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "check_concurrency",
+                                        "label": "115 检测并发数",
+                                        "placeholder": str(DEFAULT_CONCURRENCY),
+                                        "hint": "1~16，太大容易被 115 风控，建议 3~5",
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "check_timeout",
+                                        "label": "115 请求超时（秒）",
+                                        "placeholder": str(DEFAULT_TIMEOUT),
+                                        "hint": "3~120",
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "cookie_115",
+                                        "label": "115 Cookie（可选）",
+                                        "placeholder": "留空 = 匿名检测",
+                                        "hint": "实测匿名与带 Cookie 结果一致；"
+                                                "填写可略微降低风控概率",
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{"component": "VSwitch", "props": {
+                                    "model": "run_once", "label": "立即巡检一次"}}],
                             },
                         ],
                     },
@@ -612,12 +1180,18 @@ class StrmEmptyDirMonitor(_PluginBase):
             "exclude": DEFAULT_EXCLUDE,
             "cron": DEFAULT_CRON,
             "dry_run": False,
+            "check_115": True,
+            "check_115_on_cron": True,
+            "check_concurrency": DEFAULT_CONCURRENCY,
+            "check_timeout": DEFAULT_TIMEOUT,
+            "cookie_115": "",
             "run_once": False,
         }
 
     def get_page(self) -> List[dict]:
         """返回插件详情页组件树。"""
         result = self._last_result or {}
+        check = self._last_check or {}
         page: List[dict] = []
 
         page.append({"component": "VAlert", "props": {
@@ -625,69 +1199,202 @@ class StrmEmptyDirMonitor(_PluginBase):
             "class": "mb-2",
             "text": f"扫描路径 {self._scan_path} ｜ 周期 {self._cron} ｜ "
                     f"排除 {self._exclude or '(无)'} ｜ "
+                    f"115 检测 {'开' if self._check_115 else '关'}"
+                    f"（并发 {self._check_concurrency}） ｜ "
                     f"清理模式 {'预览（不删）' if self._dry_run else '实际执行'}",
         }})
 
         if not self._enabled:
             page.append({"component": "VAlert", "props": {
                 "type": "warning", "variant": "tonal", "class": "mb-2",
-                "text": "插件未启用，定时扫描不会执行（详情页的手动按钮仍可用）。",
+                "text": "插件未启用，定时巡检不会执行（详情页的手动按钮仍可用）。",
             }})
 
-        if not result:
+        if not result and not check:
             page.append({"component": "VAlert", "props": {
                 "type": "info", "variant": "tonal", "class": "mb-2",
-                "text": "尚未扫描过。点下面的「立即扫描」跑一次。",
+                "text": "尚未巡检过。建议点「组合巡检」（先检测 115 链接、再查空目录）。",
             }})
-        elif not result.get("exists"):
+        elif not result.get("exists", True) or (check and not check.get("exists", True)):
             page.append({"component": "VAlert", "props": {
                 "type": "error", "variant": "tonal", "class": "mb-2",
-                "text": f"扫描路径不存在：{result.get('root')}。"
+                "text": f"扫描路径不存在：{result.get('root') or check.get('root')}。"
                         f"该路径需要在 moviepilot 容器的 compose 里挂载后才能扫描。",
             }})
 
-        # 操作行
+        # ---- 操作行：第一排是 115 检测，第二排是空目录（呼应「先测链接再查目录」）
+        page.append({
+            "component": "VRow",
+            "props": {"dense": True, "class": "mb-1"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 4},
+                 "content": [_inspect_btn()]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4},
+                 "content": [_check115_btn(self._check_115)]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4},
+                 "content": [_clean_invalid_btn((check.get("share_invalid") or 0)
+                                                if check else 0)]},
+            ],
+        })
         page.append({
             "component": "VRow",
             "props": {"dense": True, "class": "mb-2"},
             "content": [
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [_scan_btn()]},
-                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                    _clean_all_btn(len(result.get("dead_roots") or []))]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4},
+                 "content": [_scan_btn()]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4},
+                 "content": [_clean_all_btn(len(result.get("dead_roots") or []))]},
             ],
         })
 
-        # 汇总
-        if result:
-            errors = result.get("errors") or []
-            summ = (
-                f"最近扫描：{result.get('time') or '—'} ｜ "
-                f"目录 {result.get('total_dirs', 0):,} ｜ 文件 {result.get('total_files', 0):,} ｜ "
-                f".strm {result.get('strm_files', 0):,} ｜ "
-                f"排除目录 {result.get('excluded_dirs', 0):,}"
-            )
-            page.append({"component": "VAlert", "props": {
-                "type": "success" if not errors else "warning",
-                "variant": "tonal", "density": "comfortable", "class": "mb-2",
-                "text": summ + (f" ｜ 权限错误 {len(errors)}" if errors else " ｜ 权限错误 0"),
-            }})
+        # ---- 115 检测区块
+        page.extend(self.__render_check_block(check))
 
-            roots = result.get("dead_roots") or []
-            head_type = "error" if roots else "success"
-            head_text = (f"发现 {len(roots)} 个死树目录（整棵子树不含 .strm）"
-                         if roots else "没有发现死树目录，媒体库是干净的。")
-            page.append({"component": "VAlert", "props": {
-                "type": head_type, "variant": "tonal", "density": "comfortable",
-                "class": "mb-2", "text": head_text,
-            }})
+        # ---- 空目录区块
+        page.extend(self.__render_scan_block(result))
 
-            if roots:
-                page.append(self.__render_dead_list(result))
-            page.append(self.__render_clean_log())
+        page.append(self.__render_clean_log())
 
         # 右下角 56px 悬浮齿轮会扫过整页右侧，最后一块要让出通道
         _avoid_fab(page)
         return page
+
+    def __render_check_block(self, check: Dict[str, Any]) -> List[dict]:
+        """渲染 115 检测区块。"""
+        blocks: List[dict] = []
+        if not check:
+            blocks.append({"component": "VAlert", "props": {
+                "type": "info", "variant": "tonal", "density": "comfortable",
+                "class": "mb-2",
+                "text": "还没有做过 115 分享检测。点上面的「检测 115 分享」跑一次。",
+            }})
+            return blocks
+
+        if not check.get("exists"):
+            return blocks
+
+        invalid = check.get("share_invalid") or 0
+        unknown = check.get("share_unknown") or 0
+        violation = check.get("share_violation") or 0
+        valid = check.get("share_valid") or 0
+        head_type = "error" if invalid else ("warning" if unknown else "success")
+        head_text = (f"115 检测：{check.get('share_total', 0):,} 个分享中 "
+                     f"失效 {invalid:,} ｜ 未知 {unknown:,} ｜ 有效 {valid:,}"
+                     + (f" ｜ 含违规文件 {violation:,}" if violation else ""))
+        blocks.append({"component": "VAlert", "props": {
+            "type": head_type, "variant": "tonal", "density": "comfortable",
+            "class": "mb-2", "text": head_text,
+        }})
+
+        blocks.append({"component": "VAlert", "props": {
+            "type": "info", "variant": "tonal", "density": "compact", "class": "mb-2",
+            "text": f"最近检测 {check.get('time') or '—'} ｜ 耗时 {check.get('cost', 0)}s ｜ "
+                    f"扫到 .strm {check.get('strm_total', 0):,} 个"
+                    f"（其中 115 格式 {check.get('strm_115', 0):,}） ｜ "
+                    f"失效文件 {check.get('strm_invalid', 0):,} 个",
+        }})
+
+        if unknown:
+            blocks.append({"component": "VAlert", "props": {
+                "type": "warning", "variant": "tonal", "density": "compact",
+                "class": "mb-2",
+                "text": f"有 {unknown} 个分享返回「未知」（115 风控或网络异常），"
+                        f"**未计入失效**。稍后重扫一遍即可。",
+            }})
+
+        blocks.extend(self.__render_pending_list(check))
+        blocks.extend(self.__render_invalid_list(check))
+        return blocks
+
+    def __render_pending_list(self, check: Dict[str, Any]) -> List[dict]:
+        """渲染「只剩失效 strm 的目录」清单。"""
+        items = check.get("pending_dead") or []
+        if not items:
+            return []
+        will_empty = sum(1 for x in items if x.get("will_empty"))
+        body: List[dict] = [{
+            "component": "div", "props": {"class": "text-subtitle-2 mb-1"},
+            "text": f"只剩失效 strm 的目录（{len(items)} 个，其中 {will_empty} 个清完就空）",
+        }, {
+            "component": "div", "props": {
+                "class": "text-caption text-medium-emphasis mb-1",
+                "text": "这些目录里有 .strm，所以「空目录巡检」抓不到；"
+                        "但里面的分享已全部失效，清掉失效文件后就会变成空目录。",
+            },
+        }]
+        for info in items[:MAX_PAGE_ROWS]:
+            body.append(_pending_row(info))
+        if len(items) > MAX_PAGE_ROWS:
+            body.append({"component": "div", "props": {
+                "class": "text-caption text-medium-emphasis",
+                "text": f"其余 {len(items) - MAX_PAGE_ROWS} 个未在页面列出。",
+            }})
+        return [{"component": "VRow", "props": {"dense": True}, "content": [
+            {"component": "VCol", "props": {"cols": 12}, "content": body}]}]
+
+    def __render_invalid_list(self, check: Dict[str, Any]) -> List[dict]:
+        """渲染失效分享清单（每个分享一行 + 单个「移除」按钮）。"""
+        shares = check.get("invalid_shares") or []
+        unknown_shares = check.get("unknown_shares") or []
+        if not shares and not unknown_shares:
+            return []
+        body: List[dict] = [{
+            "component": "div", "props": {"class": "text-subtitle-2 mb-1"},
+            "text": f"失效分享清单（{len(shares)} 条）",
+        }]
+        if not shares:
+            body.append({"component": "div", "props": {
+                "class": "text-caption text-medium-emphasis",
+                "text": "没有失效分享。",
+            }})
+        for info in shares[:MAX_PAGE_ROWS]:
+            body.append(_share_row(info))
+        if len(shares) > MAX_PAGE_ROWS:
+            body.append({"component": "div", "props": {
+                "class": "text-caption text-medium-emphasis",
+                "text": f"其余 {len(shares) - MAX_PAGE_ROWS} 条未在页面列出。",
+            }})
+        if unknown_shares:
+            body.append({"component": "div", "props": {
+                "class": "text-caption text-medium-emphasis mt-2",
+                "text": f"另有 {len(unknown_shares)} 个分享状态未知（未判定为失效）："
+                        + "、".join(f"{x.get('share_code', '')}"
+                                   for x in unknown_shares[:8]),
+            }})
+        return [{"component": "VRow", "props": {"dense": True}, "content": [
+            {"component": "VCol", "props": {"cols": 12}, "content": body}]}]
+
+    def __render_scan_block(self, result: Dict[str, Any]) -> List[dict]:
+        """渲染空目录巡检区块。"""
+        blocks: List[dict] = []
+        if not result:
+            return blocks
+
+        errors = result.get("errors") or []
+        summ = (
+            f"空目录巡检：{result.get('time') or '—'} ｜ "
+            f"目录 {result.get('total_dirs', 0):,} ｜ 文件 {result.get('total_files', 0):,} ｜ "
+            f".strm {result.get('strm_files', 0):,} ｜ "
+            f"排除目录 {result.get('excluded_dirs', 0):,}"
+        )
+        blocks.append({"component": "VAlert", "props": {
+            "type": "success" if not errors else "warning",
+            "variant": "tonal", "density": "comfortable", "class": "mb-2",
+            "text": summ + (f" ｜ 权限错误 {len(errors)}" if errors else " ｜ 权限错误 0"),
+        }})
+
+        roots = result.get("dead_roots") or []
+        head_type = "error" if roots else "success"
+        head_text = (f"发现 {len(roots)} 个死树目录（整棵子树不含 .strm）"
+                     if roots else "没有发现死树目录，媒体库是干净的。")
+        blocks.append({"component": "VAlert", "props": {
+            "type": head_type, "variant": "tonal", "density": "comfortable",
+            "class": "mb-2", "text": head_text,
+        }})
+
+        if roots:
+            blocks.append(self.__render_dead_list(result))
+        return blocks
 
     def __render_dead_list(self, result: Dict[str, Any]) -> dict:
         """渲染死树清单（每行一个路径 + 大小 + 单个「清理」按钮）。"""
@@ -744,10 +1451,12 @@ class StrmEmptyDirMonitor(_PluginBase):
 
     # ---------------------------------------------------------------- 业务
 
-    def check(self, manual: bool = False) -> Optional[Dict[str, Any]]:
-        """扫描一次并把结果落库 / 通知。
+    def check(self, manual: bool = False,
+              with_115: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+        """扫一遍空目录并落库 / 通知。
 
         :param manual: 是否由详情页按钮触发（手动触发时忽略「未启用」）
+        :param with_115: 是否连带跑 115 检测；None 表示按配置（定时任务用）
         :return: 扫描结果
         """
         if not self._enabled and not manual:
@@ -781,8 +1490,129 @@ class StrmEmptyDirMonitor(_PluginBase):
             self._last_result = result
             self.save_data(LAST_RESULT_KEY, result)
 
-            if self._notify:
-                self.__notify(result)
+        # 🔴 115 检测放在锁外：它自己不带锁、耗时长，串在锁里会把整段占死
+        want_115 = self._check_115 and (self._check_115_on_cron if with_115 is None
+                                        else bool(with_115))
+        if want_115:
+            self.check_115(manual=manual)
+
+        if self._notify:
+            self.__notify(result, self._last_check)
+        return result
+
+    def check_115(self, manual: bool = False) -> Optional[Dict[str, Any]]:
+        """检测库里所有 115 分享的有效性（只读，不做任何清理）。
+
+        :param manual: 是否由详情页按钮触发（手动触发时忽略「未启用」）
+        :return: 检测结果
+        """
+        if not self._enabled and not manual:
+            return None
+
+        with self._scan_lock:
+            root = os.path.abspath(self._scan_path)
+            logger.info(f"【strm空目录巡检】开始 115 分享检测：{root}")
+            started = datetime.now()
+
+            collect = _collect_shares(root, _parse_patterns(self._exclude))
+            shares = collect.get("shares") or {}
+
+            if not collect["exists"]:
+                logger.error(f"【strm空目录巡检】115 检测跳过：扫描路径不存在 {root}")
+                result: Dict[str, Any] = {
+                    "root": root, "exists": False, "time": _now_str(), "cost": 0.0,
+                    "strm_total": 0, "strm_115": 0, "strm_other": 0, "unreadable": 0,
+                    "share_total": 0, "share_valid": 0, "share_invalid": 0,
+                    "share_unknown": 0, "share_violation": 0,
+                    "strm_invalid": 0, "strm_unknown": 0,
+                    "invalid_shares": [], "unknown_shares": [], "violation_shares": [],
+                    "pending_dead": [], "pending_dead_will_empty": 0,
+                }
+                self._last_check = result
+                self.save_data(CHECK_RESULT_KEY, result)
+                return result
+
+            logger.info(f"【strm空目录巡检】115 检测：扫到 .strm {collect['strm_total']:,} 个，"
+                        f"其中 115 分享格式 {collect['strm_115']:,} 个，"
+                        f"去重后 {len(shares):,} 个分享，开始并发检测"
+                        f"（并发 {self._check_concurrency}）")
+            verdicts = _check_shares_concurrent(
+                shares,
+                concurrency=self._check_concurrency,
+                timeout=self._check_timeout,
+                cookie=self._cookie_115,
+            )
+
+            invalid_shares: List[Dict[str, Any]] = []
+            unknown_shares: List[Dict[str, Any]] = []
+            violation_shares: List[Dict[str, Any]] = []
+            strm_invalid = 0
+            strm_unknown = 0
+            for key, bucket in shares.items():
+                verdict = verdicts.get(key) or {"state": "unknown",
+                                                "reason": "未返回结果", "errno": None}
+                state = verdict.get("state")
+                record = {
+                    "key": key,
+                    "share_code": bucket.get("share_code", ""),
+                    "receive_code": bucket.get("receive_code", ""),
+                    "files": bucket.get("count", 0),
+                    "reason": verdict.get("reason") or "",
+                    "errno": verdict.get("errno"),
+                    "title": verdict.get("title") or "",
+                    "samples": bucket.get("samples") or [],
+                }
+                if state == "invalid":
+                    invalid_shares.append(record)
+                    strm_invalid += bucket.get("count", 0)
+                elif state == "unknown":
+                    unknown_shares.append(record)
+                    strm_unknown += bucket.get("count", 0)
+                elif verdict.get("violation"):
+                    violation_shares.append(record)
+
+            invalid_shares.sort(key=lambda x: -x["files"])
+            unknown_shares.sort(key=lambda x: -x["files"])
+            violation_shares.sort(key=lambda x: -x["files"])
+
+            pending = _find_pending_dead(collect, verdicts)
+
+            result = {
+                "root": root,
+                "exists": True,
+                "time": _now_str(),
+                "cost": round((datetime.now() - started).total_seconds(), 2),
+                "strm_total": collect["strm_total"],
+                "strm_115": collect["strm_115"],
+                "strm_other": collect["strm_other"],
+                "unreadable": collect["unreadable"],
+                "share_total": len(shares),
+                "share_valid": sum(1 for v in verdicts.values() if v.get("state") == "valid"),
+                "share_invalid": len(invalid_shares),
+                "share_unknown": len(unknown_shares),
+                "share_violation": len(violation_shares),
+                "strm_invalid": strm_invalid,
+                "strm_unknown": strm_unknown,
+                "invalid_shares": invalid_shares[:MAX_STORED_SHARES],
+                "unknown_shares": unknown_shares[:MAX_STORED_SHARES],
+                "violation_shares": violation_shares[:MAX_STORED_SHARES],
+                "pending_dead": pending["items"][:MAX_STORED_ROOTS],
+                "pending_dead_will_empty": pending["will_empty"],
+                "errors": collect.get("errors") or [],
+            }
+
+            logger.info(
+                f"【strm空目录巡检】115 检测完成：分享 {result['share_total']} / "
+                f"有效 {result['share_valid']} / 失效 {result['share_invalid']} / "
+                f"未知 {result['share_unknown']} / 含违规 {result['share_violation']} / "
+                f"失效文件 {result['strm_invalid']} / "
+                f"只剩失效的目录 {len(result['pending_dead'])} / 耗时 {result['cost']}s")
+            for info in invalid_shares[:10]:
+                logger.info(f"【strm空目录巡检】失效分享 {info['share_code']}"
+                            f"（{info['files']} 个文件）：{info['reason']}")
+
+            self._last_check = result
+            self.save_data(CHECK_RESULT_KEY, result)
             return result
 
     def clean(self, path: str = "", clean_all: bool = False) -> Dict[str, Any]:
@@ -840,38 +1670,113 @@ class StrmEmptyDirMonitor(_PluginBase):
             "time": _now_str(), "ok": ok, "skip": skip, "summary": summary,
         })
         # 清理完立刻重扫，避免页面还挂着已经不存在的目标
-        self.check(manual=True)
+        self.check(manual=True, with_115=False)
+        return {"success": True, "preview": False, "items": items, "summary": summary}
+
+    def clean_invalid(self, key: str = "", clean_all: bool = False) -> Dict[str, Any]:
+        """把失效分享对应的 ``.strm`` 移入库内回收站（**只移动、不删除**）。
+
+        :param key: 单个分享键 ``share_code|receive_code``
+        :param clean_all: 是否清理全部失效分享下的 strm
+        :return: {"success": bool, "preview": bool, "items": [...], "summary": str}
+        """
+        check = self._last_check or self.get_data(CHECK_RESULT_KEY) or {}
+        shares = check.get("invalid_shares") or []
+        root = os.path.abspath(self._scan_path or DEFAULT_SCAN_PATH)
+
+        if clean_all:
+            targets = shares
+        elif key:
+            targets = [x for x in shares if x.get("key") == key]
+            if not targets:
+                return {"success": False, "preview": False, "items": [],
+                        "summary": "没有找到该分享的最新检测结果，请先重新检测一次。"}
+        else:
+            return {"success": False, "preview": False, "items": [],
+                    "summary": "没有指定要清理的分享。"}
+
+        if not targets:
+            return {"success": False, "preview": False, "items": [],
+                    "summary": "当前没有已确认失效的分享（请先做一次 115 检测）。"}
+
+        if self._dry_run:
+            total = sum(len(x.get("samples") or []) for x in targets)
+            return {"success": True, "preview": True, "items": [],
+                    "summary": f"预览模式：{len(targets)} 个失效分享、"
+                               f"至少 {total} 个 strm 将被移入回收站，未做任何改动。"}
+
+        trash_root = os.path.join(root, TRASH_DIR_NAME,
+                                  datetime.now().strftime("%Y%m%d_%H%M%S"))
+        items: List[Dict[str, Any]] = []
+        ok = skip = 0
+        for info in targets:
+            # samples 只是「样本」，这里按样本清单移动；完整清单在检测时按分享聚合
+            for path in (info.get("samples") or []):
+                item = _move_strm_to_trash(root, path, trash_root)
+                items.append(item)
+                if item.get("ok"):
+                    ok += 1
+                else:
+                    skip += 1
+        summary = f"失效分享 {len(targets)} 个：移动 {ok} 个 .strm、跳过 {skip} 个"
+        self.__append_clean_log({
+            "time": _now_str(), "ok": ok, "skip": skip, "summary": summary,
+        })
+        logger.info(f"【strm空目录巡检】{summary}（回收站 {trash_root}）")
         return {"success": True, "preview": False, "items": items, "summary": summary}
 
     # ---------------------------------------------------------------- 内部
 
-    def __notify(self, result: Dict[str, Any]) -> None:
-        """按配置发送扫描结果通知。"""
+    def __notify(self, result: Dict[str, Any],
+                 check: Optional[Dict[str, Any]] = None) -> None:
+        """按配置发送巡检结果通知（115 检测 + 空目录）。"""
         try:
-            roots = result.get("dead_roots") or []
+            lines: List[str] = []
+
+            if check and check.get("exists"):
+                invalid = check.get("share_invalid") or 0
+                unknown = check.get("share_unknown") or 0
+                if invalid:
+                    lines.append(f"115 分享：{check.get('share_total', 0)} 个中 "
+                                 f"{invalid} 个已失效（涉及 "
+                                 f"{check.get('strm_invalid', 0)} 个 .strm）")
+                    for info in (check.get("invalid_shares") or [])[:5]:
+                        lines.append(f"· {info.get('share_code')}"
+                                     f"（{info.get('files')} 文件）：{info.get('reason')}")
+                    if invalid > 5:
+                        lines.append(f"…… 其余 {invalid - 5} 个见插件详情页")
+                elif unknown:
+                    lines.append(f"115 分享：{check.get('share_total', 0)} 个全部未判定，"
+                                 f"其中 {unknown} 个返回未知（疑似风控），建议稍后重扫。")
+                elif check.get("share_total"):
+                    lines.append(f"115 分享：{check.get('share_total', 0)} 个全部有效。")
+
             if not result.get("exists"):
                 self.post_message(
                     mtype=NotificationType.SiteMessage,
-                    title="【strm空目录巡检】",
-                    text=f"扫描路径不存在：{result.get('root')}\n"
-                         f"该目录需要在 moviepilot 容器的 compose 里挂载。",
+                    title="【strm库巡检】",
+                    text="扫描路径不存在：{}\n该目录需要在 moviepilot 容器的 compose 里挂载。"
+                    .format(result.get("root")),
                 )
                 return
-            if not roots and self._notify_only_when_found:
-                return
 
+            roots = result.get("dead_roots") or []
             if roots:
-                preview = "\n".join(f"· {p}" for p in roots[:5])
-                more = f"\n…… 其余 {len(roots) - 5} 个见插件详情页" if len(roots) > 5 else ""
-                text = (f"发现 {len(roots)} 个死树目录（整棵子树不含 .strm）：\n"
-                        f"{preview}{more}\n\n"
-                        f"清理请到插件详情页手动执行。")
-            else:
-                text = "没有发现死树目录，媒体库是干净的。"
+                lines.append(f"空目录：{len(roots)} 个死树目录（整棵子树不含 .strm）")
+                lines.extend(f"· {p}" for p in roots[:5])
+                if len(roots) > 5:
+                    lines.append(f"…… 其余 {len(roots) - 5} 个见插件详情页")
 
+            if not lines:
+                if self._notify_only_when_found:
+                    return
+                lines.append("没有发现问题，媒体库是干净的。")
+
+            lines.append("")
+            lines.append("清理请到插件详情页手动执行。")
             self.post_message(mtype=NotificationType.SiteMessage,
-                              title="【strm空目录巡检】", text=text)
-        except Exception as err:  # noqa: BLE001 - 通知失败不能影响扫描结果落库
+                              title="【strm库巡检】", text="\n".join(lines))
+        except Exception as err:  # noqa: BLE001 - 通知失败不能影响结果落库
             logger.error(f"【strm空目录巡检】发送通知失败：{err}")
 
     def __append_clean_log(self, entry: Dict[str, Any]) -> None:
@@ -889,16 +1794,63 @@ class StrmEmptyDirMonitor(_PluginBase):
 
 
 def _scan_btn() -> dict:
-    """「立即扫描」按钮。"""
+    """「扫描空目录」按钮。"""
     return {
         "component": "VBtn",
         "props": {"size": "small", "color": "primary", "variant": "tonal",
                   "prepend-icon": "mdi-magnify", "style": "flex:0 0 auto;"},
-        "text": "立即扫描",
+        "text": "扫空目录",
         "events": {"click": {
             "api": f"plugin/{_PLUGIN_ID}/scan",
             "method": "get",
             "params": {"apikey": settings.API_TOKEN},
+        }},
+    }
+
+
+def _inspect_btn() -> dict:
+    """「组合巡检」按钮（先测 115 再查空目录）。"""
+    return {
+        "component": "VBtn",
+        "props": {"size": "small", "color": "primary", "variant": "flat",
+                  "prepend-icon": "mdi-playlist-check", "style": "flex:0 0 auto;"},
+        "text": "组合巡检",
+        "events": {"click": {
+            "api": f"plugin/{_PLUGIN_ID}/inspect",
+            "method": "get",
+            "params": {"apikey": settings.API_TOKEN},
+        }},
+    }
+
+
+def _check115_btn(enabled: bool) -> dict:
+    """「检测 115 分享」按钮。"""
+    return {
+        "component": "VBtn",
+        "props": {"size": "small", "color": "indigo", "variant": "tonal",
+                  "prepend-icon": "mdi-link-variant",
+                  "disabled": not enabled, "style": "flex:0 0 auto;"},
+        "text": "检测 115 分享",
+        "events": {"click": {
+            "api": f"plugin/{_PLUGIN_ID}/check115",
+            "method": "get",
+            "params": {"apikey": settings.API_TOKEN},
+        }},
+    }
+
+
+def _clean_invalid_btn(count: int) -> dict:
+    """「清理失效 strm」按钮（移入回收站）。"""
+    return {
+        "component": "VBtn",
+        "props": {"size": "small", "color": "deep-orange", "variant": "tonal",
+                  "prepend-icon": "mdi-broom",
+                  "disabled": count <= 0, "style": "flex:0 0 auto;"},
+        "text": f"清理失效（{count}）",
+        "events": {"click": {
+            "api": f"plugin/{_PLUGIN_ID}/clean_invalid",
+            "method": "get",
+            "params": {"apikey": settings.API_TOKEN, "all": "1"},
         }},
     }
 
@@ -910,7 +1862,7 @@ def _clean_all_btn(count: int) -> dict:
         "props": {"size": "small", "color": "error", "variant": "tonal",
                   "prepend-icon": "mdi-delete-sweep", "disabled": count <= 0,
                   "style": "flex:0 0 auto;"},
-        "text": f"清理全部（{count}）",
+        "text": f"清理空目录（{count}）",
         "events": {"click": {
             "api": f"plugin/{_PLUGIN_ID}/clean",
             "method": "get",
@@ -971,6 +1923,119 @@ def _dead_row(path: str, info: Dict[str, Any]) -> dict:
                     "api": f"plugin/{_PLUGIN_ID}/clean",
                     "method": "get",
                     "params": {"apikey": settings.API_TOKEN, "path": path},
+                }},
+            },
+        ],
+    }
+
+
+def _pending_row(info: Dict[str, Any]) -> dict:
+    """「只剩失效 strm 的目录」一行。"""
+    will_empty = bool(info.get("will_empty"))
+    strm = info.get("strm", 0)
+    other = info.get("other", 0)
+    if will_empty:
+        tag_text = f"{strm} 个失效 strm · 清完即空"
+        tag_color = "#C62828"
+    else:
+        tag_text = f"{strm} 个失效 strm · 另有 {other} 个其它文件"
+        tag_color = "#E08A17"
+    return {
+        "component": "div",
+        "props": {
+            "style": "display:flex; align-items:center; gap:8px; "
+                     "padding:6px 0; border-bottom:1px solid "
+                     "rgba(var(--v-border-color), var(--v-border-opacity)); "
+                     f"padding-right:{_FAB_CHANNEL}px;",
+        },
+        "content": [
+            {
+                "component": "div",
+                "props": {"style": "flex:1 1 auto; min-width:0;"},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "text-body-2 text-truncate",
+                                  "style": "min-width:0;",
+                                  "title": info.get("path") or ""},
+                        "text": info.get("rel") or info.get("path") or "",
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption",
+                                  "style": "display:block; margin-top:2px;"},
+                        "content": [
+                            {"component": "span",
+                             "props": {"style": f"color:{tag_color}; font-weight:600;"},
+                             "text": tag_text},
+                            {"component": "span",
+                             "props": {"style": "color:rgba(var(--v-theme-on-surface),0.62);"},
+                             "text": f"　涉及分享 {info.get('shares', 0)} 个"},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def _share_row(info: Dict[str, Any]) -> dict:
+    """失效分享一行（上行分享码 + 移除按钮，下行文件数与原因）。"""
+    files = info.get("files", 0)
+    code = info.get("share_code", "")
+    receive = info.get("receive_code", "")
+    errno = info.get("errno")
+
+    meta = f"{files} 个文件"
+    if receive:
+        meta += f"　提取码 {receive}"
+    if errno not in (None, ""):
+        meta += f"　errno {errno}"
+
+    return {
+        "component": "div",
+        "props": {
+            "style": "display:flex; align-items:center; gap:8px; "
+                     "padding:6px 0; border-bottom:1px solid "
+                     "rgba(var(--v-border-color), var(--v-border-opacity)); "
+                     f"padding-right:{_FAB_CHANNEL}px;",
+        },
+        "content": [
+            {
+                "component": "div",
+                "props": {"style": "flex:1 1 auto; min-width:0;"},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "text-body-2 text-truncate",
+                                  "style": "min-width:0;",
+                                  "title": info.get("samples") and
+                                  (info.get("samples") or [""])[0] or code},
+                        "content": [
+                            {"component": "span",
+                             "props": {"style": "font-weight:600;"}, "text": code},
+                            {"component": "span",
+                             "props": {"style": "opacity:0.7;"},
+                             "text": f"　{info.get('reason') or '已失效'}"},
+                        ],
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption",
+                                  "style": "display:block; margin-top:2px; opacity:0.72;"},
+                        "text": meta,
+                    },
+                ],
+            },
+            {
+                "component": "VBtn",
+                "props": {"size": "x-small", "color": "deep-orange", "variant": "text",
+                          "style": "flex:0 0 auto;"},
+                "text": "移除",
+                "events": {"click": {
+                    "api": f"plugin/{_PLUGIN_ID}/clean_invalid",
+                    "method": "get",
+                    "params": {"apikey": settings.API_TOKEN, "key": info.get("key", "")},
                 }},
             },
         ],
