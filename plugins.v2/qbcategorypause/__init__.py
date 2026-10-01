@@ -52,8 +52,9 @@ MIGRATE_STATE_COLORS = {
 }
 
 # 迁移队列里最多保留多少条「已结束」（done / failed）历史记录。
-# 渲染层本来就只展示最近 20 条，存储层也要收敛，否则队列会随版本无限膨胀。
-MIGRATE_KEEP_FINISHED = 50
+# 采用**覆盖模式**：满了之后新记录挤掉最旧的，队列长度恒定在这个数。
+# 渲染层也只取最近同样多条（见 __render_migrate_jobs），两边口径保持一致。
+MIGRATE_KEEP_FINISHED = 20
 
 # 🔴 迁移前的空间校验余量（字节）。
 # 判断「装得下」用的是 `剩余空间 - 本次需要 >= MIGRATE_SPACE_RESERVE`，
@@ -124,7 +125,7 @@ _PAGE_GAP = 14
 _PAGE_FAB_CHANNEL = 68
 
 # 完成态在队列里最多平铺几条，其余折成一行汇总（D4 的核心）
-_PAGE_DONE_PREVIEW = 3
+_PAGE_DONE_PREVIEW = 5
 
 # 徽章配色（自带底色，不依赖面板主题）
 _PAGE_CHIP = {
@@ -572,7 +573,7 @@ class QbCategoryPause(_PluginBase):
     # 插件图标
     plugin_icon = "Qbittorrent_A.png"
     # 插件版本
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -2029,12 +2030,14 @@ class QbCategoryPause(_PluginBase):
                               message=f"源路径不存在：{src_mp or '无法定位种子内容'}")
             return
 
-        # 源路径正好就是主目标下的同名位置时，搬了等于原地不动
+        # 源路径正好就是主目标下的同名位置时，搬了等于原地不动。
+        # ⚠️ 这是「无事可做」而不是「出错」—— 记成 done，别去占顶部那个失败计数，
+        #    否则用户看到红字「失败 N」会以为插件坏了（1.7.1 修正）。
         primary_mp = self.__map_qb_path(self._migrate_target)
         if os.path.abspath(src_mp) == os.path.abspath(
                 os.path.join(primary_mp, os.path.basename(src_mp.rstrip("/")))):
-            self.__update_job(torrent_hash, state="failed",
-                              message="源路径与主目标路径相同，无需迁移")
+            self.__update_job(torrent_hash, state="done",
+                              message="无需迁移：源已在主目标位置")
             return
 
         # ① 空间校验：剩余空间必须大于本次迁移所需（并留安全余量），
@@ -2051,8 +2054,9 @@ class QbCategoryPause(_PluginBase):
         # 一律用种子名的话，真单文件会变成「无扩展名的裸文件」，校验必然失败。
         dst_mp = os.path.join(target_mp, os.path.basename(src_mp.rstrip("/")))
         if os.path.abspath(src_mp) == os.path.abspath(dst_mp):
-            self.__update_job(torrent_hash, state="failed",
-                              message="源路径与选中的目标路径相同，无需迁移")
+            # 同上：无事可做 = done，不计入失败
+            self.__update_job(torrent_hash, state="done",
+                              message="无需迁移：源已在选中的目标位置")
             return
 
         # ② 复制（复用空间校验时已扫好的文件清单，不重复遍历目录）
@@ -2307,7 +2311,7 @@ class QbCategoryPause(_PluginBase):
         病根不是行高，是**信息重复**。所以这里按状态分流：
 
           · 失败 / 进行中 → 两行（种子名 + 原因或落地位置），进度只留百分比；
-          · 完成态       → 一行 36px，只留名字 + 徽章 + 百分比，最多平铺 3 条；
+          · 完成态       → 一行 36px，只留名字 + 徽章 + 百分比，最多平铺 5 条；
           · 其余完成态   → 折成一条绿色汇总行（「✓ 其余 N 条已完成 · 最近：…」）。
 
         折叠行是**静态文案**，没有做「点击展开」：面板的页面树没有可用的展开组件，
