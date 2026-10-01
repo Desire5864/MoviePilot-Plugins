@@ -33,6 +33,21 @@
     ``get_service()`` 抛 ``unexpected keyword argument 'cron'``、**定时任务静默不注册**
     （页面正常、只有日志一条 ERROR）。正确做法见 :func:`_cron_kwargs`。
 
+🔴 「清理失效点了像没反应」的坑（1.1.2 修，2026-10-01 用户实测反馈）：
+    详情页上的「失效文件 N 个 / 失效分享清单 / 只剩失效 strm 的目录」**全部来自上一次
+    检测的快照**，清理原本既不更新它们、又只搬每个分享的前 10 条样本
+    （``SAMPLE_PER_SHARE``）—— 于是 14 个文件只搬走 10 个、页面数字纹丝不动，
+    整页唯一的变化是页面**最底下**的「最近清理记录」多一行，用户自然认为点了没反应。
+    现在的做法：清理时**按需重扫**目标分享、把**全部** strm 都搬走
+    （``_collect_shares(capture_paths=...)``），结束后**当场扣减并回存检测快照**
+    （``__prune_after_clean``）、页面上补一条「已于 xx 清理 N 个」的绿色回执；
+    并且无论成功 / 空转 / 失败都会写一条清理记录 —— **点击必有回执**。
+
+    ⚠️ 顺带记住：MP 前端的页面事件处理器（``PluginDataDialog`` 里的 ``PageRender``）
+    是 ``try { axios... } catch(e) {}`` —— **把错误全部吞掉**，接口报错时页面上
+    一点提示都没有。所以插件侧任何“点了没反应”的排查，第一步都应该是
+    **去插件日志看那一步到底有没有执行**，而不是盯着前端。
+
 清理的三道保险（都在代码里）：
     1. 删前对每个目标**重新实时复查**，只要子树里出现任何一个 ``.strm`` 就跳过；
     2. **零文件的子树只用 ``os.rmdir``**（非空必然失败）⇒ 物理上不可能删掉文件；
@@ -48,7 +63,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode
 from urllib.request import ProxyHandler, Request, build_opener
@@ -92,8 +107,11 @@ CHECK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 # 读 .strm 时只取前 N 字节：内容就是一行 URL，远小于这个值
 STRM_READ_BYTES = 512
-# 每个分享最多保留的样本路径条数（落库体积的闸门）
+# 每个分享在「检测快照」里保留的样本路径条数（落库体积的闸门，只用于展示）
 SAMPLE_PER_SHARE = 10
+# 🔴 清理时按需重扫、每个分享最多抓多少条**完整**路径。
+#    检测阶段不抓全量（22.9 万条太占内存），只有点「清理失效」时才对目标分享抓。
+MAX_PATHS_PER_SHARE = 5000
 # 落库的失效/未知分享条数上限
 MAX_STORED_SHARES = 300
 # 单个目录最多记几个分享键（防极端情况下 dir_keys 映射膨胀）
@@ -534,7 +552,8 @@ def _read_strm_share(path: str) -> Optional[Dict[str, str]]:
     return _parse_strm_share(raw.decode("utf-8", "replace"))
 
 
-def _collect_shares(root: str, patterns: List[str]) -> Dict[str, Any]:
+def _collect_shares(root: str, patterns: List[str],
+                    capture_paths: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """遍历 strm 库，收集 115 分享并按 ``(share_code, receive_code)`` 去重。
 
     同时顺手记下每个目录的「直属 strm 数 / 直属非 strm 文件数 / 涉及的分享键」，
@@ -544,6 +563,10 @@ def _collect_shares(root: str, patterns: List[str]) -> Dict[str, Any]:
 
     :param root: 扫描根目录
     :param patterns: 排除的目录名通配列表
+    :param capture_paths: 需要**抓全量路径**的分享键集合。
+        🔴 默认 ``None`` ⇒ 每个分享只留 ``SAMPLE_PER_SHARE`` 条样本（检测阶段用，省内存）；
+        点「清理失效」时传入目标分享键，只对这几个分享抓全量 —— 这样 22.9 万条 strm
+        也不会在检测阶段常驻内存，而清理又能清干净（不再受 10 条样本上限限制）。
     :return: 采集结果字典
     """
     result: Dict[str, Any] = {
@@ -554,13 +577,15 @@ def _collect_shares(root: str, patterns: List[str]) -> Dict[str, Any]:
         "strm_other": 0,
         "unreadable": 0,
         "errors": [],
-        "shares": {},      # key -> {"share_code","receive_code","count","samples"}
+        "shares": {},      # key -> {"share_code","receive_code","count","samples","paths"}
         "dir_strm": {},    # 目录 -> 直属 .strm 数
         "dir_other": {},   # 目录 -> 直属非 .strm 文件数
         "dir_keys": {},    # 目录 -> 直属 .strm 涉及的分享键（去重、封顶）
     }
     if not result["exists"]:
         return result
+
+    capture: Set[str] = set(capture_paths or ())
 
     def _on_error(err: OSError) -> None:
         if len(result["errors"]) < 50:
@@ -601,11 +626,14 @@ def _collect_shares(root: str, patterns: List[str]) -> Dict[str, Any]:
                     "receive_code": info["receive_code"],
                     "count": 0,
                     "samples": [],
+                    "paths": [],
                 }
                 result["shares"][key] = bucket
             bucket["count"] += 1
             if len(bucket["samples"]) < SAMPLE_PER_SHARE:
                 bucket["samples"].append(path)
+            if key in capture and len(bucket["paths"]) < MAX_PATHS_PER_SHARE:
+                bucket["paths"].append(path)
             if key not in keys_here and len(keys_here) < MAX_KEYS_PER_DIR:
                 keys_here.append(key)
 
@@ -814,7 +842,7 @@ class StrmEmptyDirMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1338,6 +1366,16 @@ class StrmEmptyDirMonitor(_PluginBase):
                     f"失效文件 {check.get('strm_invalid', 0):,} 个",
         }})
 
+        # 🔴 清理过就要有回执：否则「失效文件 N 个」纹丝不动，用户会以为点了没反应。
+        if check.get("cleaned_at"):
+            blocks.append({"component": "VAlert", "props": {
+                "type": "success", "variant": "tonal", "density": "compact",
+                "class": "mb-2",
+                "text": f"已于 {check.get('cleaned_at')} 清理 "
+                        f"{check.get('cleaned_total', 0):,} 个失效 strm"
+                        f"（移入库内 @recycle）；上面这些数字已按清理结果同步扣减。",
+            }})
+
         if unknown:
             blocks.append({"component": "VAlert", "props": {
                 "type": "warning", "variant": "tonal", "density": "compact",
@@ -1720,6 +1758,18 @@ class StrmEmptyDirMonitor(_PluginBase):
     def clean_invalid(self, key: str = "", clean_all: bool = False) -> Dict[str, Any]:
         """把失效分享对应的 ``.strm`` 移入库内回收站（**只移动、不删除**）。
 
+        1.1.2 起修了两个「点了像没反应」的坑：
+
+        * **清不干净** —— 检测快照里每个分享只留 10 条样本，旧实现只搬这 10 条，
+          分享实际有 14 个文件时就剩 4 个一直挂着。现在**按需重扫**，抓目标分享的
+          **全部** strm 再搬（``capture_paths``）。
+        * **看不出变化** —— 页面上的「失效文件 N 个 / 失效分享清单 / 只剩失效 strm 的目录」
+          全部来自上一次检测的快照，清理原本不动它们，于是整页毫无变化、只有页面最底下
+          的「最近清理记录」多一行 ⇒ 用户以为没反应。现在清理完会**当场把快照里对应条目
+          扣掉并回存**（:meth:`__prune_after_clean`），页面刷新即反映真实状态。
+
+        另外：无论成功、空转还是失败，**都会往「最近清理记录」写一条**，保证点击必有回执。
+
         :param key: 单个分享键 ``share_code|receive_code``
         :param clean_all: 是否清理全部失效分享下的 strm
         :return: {"success": bool, "preview": bool, "items": [...], "summary": str}
@@ -1729,45 +1779,128 @@ class StrmEmptyDirMonitor(_PluginBase):
         root = os.path.abspath(self._scan_path or DEFAULT_SCAN_PATH)
 
         if clean_all:
-            targets = shares
+            targets = list(shares)
         elif key:
             targets = [x for x in shares if x.get("key") == key]
             if not targets:
-                return {"success": False, "preview": False, "items": [],
-                        "summary": "没有找到该分享的最新检测结果，请先重新检测一次。"}
+                return self.__clean_refuse("没有找到该分享的最新检测结果，请先重新检测一次。")
         else:
-            return {"success": False, "preview": False, "items": [],
-                    "summary": "没有指定要清理的分享。"}
+            return self.__clean_refuse("没有指定要清理的分享。")
 
         if not targets:
-            return {"success": False, "preview": False, "items": [],
-                    "summary": "当前没有已确认失效的分享（请先做一次 115 检测）。"}
+            return self.__clean_refuse(
+                "当前没有已确认失效的分享（可能已经清理完，或还没做过 115 检测）。")
+
+        target_keys = {x.get("key") for x in targets if x.get("key")}
 
         if self._dry_run:
-            total = sum(len(x.get("samples") or []) for x in targets)
-            return {"success": True, "preview": True, "items": [],
-                    "summary": f"预览模式：{len(targets)} 个失效分享、"
-                               f"至少 {total} 个 strm 将被移入回收站，未做任何改动。"}
+            total = sum(int(x.get("files") or 0) for x in targets)
+            summary = (f"预览模式：{len(targets)} 个失效分享、共 {total} 个 strm "
+                       f"将被移入回收站，未做任何改动。")
+            self.__append_clean_log({"time": _now_str(), "ok": 0, "skip": 0,
+                                     "preview": True, "summary": summary})
+            return {"success": True, "preview": True, "items": [], "summary": summary}
+
+        # ---- 按需重扫：只对目标分享抓**全量**路径（22.9 万条也不会常驻内存）
+        collect = _collect_shares(root, _parse_patterns(self._exclude),
+                                  capture_paths=target_keys)
+        bucket_map = collect.get("shares") or {}
+        plan: List[Tuple[str, str]] = []
+        for k in target_keys:
+            for p in ((bucket_map.get(k) or {}).get("paths") or []):
+                plan.append((k, p))
+        if not plan:
+            # 扫不到（库结构变了 / 分享已整批消失）→ 退回快照里的样本，至少不全无作为
+            for x in targets:
+                for p in (x.get("samples") or []):
+                    plan.append((x.get("key"), p))
+
+        if not plan:
+            summary = "重新扫描后没有找到可清理的失效 strm（可能已被清理过，或库已变化）。"
+            self.__append_clean_log({"time": _now_str(), "ok": 0, "skip": 0,
+                                     "summary": summary})
+            return {"success": True, "preview": False, "items": [], "summary": summary}
 
         trash_root = os.path.join(root, TRASH_DIR_NAME,
                                   datetime.now().strftime("%Y%m%d_%H%M%S"))
         items: List[Dict[str, Any]] = []
         ok = skip = 0
-        for info in targets:
-            # samples 只是「样本」，这里按样本清单移动；完整清单在检测时按分享聚合
-            for path in (info.get("samples") or []):
-                item = _move_strm_to_trash(root, path, trash_root)
-                items.append(item)
-                if item.get("ok"):
-                    ok += 1
-                else:
-                    skip += 1
-        summary = f"失效分享 {len(targets)} 个：移动 {ok} 个 .strm、跳过 {skip} 个"
+        moved: List[str] = []
+        per_key: Dict[str, int] = {}
+        for k, path in plan:
+            item = _move_strm_to_trash(root, path, trash_root)
+            items.append(item)
+            if item.get("ok"):
+                ok += 1
+                moved.append(os.path.realpath(path))
+                per_key[k] = per_key.get(k, 0) + 1
+            else:
+                skip += 1
+
+        summary = f"失效分享 {len(target_keys)} 个：移动 {ok} 个 .strm、跳过 {skip} 个"
+        self.__prune_after_clean(check, moved, per_key)
         self.__append_clean_log({
             "time": _now_str(), "ok": ok, "skip": skip, "summary": summary,
         })
         logger.info(f"【strm空目录巡检】{summary}（回收站 {trash_root}）")
         return {"success": True, "preview": False, "items": items, "summary": summary}
+
+    def __clean_refuse(self, summary: str) -> Dict[str, Any]:
+        """「没能开始清理」也要留一条可见记录，否则页面上看起来就是『点了没反应』。"""
+        self.__append_clean_log({"time": _now_str(), "ok": 0, "skip": 0,
+                                 "summary": summary})
+        return {"success": False, "preview": False, "items": [], "summary": summary}
+
+    def __prune_after_clean(self, check: Dict[str, Any], moved: List[str],
+                            per_key: Dict[str, int]) -> None:
+        """清理成功后，把检测快照里对应的条目**扣掉并回存**，让详情页立刻反映真实状态。
+
+        * 失效分享清单：按 ``per_key`` 减掉已清理条数，减到 0 的直接移除；
+        * 「只剩失效 strm 的目录」：按**直属** strm 数扣减（子目录的条目由它自己承载），
+          减到 0 的说明这批失效文件已清空、该目录不再属于「只剩失效 strm」，一并移除；
+        * 重算 ``share_invalid`` / ``strm_invalid`` / ``pending_dead_will_empty``。
+        """
+        if not check or not moved:
+            return
+        try:
+            moved_set = set(moved)
+
+            kept: List[Dict[str, Any]] = []
+            for info in (check.get("invalid_shares") or []):
+                gone = per_key.get(info.get("key"), 0)
+                if gone:
+                    info = dict(info)
+                    info["files"] = max(0, int(info.get("files") or 0) - gone)
+                    info["samples"] = [p for p in (info.get("samples") or [])
+                                       if os.path.realpath(p) not in moved_set]
+                if int(info.get("files") or 0) <= 0:
+                    continue
+                kept.append(info)
+            check["invalid_shares"] = kept
+            check["share_invalid"] = len(kept)
+            check["strm_invalid"] = sum(int(x.get("files") or 0) for x in kept)
+
+            pending: List[Dict[str, Any]] = []
+            for info in (check.get("pending_dead") or []):
+                d = os.path.realpath(info.get("path") or "")
+                if not d:
+                    continue
+                gone = sum(1 for p in moved_set if os.path.dirname(p) == d)
+                info = dict(info)
+                info["strm"] = max(0, int(info.get("strm") or 0) - gone)
+                if info["strm"] <= 0:
+                    continue
+                pending.append(info)
+            check["pending_dead"] = pending
+            check["pending_dead_will_empty"] = sum(
+                1 for x in pending if x.get("will_empty"))
+
+            check["cleaned_at"] = _now_str()
+            check["cleaned_total"] = int(check.get("cleaned_total") or 0) + len(moved)
+            self._last_check = check
+            self.save_data(CHECK_RESULT_KEY, check)
+        except Exception as err:  # noqa: BLE001 - 扣减失败不能影响清理结果本身
+            logger.error(f"【strm空目录巡检】清理后同步检测快照失败：{err}")
 
     # ---------------------------------------------------------------- 内部
 
