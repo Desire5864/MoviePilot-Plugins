@@ -48,6 +48,13 @@
     一点提示都没有。所以插件侧任何“点了没反应”的排查，第一步都应该是
     **去插件日志看那一步到底有没有执行**，而不是盯着前端。
 
+🔴 快照扣减的对账口径（1.1.3 修）：清理后回写快照时，**以清理那一刻重扫实测的条数为基准**
+    （``clean_invalid`` 里的 ``before_map``），**不要拿快照里的 ``files`` 去减**。
+    因为快照是上一次检测拍的、随时可能过期：假设快照记「某分享 14 个失效 strm」，
+    而这期间别人手清只剩 4 个，若按快照扣就变成 14-4=10 —— 页面上会**永久留 10 条残影**，
+    再次表现为「清了但没变化」。同理，「只剩失效 strm 的目录」优先按快照里的 ``keys``
+    判定（涉及的失效分享全清空 → 该目录直接移除），比按 strm 数硬扣更贴合语义。
+
 清理的三道保险（都在代码里）：
     1. 删前对每个目标**重新实时复查**，只要子树里出现任何一个 ``.strm`` 就跳过；
     2. **零文件的子树只用 ``os.rmdir``**（非空必然失败）⇒ 物理上不可能删掉文件；
@@ -813,6 +820,7 @@ def _find_pending_dead(collect: Dict[str, Any],
             "rel": os.path.relpath(path, root) if root else path,
             "strm": dir_strm.get(path, 0),
             "shares": len(keys),
+            "keys": list(keys),      # 清理后按「涉及的分享是否都清空」判定该目录去留
             "other": other,
             "will_empty": other == 0,
         })
@@ -842,7 +850,7 @@ class StrmEmptyDirMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1768,6 +1776,9 @@ class StrmEmptyDirMonitor(_PluginBase):
           的「最近清理记录」多一行 ⇒ 用户以为没反应。现在清理完会**当场把快照里对应条目
           扣掉并回存**（:meth:`__prune_after_clean`），页面刷新即反映真实状态。
 
+        1.1.3 起对账口径修正：扣减快照时以**重扫实测数**为准（见 ``before_map``），
+        而不是快照里的 ``files`` —— 否则快照过期时会留下永远扣不掉的残影。
+
         另外：无论成功、空转还是失败，**都会往「最近清理记录」写一条**，保证点击必有回执。
 
         :param key: 单个分享键 ``share_code|receive_code``
@@ -1805,6 +1816,9 @@ class StrmEmptyDirMonitor(_PluginBase):
         collect = _collect_shares(root, _parse_patterns(self._exclude),
                                   capture_paths=target_keys)
         bucket_map = collect.get("shares") or {}
+        # 重扫实测数 —— 清理后以它为准对账，**不信快照里可能已经过期的 files 数**
+        before_map = {k: int((bucket_map.get(k) or {}).get("count") or 0)
+                      for k in target_keys}
         plan: List[Tuple[str, str]] = []
         for k in target_keys:
             for p in ((bucket_map.get(k) or {}).get("paths") or []):
@@ -1838,7 +1852,7 @@ class StrmEmptyDirMonitor(_PluginBase):
                 skip += 1
 
         summary = f"失效分享 {len(target_keys)} 个：移动 {ok} 个 .strm、跳过 {skip} 个"
-        self.__prune_after_clean(check, moved, per_key)
+        self.__prune_after_clean(check, moved, per_key, before_map)
         self.__append_clean_log({
             "time": _now_str(), "ok": ok, "skip": skip, "summary": summary,
         })
@@ -1852,12 +1866,17 @@ class StrmEmptyDirMonitor(_PluginBase):
         return {"success": False, "preview": False, "items": [], "summary": summary}
 
     def __prune_after_clean(self, check: Dict[str, Any], moved: List[str],
-                            per_key: Dict[str, int]) -> None:
+                            per_key: Dict[str, int],
+                            before_map: Dict[str, int]) -> None:
         """清理成功后，把检测快照里对应的条目**扣掉并回存**，让详情页立刻反映真实状态。
 
-        * 失效分享清单：按 ``per_key`` 减掉已清理条数，减到 0 的直接移除；
-        * 「只剩失效 strm 的目录」：按**直属** strm 数扣减（子目录的条目由它自己承载），
-          减到 0 的说明这批失效文件已清空、该目录不再属于「只剩失效 strm」，一并移除；
+        * 失效分享清单：以**重扫实测数** ``before_map`` 为基准扣减，减到 0 的直接移除。
+          🔴 为什么不信快照里的 ``files``：快照是上一次检测时拍的，可能已经过期
+          （例如快照记 14、期间别人手清只剩 4，若按快照扣 4 就会留 10 条残影），
+          而 ``before_map`` 是清理这一刻现扫出来的真值，扣它才准。
+        * 「只剩失效 strm 的目录」：涉及的失效分享**全部清空**的目录直接移除
+          （用快照里的 ``keys`` 精确判定，比按 strm 数硬扣更贴近语义）；
+          否则再按**直属** strm 数扣减，减到 0 的一并移除。
         * 重算 ``share_invalid`` / ``strm_invalid`` / ``pending_dead_will_empty``。
         """
         if not check or not moved:
@@ -1865,16 +1884,22 @@ class StrmEmptyDirMonitor(_PluginBase):
         try:
             moved_set = set(moved)
 
+            cleared: Set[str] = set()
             kept: List[Dict[str, Any]] = []
             for info in (check.get("invalid_shares") or []):
-                gone = per_key.get(info.get("key"), 0)
-                if gone:
-                    info = dict(info)
-                    info["files"] = max(0, int(info.get("files") or 0) - gone)
-                    info["samples"] = [p for p in (info.get("samples") or [])
-                                       if os.path.realpath(p) not in moved_set]
-                if int(info.get("files") or 0) <= 0:
+                k = info.get("key")
+                gone = per_key.get(k, 0)
+                # 目标分享用重扫实测数，非目标分享退回快照里的 files
+                base = int(before_map.get(k, info.get("files") or 0))
+                left = max(0, base - gone)
+                if left <= 0:
+                    if k:
+                        cleared.add(k)
                     continue
+                info = dict(info)
+                info["files"] = left
+                info["samples"] = [p for p in (info.get("samples") or [])
+                                   if os.path.realpath(p) not in moved_set]
                 kept.append(info)
             check["invalid_shares"] = kept
             check["share_invalid"] = len(kept)
@@ -1884,6 +1909,10 @@ class StrmEmptyDirMonitor(_PluginBase):
             for info in (check.get("pending_dead") or []):
                 d = os.path.realpath(info.get("path") or "")
                 if not d:
+                    continue
+                keys = info.get("keys")
+                if keys and all(k in cleared for k in keys):
+                    # 这个目录涉及的失效分享都清空了 → 它不再「只剩失效 strm」，移除
                     continue
                 gone = sum(1 for p in moved_set if os.path.dirname(p) == d)
                 info = dict(info)
