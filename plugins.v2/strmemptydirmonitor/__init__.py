@@ -27,6 +27,12 @@
       "服务器开小差了"），**绝不能当成分享失效** —— 一律记为「未知」。
     * 必须**绕开系统代理**直连 115，走代理会被拒或超时。
 
+🔴 定时任务注册的坑（1.0.0 翻过，1.1.1 修）：
+    MoviePilot 的 scheduler 对 ``trigger="cron"`` 是 ``CronTrigger(**kwargs)``，
+    kwargs 必须是 APScheduler 的字段名。传 ``{"cron": "0 30 3 * * *"}`` 会让
+    ``get_service()`` 抛 ``unexpected keyword argument 'cron'``、**定时任务静默不注册**
+    （页面正常、只有日志一条 ERROR）。正确做法见 :func:`_cron_kwargs`。
+
 清理的三道保险（都在代码里）：
     1. 删前对每个目标**重新实时复查**，只要子树里出现任何一个 ``.strm`` 就跳过；
     2. **零文件的子树只用 ``os.rmdir``**（非空必然失败）⇒ 物理上不可能删掉文件；
@@ -141,6 +147,35 @@ def _is_excluded(name: str, patterns: List[str]) -> bool:
         if fnmatch.fnmatchcase(name, pat):
             return True
     return False
+
+
+def _cron_kwargs(expr: str) -> Dict[str, str]:
+    """把 cron 表达式转成 APScheduler ``CronTrigger`` 的关键字参数。
+
+    🔴 **这是踩过的坑，别改回去**：MoviePilot 的 scheduler 对
+    ``trigger="cron"`` 走的是 ``CronTrigger(**kwargs)``，所以 kwargs 必须是
+    APScheduler 自己的字段名（``second`` / ``minute`` / ``hour`` / ``day`` /
+    ``month`` / ``day_of_week``）。如果图省事传 ``{"cron": "0 30 3 * * *"}``，
+    注册时会直接抛 ``CronTrigger.__init__() got an unexpected keyword
+    argument 'cron'`` —— **定时任务静默注册不上**，插件看起来一切正常，
+    只有日志里一条 ERROR。1.0.0 就是这么翻的。
+
+    5 位（分 时 日 月 周）与 6 位（秒 分 时 日 月 周）都支持。
+
+    :param expr: cron 表达式
+    :return: 可直接 ``CronTrigger(**kwargs)`` 的字典
+    :raises ValueError: 位数不是 5 或 6
+    """
+    fields = str(expr or "").split()
+    if len(fields) == 5:
+        minute, hour, day, month, dow = fields
+        return {"minute": minute, "hour": hour, "day": day,
+                "month": month, "day_of_week": dow}
+    if len(fields) == 6:
+        second, minute, hour, day, month, dow = fields
+        return {"second": second, "minute": minute, "hour": hour,
+                "day": day, "month": month, "day_of_week": dow}
+    raise ValueError(f"cron 表达式需要 5 位或 6 位，当前 {len(fields)} 位：{expr!r}")
 
 
 # ----------------------------------------------------------------- 扫描核心
@@ -779,7 +814,7 @@ class StrmEmptyDirMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "world.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -902,16 +937,25 @@ class StrmEmptyDirMonitor(_PluginBase):
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册定时巡检服务。"""
-        if self._enabled and self._cron:
-            return [{
-                "id": _PLUGIN_ID,
-                "name": "strm库空目录巡检",
-                "trigger": "cron",
-                "func": self.check,
-                "kwargs": {"cron": self._cron},
-            }]
-        return []
+        """注册定时巡检服务。
+
+        🔴 kwargs 必须拆成 APScheduler 的字段名，**不能**传 ``{"cron": "..."}``
+        —— 详见 :func:`_cron_kwargs` 的说明，1.0.0 正是死在这里。
+        """
+        if not (self._enabled and self._cron):
+            return []
+        try:
+            kwargs = _cron_kwargs(self._cron)
+        except ValueError as err:
+            logger.error(f"【strm空目录巡检】定时周期不合法，定时服务未注册：{err}")
+            return []
+        return [{
+            "id": _PLUGIN_ID,
+            "name": "strm库空目录巡检",
+            "trigger": "cron",
+            "func": self.check,
+            "kwargs": kwargs,
+        }]
 
     # ------------------------------------------------------------------ API
 
