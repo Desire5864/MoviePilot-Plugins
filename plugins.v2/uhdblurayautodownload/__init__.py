@@ -1,5 +1,7 @@
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,6 +29,18 @@ DOWNLOAD_TAG = "UHD自动下载"
 # 原盘体积大、做种时间长，不限制的话很容易把上行带宽占满，
 # 因此默认给一个保守值，用户可在配置页改（0 关闭）。
 DEFAULT_UPLOAD_LIMIT_KB = 100
+
+# 并发度（v2.25.0 起）。旧实现整条链路纯串行：站点 → 每条种子的
+# 「详情页 → TMDB 简介」依次跑完，一次「立即执行」实测 49 秒里有
+# 39 秒纯粹在等单个 HTTP 响应（站点列表页 17.3 秒 + 详情页 25 秒）。
+# 这里只把「纯网络等待」的部分并发化，站点顺序、逐条判定顺序、
+# 落库顺序全部保持原样（详见 __collect_sites_parallel / __prefetch_extras）。
+SITE_FETCH_WORKERS = 5    # 站点列表页并发数（站点数一般不超过 5，等于全并行）
+EXTRA_FETCH_WORKERS = 6   # 详情页 + TMDB 简介的全局并发数
+# 同一站点同时最多几个回源请求。家园等站点有偶发限流（见
+# __collect_site_torrents 里的重试说明），所以即便全局并发放宽，
+# 单站并发也压在 2 —— 跨站点并行已经能吃掉绝大部分等待。
+EXTRA_FETCH_PER_SITE = 2
 
 # 站点阀门配置键（v2.11.0 起）：单个数组键取代「每站点一个布尔键」。
 # 元素沿用 _site_switch_key() 生成的站点键名（如 enable_ptchdbits_co），
@@ -284,7 +298,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.24.0"
+    plugin_version = "2.25.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -295,6 +309,14 @@ class UhdBlurayAutoDownload(_PluginBase):
     plugin_order = 26
     # 可使用的用户级别
     auth_level = 1
+
+    # 🔴 并发相关的两个锁刻意定义为**类属性**，不要在 init_plugin 里重建：
+    # init_plugin 每次保存配置都会被调一次，若在那里 new 一个锁，正在后台跑的
+    # 检查线程握的是旧锁对象，互斥就静默失效了。
+    #   _run_lock   防止「立即执行」与定时任务重叠跑同一轮检查（非阻塞抢锁）
+    #   _cache_lock 保护详情页 / 简介缓存与真实请求计数在并发写入下的一致性
+    _run_lock = threading.Lock()
+    _cache_lock = threading.RLock()
 
     # 站点配置：域名 -> 列表页地址、QB分类、保存路径、标签、筛选模式
     #
@@ -580,14 +602,34 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         # 立即执行一次：执行后自动关闭开关
         if self._run_once:
-            logger.info("UHD原盘自动下载：立即执行一次检查")
-            self.check_uhd()
+            # 🔴 v2.25.0：改为**后台线程**执行。
+            # 旧实现直接同步调 check_uhd()，而这一轮检查要跑 20~50 秒；
+            # init_plugin 又是在「保存配置」的 PUT 请求里被同步调用的
+            # —— 前端整段时间都在转圈（「正在保存配置…」），而真正的原因
+            # 只是服务端在等站点与 TMDB 的 HTTP 响应。
+            # 现在先把开关关掉落库、再起后台线程，保存配置立刻返回。
+            logger.info("UHD原盘自动下载：立即执行一次检查（已转后台执行，保存配置立即返回）")
             # update_config 是整键覆盖写（systemconfig.set）：
             # 必须以当前完整 config 为基底回写、仅翻转 run_once，
             # 逐字段手工枚举会在新增配置项时漏掉（v2.9.0/v2.9.1 曾因此把 push_mode 覆盖丢失）
             new_config: Dict[str, Any] = dict(config)
             new_config["run_once"] = False
+            self._run_once = False
             self.update_config(new_config)
+            threading.Thread(
+                target=self.__run_once_async,
+                name="UHD-run-once",
+                daemon=True,
+            ).start()
+
+    def __run_once_async(self) -> None:
+        """后台执行一次「立即执行」检查（保存配置不再等它）。"""
+        # 单独包一层是为了把异常吃掉：线程里抛出的异常没人接，
+        # 不接的话后台线程静默死掉，只留一行 traceback 埋在日志别处。
+        try:
+            self.check_uhd()
+        except Exception as err:
+            logger.error(f"UHD原盘自动下载：立即执行检查失败，{err}")
 
     def get_state(self) -> bool:
         """获取插件启用状态。
@@ -1816,7 +1858,12 @@ class UhdBlurayAutoDownload(_PluginBase):
         return []
 
     def check_uhd(self) -> None:
-        """检查两个站点的 UHD BluRay 原盘并推送未下载的种子。"""
+        """检查各站点的 UHD BluRay 原盘并推送未下载的种子。
+
+        外层只做前置校验与互斥，真正流程在 __check_uhd_impl。
+        互斥是必要的（v2.25.0 起）：「立即执行」现在跑在后台线程里，
+        可能与定时任务的重叠，同一批种子被判定两次就会推两遍。
+        """
         if not self._enabled:
             return
 
@@ -1824,6 +1871,16 @@ class UhdBlurayAutoDownload(_PluginBase):
             logger.warning("UHD原盘自动下载：未配置下载器，跳过检查")
             return
 
+        if not self._run_lock.acquire(blocking=False):
+            logger.warning("UHD原盘自动下载：上一轮检查尚未结束，本次跳过")
+            return
+        try:
+            self.__check_uhd_impl()
+        finally:
+            self._run_lock.release()
+
+    def __check_uhd_impl(self) -> None:
+        """检查主流程（调用方已持有 _run_lock）。"""
         self._last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # 获取下载器实例
@@ -1842,14 +1899,34 @@ class UhdBlurayAutoDownload(_PluginBase):
         all_items: List[Dict[str, Any]] = []
         downloaded_items: List[Dict[str, Any]] = []
 
+        # 本轮启用站点。顺序 = _site_configs 的声明顺序（站点顺序铁律），
+        # 并发只发生在「抓取」这一层，取到之后一律按这个顺序处理。
+        active_sites: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
         for domain, site_conf in self._site_configs.items():
             if not self._site_enabled.get(domain, True):
                 logger.info(f"UHD原盘自动下载：站点 {site_conf.get('name')} 未勾选采集，跳过")
                 continue
             # 合并表单里的「下载分类 / 路径 / 推送开关」覆盖值（v2.12.0 起）
-            eff_conf = self.__site_effective_conf(domain, site_conf)
+            active_sites.append(
+                (domain, site_conf, self.__site_effective_conf(domain, site_conf))
+            )
+
+        # 阶段一：并发抓各站列表页（旧实现串行，实测 5 站合计 17.3 秒）
+        site_torrents = self.__collect_sites_parallel(active_sites)
+
+        # 阶段二：并发预取「本轮需要回源」的详情页字段与 TMDB 简介
+        #（旧实现串行嵌在下面的逐条循环里，实测 10 条约 25 秒）。
+        # 预取结果全部落进 _detail_cache / _intro_cache，阶段三调用
+        # 那两个方法时直接命中缓存，逐条判定与推送的语义一字未改。
+        self.__prefetch_extras(active_sites, site_torrents, processed_map)
+
+        # 阶段三：按站点顺序逐条判定与推送
+        for domain, site_conf, eff_conf in active_sites:
             try:
-                items = self.__process_site(domain, eff_conf, downloader_obj, processed_map)
+                items = self.__process_site(
+                    domain, eff_conf, downloader_obj, processed_map,
+                    torrents=site_torrents.get(domain),
+                )
                 all_items.extend(items)
                 downloaded_items.extend([item for item in items if item.get("action") == "已推送"])
             except Exception as err:
@@ -2066,7 +2143,7 @@ class UhdBlurayAutoDownload(_PluginBase):
         detail_url = f"{base_url}/details.php?id={torrent_id}"
 
         for attempt in range(2):
-            self._fetch_count += 1
+            self.__bump_fetch_count()
             try:
                 res = RequestUtils(
                     ua=site.get("ua"),
@@ -2144,6 +2221,15 @@ class UhdBlurayAutoDownload(_PluginBase):
         name = re.sub(r'^\[[^\]]+\]\.?', '', name).strip()
         return name
 
+    def __bump_fetch_count(self) -> None:
+        """真实网络请求计数 +1。
+
+        v2.25.0 起详情页与 TMDB 是并发抓的，`+=` 不是原子操作，
+        不串行化偶尔会漏记（__fill_missing_subtitles 的配额就靠它）。
+        """
+        with self._cache_lock:
+            self._fetch_count += 1
+
     def __remember_detail(self, cache_key: str, subtitle: str, seed_name: str) -> None:
         """写入详情页字段缓存，并按上限淘汰最旧的记录。
 
@@ -2151,12 +2237,14 @@ class UhdBlurayAutoDownload(_PluginBase):
         :param subtitle: 完整副标题
         :param seed_name: 种子文件名
         """
-        self._detail_cache[cache_key] = {
-            "subtitle": subtitle,
-            "seed_name": seed_name,
-            "ts": time.time(),
-        }
-        self.__trim_cache(self._detail_cache, DETAIL_CACHE_LIMIT)
+        # 并发写入：写 + 淘汰必须原子（__trim_cache 会遍历整个字典）
+        with self._cache_lock:
+            self._detail_cache[cache_key] = {
+                "subtitle": subtitle,
+                "seed_name": seed_name,
+                "ts": time.time(),
+            }
+            self.__trim_cache(self._detail_cache, DETAIL_CACHE_LIMIT)
 
     @staticmethod
     def __cache_fresh(ts: Any, ttl: int) -> bool:
@@ -2207,7 +2295,7 @@ class UhdBlurayAutoDownload(_PluginBase):
             if self.__cache_fresh(cached.get("ts"), NEGATIVE_CACHE_TTL):
                 return ""
 
-        self._fetch_count += 1
+        self.__bump_fetch_count()
         try:
             meta = MetaInfo(title=title, subtitle=subtitle)
             mediainfo = MediaChain().recognize_media(meta=meta)
@@ -2237,8 +2325,10 @@ class UhdBlurayAutoDownload(_PluginBase):
         :param cache_key: 缓存键（f"{title}|{subtitle}"）
         :param text: 简介文本；空字符串表示负结果
         """
-        self._intro_cache[cache_key] = {"text": text, "ts": time.time()}
-        self.__trim_cache(self._intro_cache, INTRO_CACHE_LIMIT)
+        # 并发写入：写 + 淘汰必须原子（__trim_cache 会遍历整个字典）
+        with self._cache_lock:
+            self._intro_cache[cache_key] = {"text": text, "ts": time.time()}
+            self.__trim_cache(self._intro_cache, INTRO_CACHE_LIMIT)
 
     @staticmethod
     def __clean_intro(text: str, max_length: int = 500) -> str:
@@ -2264,14 +2354,32 @@ class UhdBlurayAutoDownload(_PluginBase):
             cleaned = cleaned[:max_length].rstrip() + "…"
         return cleaned
 
+    @staticmethod
+    def __needs_detail(record: Any) -> bool:
+        """判断一条记录是否还需要回源补详情。
+
+        口径：**同时**有完整副标题与种子标题才算齐全，缺任一项仍要回源。
+        抽成独立方法是为了让「预取」（__prefetch_extras）与「实际判定」
+        （__process_site）用的是同一个判据 —— 两处口径一旦漂移，
+        预取就会白跑（抓了用不上，或者该抓的没抓）。
+
+        :param record: 已处理记录（可能为 None）
+        :return: 需要回源返回 True
+        """
+        if not isinstance(record, dict):
+            return True
+        return not (record.get("subtitle") and record.get("qb_name"))
+
     def __process_site(self, domain: str, site_conf: Dict[str, Any], downloader_obj: Any,
-                       processed_map: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+                       processed_map: Dict[str, Dict[str, Any]],
+                       torrents: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         """处理单个站点的 UHD BluRay 列表。
 
         :param domain: 站点域名
         :param site_conf: 站点配置
         :param downloader_obj: 下载器实例
         :param processed_map: 已处理种子记录
+        :param torrents: 该站待处理种子（已由调用方抓取）；None = 本站自行抓取
         :return: 处理明细列表
         """
         site_name = site_conf.get("name") or domain
@@ -2287,7 +2395,10 @@ class UhdBlurayAutoDownload(_PluginBase):
         # latest_count 条。取数阶段不跳过任何行，也不按发布时间重排——
         # 是否已下载、是否已推送，由下面的逐条判定负责，这样插件看到的种子
         # 与站点网页逐条对应。
-        torrents = self.__collect_site_torrents(site, site_conf, site_name)
+        # v2.25.0：列表页已由 __collect_sites_parallel 并发抓好并传入；
+        # 只有 torrents 为 None（本站自行调用）时才在这里现抓。
+        if torrents is None:
+            torrents = self.__collect_site_torrents(site, site_conf, site_name)
         if not torrents:
             return items
 
@@ -2370,7 +2481,8 @@ class UhdBlurayAutoDownload(_PluginBase):
                 cached_subtitle = str(record.get("subtitle") or "")
                 cached_name = str(record.get("qb_name") or "")
                 # 两项都在记录里才可跳过抓取（缺任一项仍需回源补齐）
-                if cached_subtitle and cached_name:
+                # 判据与 __prefetch_extras 共用 __needs_detail，不要各写一份
+                if not self.__needs_detail(record):
                     item["subtitle"] = cached_subtitle
                     item["qb_name"] = cached_name
                     item["intro"] = str(record.get("intro") or "")
@@ -2656,6 +2768,137 @@ class UhdBlurayAutoDownload(_PluginBase):
             f"UHD原盘自动下载：{site_name} 取站点顺序前 {len(selected)} 个 UHD BluRay 原盘"
         )
         return selected
+
+    def __collect_sites_parallel(
+        self, active_sites: List[Tuple[str, Dict[str, Any], Dict[str, Any]]]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """并发抓取各站点的列表页（v2.25.0 起）。
+
+        只把**网络等待**并行化：每站仍走原来的 __collect_site_torrents
+        —— 同一份 URL、同一套重试、同一套解析与「取站点顺序前 N 条」口径，
+        所以每一份返回的列表与串行时逐条相同，站点顺序铁律不受影响。
+
+        :param active_sites: [(domain, 站点原始配置, 生效配置)]
+        :return: {domain: 该站待处理种子列表}；抓取失败 / 站点不存在为空列表
+        """
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        if not active_sites:
+            return result
+
+        # 站点配置先在本线程统一解析好：__get_site_config 会写站点缓存字典，
+        # 放到工作线程里并发写没有意义；先解析还能让「站点不存在」的告警
+        # 出现在并发开始之前，日志顺序更好读。
+        prepared: List[Tuple[str, Dict[str, Any], Dict[str, Any], str]] = []
+        for domain, _site_conf, eff_conf in active_sites:
+            site = self.__get_site_config(domain)
+            if not site:
+                # 具体告警由 __process_site 打（那里才是缺配置的后果发生处）
+                result[domain] = []
+                continue
+            prepared.append((domain, site, eff_conf, eff_conf.get("name") or domain))
+
+        if not prepared:
+            return result
+
+        workers = max(1, min(SITE_FETCH_WORKERS, len(prepared)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="uhd-site") as pool:
+            futures = {
+                pool.submit(self.__collect_site_torrents, site, eff_conf, site_name): domain
+                for domain, site, eff_conf, site_name in prepared
+            }
+            for future in as_completed(futures):
+                domain = futures[future]
+                try:
+                    result[domain] = future.result() or []
+                except Exception as err:
+                    logger.error(f"UHD原盘自动下载：抓取站点 {domain} 列表失败，{err}")
+                    result[domain] = []
+        return result
+
+    def __prefetch_extras(
+        self,
+        active_sites: List[Tuple[str, Dict[str, Any], Dict[str, Any]]],
+        site_torrents: Dict[str, List[Dict[str, Any]]],
+        processed_map: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """并发预取「本轮需要回源」的详情页字段与 TMDB 简介（v2.25.0 起）。
+
+        判定口径与 __process_site 完全一致（共用 __needs_detail）：
+        记录里同时有完整副标题与种子标题才算齐全，缺任一项仍需回源。
+        旧实现把这两步串行嵌在逐条循环里，是整轮耗时的大头。
+
+        :param active_sites: [(domain, 站点原始配置, 生效配置)]
+        :param site_torrents: __collect_sites_parallel 的结果
+        :param processed_map: 已处理记录（本方法只读）
+        """
+        jobs: List[Tuple[Dict[str, Any], str, str, str, str]] = []
+        site_gates: Dict[str, threading.BoundedSemaphore] = {}
+        seen: set = set()
+        for domain, _site_conf, _eff_conf in active_sites:
+            torrents = site_torrents.get(domain) or []
+            if not torrents:
+                continue
+            site = self.__get_site_config(domain)
+            if not site:
+                continue
+            for torrent in torrents:
+                torrent_id = str(torrent.get("id") or "")
+                if not torrent_id:
+                    continue
+                record_key = f"{domain}:{torrent_id}"
+                if record_key in seen:
+                    continue
+                if not self.__needs_detail(processed_map.get(record_key)):
+                    continue
+                seen.add(record_key)
+                jobs.append((
+                    site,
+                    domain,
+                    torrent_id,
+                    str(torrent.get("title") or ""),
+                    str(torrent.get("subtitle") or ""),
+                ))
+                if domain not in site_gates:
+                    site_gates[domain] = threading.BoundedSemaphore(EXTRA_FETCH_PER_SITE)
+
+        if not jobs:
+            return
+
+        def _run(job: Tuple[Dict[str, Any], str, str, str, str]) -> None:
+            # 单站并发闸门：跨站点并行已经吃掉了绝大部分等待，
+            # 单站再放宽只会去撞站点限流（家园此前就偶发过）。
+            with site_gates[job[1]]:
+                self.__fetch_item_extras(job[0], job[1], job[2], job[3], job[4])
+
+        workers = max(1, min(EXTRA_FETCH_WORKERS, len(jobs)))
+        logger.info(f"UHD原盘自动下载：预取 {len(jobs)} 条种子的详情与简介（{workers} 并发）")
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="uhd-extra") as pool:
+            futures = {
+                pool.submit(_run, job): f"{job[1]}:{job[2]}" for job in jobs
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    future.result()
+                except Exception as err:
+                    logger.error(f"UHD原盘自动下载：预取详情失败 {key}，{err}")
+
+    def __fetch_item_extras(self, site: Dict[str, Any], domain: str, torrent_id: str,
+                            title: str, fallback_subtitle: str) -> None:
+        """取回一条种子的详情页字段与 TMDB 简介（结果写进各自缓存）。
+
+        副标题回退口径与 __process_site 一致：详情页取到就用详情页的，
+        取不到才退回列表页副标题 —— 否则 TMDB 识别的入参就会与串行版不同，
+        简介缓存键随之漂移。
+
+        :param site: 站点配置
+        :param domain: 站点域名
+        :param torrent_id: 种子 ID
+        :param title: 站点种子标题
+        :param fallback_subtitle: 列表页副标题（详情页取不到时的回退值）
+        """
+        detail_subtitle, _seed_name = self.__fetch_detail_fields(site, domain, torrent_id)
+        self.__fetch_tmdb_intro(title, detail_subtitle or fallback_subtitle)
 
     def __list_qb_torrents(self) -> Optional[List[Any]]:
         """读取 QB 全部任务列表。
