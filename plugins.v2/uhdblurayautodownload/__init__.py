@@ -298,7 +298,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "2.25.0"
+    plugin_version = "2.25.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -311,8 +311,8 @@ class UhdBlurayAutoDownload(_PluginBase):
     auth_level = 1
 
     # 🔴 并发相关的两个锁刻意定义为**类属性**，不要在 init_plugin 里重建：
-    # init_plugin 每次保存配置都会被调一次，若在那里 new 一个锁，正在后台跑的
-    # 检查线程握的是旧锁对象，互斥就静默失效了。
+    # init_plugin 每次保存配置都会被调一次，若在那里 new 一个锁，正在跑的那一轮
+    # 检查（保存配置的 PUT 线程，或调度线程）握的是旧锁对象，互斥就静默失效了。
     #   _run_lock   防止「立即执行」与定时任务重叠跑同一轮检查（非阻塞抢锁）
     #   _cache_lock 保护详情页 / 简介缓存与真实请求计数在并发写入下的一致性
     _run_lock = threading.Lock()
@@ -602,34 +602,24 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         # 立即执行一次：执行后自动关闭开关
         if self._run_once:
-            # 🔴 v2.25.0：改为**后台线程**执行。
-            # 旧实现直接同步调 check_uhd()，而这一轮检查要跑 20~50 秒；
-            # init_plugin 又是在「保存配置」的 PUT 请求里被同步调用的
-            # —— 前端整段时间都在转圈（「正在保存配置…」），而真正的原因
-            # 只是服务端在等站点与 TMDB 的 HTTP 响应。
-            # 现在先把开关关掉落库、再起后台线程，保存配置立刻返回。
-            logger.info("UHD原盘自动下载：立即执行一次检查（已转后台执行，保存配置立即返回）")
-            # update_config 是整键覆盖写（systemconfig.set）：
-            # 必须以当前完整 config 为基底回写、仅翻转 run_once，
-            # 逐字段手工枚举会在新增配置项时漏掉（v2.9.0/v2.9.1 曾因此把 push_mode 覆盖丢失）
-            new_config: Dict[str, Any] = dict(config)
-            new_config["run_once"] = False
-            self._run_once = False
-            self.update_config(new_config)
-            threading.Thread(
-                target=self.__run_once_async,
-                name="UHD-run-once",
-                daemon=True,
-            ).start()
-
-    def __run_once_async(self) -> None:
-        """后台执行一次「立即执行」检查（保存配置不再等它）。"""
-        # 单独包一层是为了把异常吃掉：线程里抛出的异常没人接，
-        # 不接的话后台线程静默死掉，只留一行 traceback 埋在日志别处。
-        try:
-            self.check_uhd()
-        except Exception as err:
-            logger.error(f"UHD原盘自动下载：立即执行检查失败，{err}")
+            # 🔴 v2.25.1：改回**同步**执行（v2.25.0 曾挪到后台线程，已回退）。
+            # 取舍点：同步 = 点「保存」后 PUT 一直等到本轮检查跑完才返回，
+            # 换来的是「页面刷新时看到的就是刚跑出来的结果」；这也是 2.24.0
+            # 的老行为。并发优化（__collect_sites_parallel / __prefetch_extras）
+            # 保留，所以这段等待已从旧的 ~49 秒降到 ~13 秒。
+            logger.info("UHD原盘自动下载：立即执行一次检查")
+            try:
+                self.check_uhd()
+            finally:
+                # update_config 是整键覆盖写（systemconfig.set）：
+                # 必须以当前完整 config 为基底回写、仅翻转 run_once，
+                # 逐字段手工枚举会在新增配置项时漏掉（v2.9.0/v2.9.1 曾因此把 push_mode 覆盖丢失）
+                # 放 finally 里：即便本轮检查抛异常，开关也必须落回 False，
+                # 否则之后每次「保存配置」都会再被动触发一整轮检查。
+                new_config: Dict[str, Any] = dict(config)
+                new_config["run_once"] = False
+                self._run_once = False
+                self.update_config(new_config)
 
     def get_state(self) -> bool:
         """获取插件启用状态。
@@ -1861,8 +1851,8 @@ class UhdBlurayAutoDownload(_PluginBase):
         """检查各站点的 UHD BluRay 原盘并推送未下载的种子。
 
         外层只做前置校验与互斥，真正流程在 __check_uhd_impl。
-        互斥是必要的（v2.25.0 起）：「立即执行」现在跑在后台线程里，
-        可能与定时任务的重叠，同一批种子被判定两次就会推两遍。
+        互斥是必要的（v2.25.0 起）：「立即执行」跑在保存配置的 PUT 线程里，
+        随时可能与定时任务撞上，同一批种子被判定两次就会推两遍。
         """
         if not self._enabled:
             return
