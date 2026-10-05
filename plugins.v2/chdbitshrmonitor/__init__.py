@@ -451,7 +451,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.3"
+    plugin_version = "2.0.4"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -483,6 +483,10 @@ class ChdbitsHrMonitor(_PluginBase):
     _last_hr_count: int = 0
     # 最近一次 QB 与站点比对明细
     _last_compare_items: List[Dict[str, Any]] = []
+    # 最近一次「本地任务 × 站点记录」的互斥分配结果
+    # key = 本地任务 hash，value = (站点任务, 站点序号)
+    # None = 本轮还没算过（例如刚 reload），此时详情页回落到逐条匹配
+    _site_assignment: Optional[Dict[str, Tuple[Dict[str, Any], int]]] = None
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。
@@ -507,6 +511,7 @@ class ChdbitsHrMonitor(_PluginBase):
         self._last_hr_tasks = []
         self._last_hr_count = 0
         self._last_compare_items = []
+        self._site_assignment = None
 
         if not config:
             return
@@ -811,7 +816,16 @@ class ChdbitsHrMonitor(_PluginBase):
                 subtitle = self.__find_hr_subtitle(name)
 
             # 站点任务（存在则说明仍在保种考核中）
-            site_task, site_idx = self.__match_site_task(name)
+            # v2.0.4：优先认判定层那一轮的**互斥分配**结果，保证卡片上显示的站点
+            # 记录与实际用来判定的站点记录是同一条；分配结果为 None（刚 reload、
+            # 本轮没跑到比对）时才回落到逐条匹配。
+            site_task, site_idx = None, -1
+            if self._site_assignment is None:
+                site_task, site_idx = self.__match_site_task(name)
+            else:
+                pair = self._site_assignment.get(cmp_item.get("hash"))
+                if pair:
+                    site_task, site_idx = pair
             if site_idx >= 0:
                 matched_site.add(site_idx)
             site_title = str(site_task.get("title") or "") if site_task else ""
@@ -1478,6 +1492,21 @@ class ChdbitsHrMonitor(_PluginBase):
             if torrent_hash not in local_hashes:
                 cycle_map.pop(torrent_hash, None)
 
+        # ── 站点记录互斥分配（v2.0.4）────────────────────────────────
+        # 一条站点 H&R 记录至多归一个本地任务。逐条独立匹配会天然允许「两条本地任务
+        # 共用同一条站点记录」（2026-10-05 实测「揭秘日」与「火遮眼」即如此），
+        # 结果是两条卡片显示同一份站点数据、其中一条被当成「站点仍在考核」而永远
+        # 不进删除流程。分配结果同时供本方法与详情页展示层复用，保证显示与判定同源。
+        site_assignment, match_conflicts = self.__assign_site_tasks(
+            local_torrents, site_tasks)
+        self._site_assignment = site_assignment
+        if match_conflicts:
+            logger.warning(
+                f"彩虹岛HR监控：{len(match_conflicts)} 个本地任务的候选站点记录"
+                f"已被更优分配占用（互斥），本轮按「站点查无」处置："
+                f"{[n[:40] for n in match_conflicts]}"
+            )
+
         # ── 保险闸门 ②：匹配失效冻结 ────────────────────────────────
         # 站点与本地的标题一旦整体匹配不上，所有任务会同时变成「站点查无」，
         # 而 check_hr 里的「解析 0 条」「条数骤降」两道保护只看站点条数，
@@ -1492,7 +1521,7 @@ class ChdbitsHrMonitor(_PluginBase):
             if progress < HR_PROGRESS_THRESHOLD:
                 continue
             compared_local += 1
-            if self.__find_site_task(torrent.get("name") or "", site_tasks):
+            if torrent.get("hash") in site_assignment:
                 matched_local += 1
 
         stats = self.get_data(MATCH_STATS_DATA_KEY) or {}
@@ -1562,8 +1591,9 @@ class ChdbitsHrMonitor(_PluginBase):
                 )
                 continue
 
-            # 查找对应的站点任务，获取做种时间与 H&R 周期
-            site_task = self.__find_site_task(title, site_tasks)
+            # 取该任务在**互斥分配**里分到的站点记录（为空即「站点查无」）
+            assigned_pair = site_assignment.get(torrent_hash)
+            site_task = assigned_pair[0] if assigned_pair else None
             seeding_time = str(site_task.get("seeding_time") or "") if site_task else ""
             hr_cycle = str(site_task.get("hr_cycle") or "") if site_task else ""
             # 剩余时间 = H&R周期 - 做种时间（还差多少做种时长才达标）
@@ -2187,12 +2217,60 @@ class ChdbitsHrMonitor(_PluginBase):
             return "已达标"
         return f"{remain_hours:.1f}h"
 
+    def __score_site_task(self, normalized: str, local_tokens: List[str],
+                          local_name: str, local_sig: set,
+                          task: Dict[str, Any]) -> Optional[Tuple[int, float]]:
+        """给「一个本地任务 × 一条站点记录」这一对打分。
+
+        从 `__find_site_task` 里拆出来，供「逐条查找」与「互斥分配」共用同一套判据
+        （两边各写一份迟早会漂移）。
+
+        :param normalized: 本地标题的规范化结果
+        :param local_tokens: 本地标题切分出的词
+        :param local_name: 本地标题前 3 个词
+        :param local_sig: 本地标题的片名特征词
+        :param task: 站点 H&R 任务
+        :return: (tier, score)。tier=2 为片名快速路径（完全一致／片名相等／互含），
+                 tier=1 为兜底评分（须 ≥ 0.8 才算数）；被片名闸门拒绝时返回 None
+        """
+        site_title = self.__normalize_title(task.get("title") or "")
+        if not site_title:
+            return None
+        # 完全一致直接命中（唯一不受片名闸门约束的快路径）
+        if site_title == normalized:
+            return (2, 1.0)
+        site_tokens = site_title.split()
+        site_name = " ".join(site_tokens[:3])
+        # 片名特征必须至少有实质重合，否则只是「同规格、同发布组的另一个种子」
+        # （规格词占比过高，仅凭它们重合不足以证明是同一个种子）
+        site_sig = self.__name_signature(site_tokens)
+        if not (local_sig and site_sig and (local_sig & site_sig)):
+            return None
+        # 片名完全一致或互相包含，视为同一任务
+        if local_name and site_name and (
+            local_name == site_name
+            or local_name in site_name
+            or site_name in local_name
+        ):
+            return (2, 1.0)
+        # 兜底：按 token 交集比例评分
+        local_set = set(local_tokens)
+        site_set = set(site_tokens)
+        if not local_set or not site_set:
+            return None
+        common = local_set & site_set
+        return (1, len(common) / min(len(local_set), len(site_set)))
+
     def __find_site_task(self, local_title: str,
                          site_tasks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """根据本地任务标题查找对应的站点 H&R 任务。
 
         优先按片名（标题开头的英文词）匹配，避免因通用词（分辨率、编码等）
         导致误匹配。
+
+        注意：这里是**逐条独立**查找，只看这一个本地任务，不关心站点记录有没有
+        被别的本地任务用掉。需要「一条站点记录只归一个任务」时用
+        `__assign_site_tasks`（判定与展示都走那一份分配结果）。
 
         :param local_title: 本地任务标题
         :param site_tasks: 站点未完成 H&R 任务列表
@@ -2211,34 +2289,14 @@ class ChdbitsHrMonitor(_PluginBase):
         best_task = None
         best_score = 0.0
         for task in site_tasks:
-            site_title = self.__normalize_title(task.get("title") or "")
-            if not site_title:
+            scored = self.__score_site_task(
+                normalized, local_tokens, local_name, local_sig, task)
+            if scored is None:
                 continue
-            # 完全一致直接返回（唯一不受片名闸门约束的快路径）
-            if site_title == normalized:
+            tier, score = scored
+            if tier == 2:
+                # 片名快速路径：命中即返回（与 v2.0.3 行为完全一致）
                 return task
-            site_tokens = site_title.split()
-            site_name = " ".join(site_tokens[:3])
-            # 片名特征必须至少有实质重合，否则只是「同规格、同发布组的另一个种子」
-            # （规格词占比过高，仅凭它们重合不足以证明是同一个种子）
-            site_sig = self.__name_signature(site_tokens)
-            if not (local_sig and site_sig and (local_sig & site_sig)):
-                continue
-            # 片名完全一致，视为同一任务
-            if local_name and local_name == site_name:
-                return task
-            # 片名互相包含，视为同一任务
-            if local_name and site_name and (
-                local_name in site_name or site_name in local_name
-            ):
-                return task
-            # 兜底：按 token 交集比例评分，取最高分且需超过阈值
-            local_set = set(local_tokens)
-            site_set = set(site_tokens)
-            if not local_set or not site_set:
-                continue
-            common = local_set & site_set
-            score = len(common) / min(len(local_set), len(site_set))
             if score > best_score:
                 best_score = score
                 best_task = task
@@ -2247,6 +2305,85 @@ class ChdbitsHrMonitor(_PluginBase):
         if best_task is not None and best_score >= 0.8:
             return best_task
         return None
+
+    def __assign_site_tasks(
+        self, local_torrents: List[Any], site_tasks: List[Dict[str, Any]]
+    ) -> Tuple[Dict[Any, Tuple[Dict[str, Any], int]], List[str]]:
+        """把站点 H&R 记录**互斥**分配给本地任务（一条记录至多归一个任务）。
+
+        为什么需要：`__find_site_task` 逐条独立调用 ⇒ 天然允许「多条本地任务共用
+        同一条站点记录」。同年同规格同发布组的两部片子尤其容易踩（2.0.3 已把年份
+        剔出片名特征，但那只是堵一个口子；国家／语言标记等仍可能钻空子）。
+
+        做法：先算出所有合法的「本地 × 站点」候选，再按
+        `tier`（片名快速路径优于兜底评分）→ `score` → 「本地序号、站点序号」
+        的顺序贪心认领。先算全局再分配（而不是按本地任务顺序先到先得），
+        是为了让**最像的那一对先配上**。
+
+        安全性：被互斥挤掉的任务本轮会走「站点查无」分支，但该分支后面还有
+        「保种时长闸门」（本地做种 ≥ H&R 周期 + 余量）兜底——没做够时间的种子
+        照样不会被删，因此互斥不会造成误删。
+
+        :param local_torrents: 本地任务列表
+        :param site_tasks: 站点未完成 H&R 任务列表
+        :return: ({本地任务 hash: (站点任务, 站点序号)}, 因互斥落空的本地任务标题列表)
+        """
+        candidates: List[Tuple[int, float, int, int, Any, str]] = []
+        for seq, torrent in enumerate(local_torrents):
+            torrent_hash = torrent.get("hash")
+            if not torrent_hash:
+                continue
+            # 只有「下载进度达 HR 阈值」的任务才有资格占用站点记录：
+            # 未达阈值的任务本就不产生 H&R 记录（见主循环的安全校验），
+            # 让它们参与分配只会白白占掉别人的记录。
+            try:
+                progress = float(torrent.get("progress") or 0)
+            except (TypeError, ValueError):
+                progress = 0
+            if progress < HR_PROGRESS_THRESHOLD:
+                continue
+            normalized = self.__normalize_title(torrent.get("name") or "")
+            if not normalized:
+                continue
+            tokens = normalized.split()
+            name = " ".join(tokens[:3])
+            sig = self.__name_signature(tokens)
+            for idx, task in enumerate(site_tasks):
+                scored = self.__score_site_task(
+                    normalized, tokens, name, sig, task)
+                if scored is None:
+                    continue
+                tier, score = scored
+                if tier < 2 and score < 0.8:
+                    # 兜底评分未过阈值（与 __find_site_task 同口径）
+                    continue
+                candidates.append((tier, score, seq, idx, torrent_hash,
+                                   str(torrent.get("name") or "")))
+
+        # 全局贪心：tier 高者优先，同 tier 分数高者优先；同分按序号升序，
+        # 保证结果稳定可复现（不依赖 dict/set 的遍历顺序）。
+        candidates.sort(key=lambda c: (-c[0], -c[1], c[2], c[3]))
+        used_local: set = set()
+        used_site: set = set()
+        assigned: Dict[Any, Tuple[Dict[str, Any], int]] = {}
+        for tier, score, seq, idx, torrent_hash, _title in candidates:
+            if seq in used_local or idx in used_site:
+                continue
+            used_local.add(seq)
+            used_site.add(idx)
+            assigned[torrent_hash] = (site_tasks[idx], idx)
+
+        # 有候选、却因互斥没分到记录的任务：它们本轮会走「站点查无」，
+        # 与 v2.0.3「两条都能匹配上」的行为不同，打日志留痕便于排障。
+        conflicts: List[str] = []
+        noted: set = set()
+        for _tier, _score, seq, idx, _hash, title in candidates:
+            if seq in used_local or seq in noted:
+                continue
+            if idx in used_site:
+                noted.add(seq)
+                conflicts.append(title)
+        return assigned, conflicts
 
     @staticmethod
     def __name_signature(tokens: List[str]) -> set:
