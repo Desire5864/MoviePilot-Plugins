@@ -68,6 +68,12 @@ NAME_STOP_TOKENS = frozenset({
     "the", "a", "an", "of", "on", "in", "and", "or", "to", "for", "with",
     "at", "by", "from", "v2", "v3", "repack", "proper",
 })
+# 片名区里的纯年份 token（如 2026 / 2018）：不参与片名特征计算。
+# 它虽然出现在规格锚点之前，却完全没有区分度 —— 同一年、同规格、同发布组的
+# 两部片子能仅凭这一个词通过片名闸门，再被兜底评分判成同一个种子
+# （实测「揭秘日」与「火遮眼」共有 14 个 token、评分 0.875 ≥ 0.8，
+#   导致前者读到后者的站点做种时间，且永远不进完成流程）。v2.0.3 修。
+YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
 
 # ── 删除保险 ⑤：删除留档 ─────────────────────────────────────────
 DELETE_LOG_DATA_KEY = "hr_deleted_log"
@@ -445,7 +451,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.2"
+    plugin_version = "2.0.3"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -2258,6 +2264,9 @@ class ChdbitsHrMonitor(_PluginBase):
             if token in SPEC_ANCHOR_TOKENS:
                 break
             if token in NAME_STOP_TOKENS:
+                continue
+            # 年份不构成片名特征（见 YEAR_TOKEN_RE 说明）
+            if YEAR_TOKEN_RE.match(token):
                 continue
             signature.add(token)
         return signature
