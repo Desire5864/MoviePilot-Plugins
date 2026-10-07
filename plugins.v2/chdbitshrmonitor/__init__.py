@@ -451,7 +451,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.4"
+    plugin_version = "2.0.5"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -469,7 +469,7 @@ class ChdbitsHrMonitor(_PluginBase):
     _downloader: str = ""
     _category: str = "彩虹岛&HR"
     _hr_url: str = ""
-    _delete_delay_hours: int = 4
+    _delete_delay_hours: float = 4.0
     _fallback_cycle_hours: float = HR_DEFAULT_CYCLE_HOURS
     _interval_minutes: int = 30
     _run_once: bool = False
@@ -502,7 +502,7 @@ class ChdbitsHrMonitor(_PluginBase):
         self._downloader = ""
         self._category = "彩虹岛&HR"
         self._hr_url = ""
-        self._delete_delay_hours = 4
+        self._delete_delay_hours = 4.0
         self._fallback_cycle_hours = HR_DEFAULT_CYCLE_HOURS
         self._interval_minutes = 30
         self._run_once = False
@@ -522,9 +522,12 @@ class ChdbitsHrMonitor(_PluginBase):
         self._category = str(config.get("category") or "彩虹岛&HR").strip()
         self._hr_url = str(config.get("hr_url") or "").strip()
         try:
-            self._delete_delay_hours = max(0, int(config.get("delete_delay_hours") or 4))
+            # v2.0.5：支持小数（例如 0.5 小时）。旧版 int() 强转会把 0.5 变成 0
+            # （表现为「立刻删除」），字符串 "0.5" 则抛错回落到 4 小时，都不是本意。
+            self._delete_delay_hours = max(
+                0.0, float(config.get("delete_delay_hours") or 4))
         except (TypeError, ValueError):
-            self._delete_delay_hours = 4
+            self._delete_delay_hours = 4.0
         try:
             fallback = float(config.get("fallback_cycle_hours") or HR_DEFAULT_CYCLE_HOURS)
             self._fallback_cycle_hours = fallback if fallback > 0 else HR_DEFAULT_CYCLE_HOURS
@@ -696,7 +699,7 @@ class ChdbitsHrMonitor(_PluginBase):
                                         "props": {
                                             "model": "delete_delay_hours",
                                             "label": "完成后延迟删除（小时）",
-                                            "placeholder": "默认4，最小0",
+                                            "placeholder": "默认4，最小0，可填小数（如 0.5）",
                                             "type": "number",
                                         },
                                     }
@@ -769,7 +772,7 @@ class ChdbitsHrMonitor(_PluginBase):
             "downloader": "",
             "category": "彩虹岛&HR",
             "hr_url": "",
-            "delete_delay_hours": 4,
+            "delete_delay_hours": 4.0,
             "fallback_cycle_hours": 120,
             "interval_minutes": 30,
             "run_once": False,
@@ -1168,7 +1171,7 @@ class ChdbitsHrMonitor(_PluginBase):
                                     "variant": "tonal",
                                     "text": f"下载器：{self._downloader or '未配置'}；"
                                             f"QB分类：{self._category}；"
-                                            f"延迟删除：{self._delete_delay_hours} 小时；"
+                                            f"延迟删除：{self._delete_delay_hours:g} 小时；"
                                             f"兜底保种周期：{self._fallback_cycle_hours:g} 小时；"
                                             f"检查间隔：{self._interval_minutes} 分钟；"
                                             f"最近检查：{self._last_check_time or '尚未检查'}",
@@ -1766,7 +1769,7 @@ class ChdbitsHrMonitor(_PluginBase):
                         "local_seeding": local_seeding,
                         "remain_time": "",
                         "hr_cycle": "",
-                        "detail": f"站点已无该任务，开始计时（{self._delete_delay_hours} 小时后删除）",
+                        "detail": f"站点已无该任务，开始计时（{self._delete_delay_hours:g} 小时后删除）",
                     }
                 )
                 continue
