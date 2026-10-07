@@ -682,7 +682,7 @@ def _deleted_log_block(rows: List[Dict[str, Any]], total: int) -> dict:
     }
 
 
-# ─────────────── 详情页视图切换条（分段胶囊 · v2.0.8） ───────────────
+# ─────── 详情页视图切换条（分段胶囊 · v2.0.8，2.0.9 修字色） ───────
 # 观感对齐 iOS segmented：整条做成一个胶囊容器，选中项白底浮起。
 # 配色沿用卡片那一族（surface-variant 低透明度），视觉重量低于任务卡。
 SEG_TRACK_STYLE = (
@@ -700,11 +700,17 @@ SEG_BTN_STYLE = (
 )
 SEG_BTN_STYLE_ON = (
     " background: rgb(var(--v-theme-surface)); "
-    "color: rgb(var(--v-theme-primary)); font-weight: 700; "
+    # 🔴 必须带 !important：Vuetify 会给 VBtn 自动加 text-primary 类，
+    #    而 `.text-primary { color: rgb(var(--v-theme-primary)) !important }`
+    #    带 !important，会压过这里没加 !important 的 color（2026-10-07 真机实测）。
+    "color: rgb(var(--v-theme-primary)) !important; font-weight: 700; "
     "box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);"
 )
 SEG_BTN_STYLE_OFF = (
-    " background: transparent; color: rgba(var(--v-theme-on-surface), 0.62);"
+    # 🔴 同上：未选中是「透明底 + 62% 灰」，字色不加 !important 会被染成主色，
+    #    真机上看着像两段都是选中态（只剩底色与字重两处差异）。
+    " background: transparent; "
+    "color: rgba(var(--v-theme-on-surface), 0.62) !important;"
 )
 
 
@@ -801,7 +807,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.8"
+    plugin_version = "2.0.9"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
