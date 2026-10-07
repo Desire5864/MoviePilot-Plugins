@@ -83,6 +83,14 @@ DELETE_LOG_DATA_KEY = "hr_deleted_log"
 DELETE_LOG_LIMIT = 50        # 存储条数（保证事后可追溯）
 DELETE_LOG_DISPLAY = 5       # 页面展示条数
 
+# ── 详情页视图切换（保种任务 / 最近删除）────────────────────────────
+# 详情页组件树的 props 是**单向 v-bind、没有 v-model**（见 PageRender.vue），
+# 所以「点一下换一个界面」这类状态只能落在后端：点分段 → 调 switch_view API 存值
+# → 前端整页重载 → get_page() 按存下的值只渲染一个视图。
+PAGE_VIEW_DATA_KEY = "page_view"
+PAGE_VIEW_HR = "hr"          # 视图①保种任务（默认，也是值非法时的回落）
+PAGE_VIEW_DEL = "del"        # 视图②最近删除
+
 
 def format_name_list_text(names: List[str]) -> str:
     """把任务名列表渲染成通知正文。
@@ -674,6 +682,111 @@ def _deleted_log_block(rows: List[Dict[str, Any]], total: int) -> dict:
     }
 
 
+# ─────────────── 详情页视图切换条（分段胶囊 · v2.0.8） ───────────────
+# 观感对齐 iOS segmented：整条做成一个胶囊容器，选中项白底浮起。
+# 配色沿用卡片那一族（surface-variant 低透明度），视觉重量低于任务卡。
+SEG_TRACK_STYLE = (
+    "display: inline-flex; align-items: center; gap: 2px; padding: 3px; "
+    "border-radius: 10px; background: rgba(var(--v-theme-on-surface), 0.06); "
+    "border: 1px solid rgba(var(--v-theme-on-surface), 0.06);"
+)
+# 两个分段共用同一套骨架；选中/未选中的差异（背景、字色、字重、投影）追加在后面，
+# 同一属性后写的胜出 —— 所以不用拆成两套常量，也不会出现「改了骨架漏改一半」。
+SEG_BTN_STYLE = (
+    "min-width: 0; min-height: 28px; height: 28px; padding: 0 16px; "
+    "border-radius: 8px; font-size: 13px; font-weight: 600; "
+    "letter-spacing: 0; text-transform: none; box-shadow: none; "
+    "font-variant-numeric: tabular-nums;"
+)
+SEG_BTN_STYLE_ON = (
+    " background: rgb(var(--v-theme-surface)); "
+    "color: rgb(var(--v-theme-primary)); font-weight: 700; "
+    "box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);"
+)
+SEG_BTN_STYLE_OFF = (
+    " background: transparent; color: rgba(var(--v-theme-on-surface), 0.62);"
+)
+
+
+def _seg_button(label: str, view: str, active: bool, plugin_id: str) -> dict:
+    """分段胶囊里的一个分段。
+
+    🔴 必须用 `VBtn`：MP 详情页只给 `VBtn` 绑得动 `events.click`，
+       自己用 `div` / `span` 画的「按钮」点了没反应。
+    🔴 `params` 是静态字典，事件回调解不到「点的是哪个」⇒ 每个分段写死自己的 `view`。
+    🔴 路由默认鉴权是 `apikey`（`_update_plugin_api_routes` 里
+       `api.pop("auth", "apikey")`），所以必须显式带上 `apikey`。
+    """
+    return {
+        "component": "VBtn",
+        "props": {
+            "variant": "text",
+            "ripple": False,
+            "style": SEG_BTN_STYLE + (SEG_BTN_STYLE_ON if active else SEG_BTN_STYLE_OFF),
+        },
+        "text": label,
+        "events": {
+            "click": {
+                "api": f"plugin/{plugin_id}/switch_view",
+                "method": "get",
+                "params": {"view": view, "apikey": settings.API_TOKEN},
+            }
+        },
+    }
+
+
+def _page_view_switch(active: str, hr_count: int, del_count: int, plugin_id: str) -> dict:
+    """详情页顶部的「保种任务 / 最近删除」切换条。
+
+    两个分段各自带计数 —— 一眼能看出**另一页有没有东西**，这是折叠面板做不到的
+    （也是这一版选分段胶囊而非手风琴的主要理由）。
+    """
+    return {
+        "component": "VRow",
+        "content": [
+            {
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"style": SEG_TRACK_STYLE},
+                        "content": [
+                            _seg_button(f"保种任务 {hr_count}", PAGE_VIEW_HR,
+                                        active == PAGE_VIEW_HR, plugin_id),
+                            _seg_button(f"最近删除 {del_count}", PAGE_VIEW_DEL,
+                                        active == PAGE_VIEW_DEL, plugin_id),
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _empty_view_hint(text: str) -> dict:
+    """当前视图没有内容时的占位提示。
+
+    加了切换条之后，空视图如果什么都不渲染，整页就只剩那条切换条 ——
+    看着像插件坏了。这里补一条中性提示（不是错误态）。
+    """
+    return {
+        "component": "VRow",
+        "content": [
+            {
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [
+                    {
+                        "component": "VAlert",
+                        "props": {"type": "info", "variant": "tonal", "text": text},
+                    }
+                ],
+            }
+        ],
+    }
+
+
 class ChdbitsHrMonitor(_PluginBase):
     """彩虹岛 H&R 种子监控插件。
 
@@ -688,7 +801,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.7"
+    plugin_version = "2.0.8"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -814,7 +927,31 @@ class ChdbitsHrMonitor(_PluginBase):
 
         :return: API 定义列表
         """
-        return []
+        return [
+            {
+                "path": "/switch_view",
+                "endpoint": self.api_switch_view,
+                "methods": ["GET"],
+                # 不写 auth：路由默认就是 apikey（见 _update_plugin_api_routes），
+                # 与仓库里 tvfirstwatch / qbcategorypause 的写法一致。
+                "summary": "切换详情页视图（保种任务 / 最近删除）",
+                "description": "详情页顶部分段胶囊点击后调用：把选中的视图写入插件数据，"
+                               "随后前端重载整页，get_page() 按该值只渲染一个视图。",
+            }
+        ]
+
+    def api_switch_view(self, view: str = None, apikey: str = None) -> Dict[str, Any]:
+        """API：切换详情页当前视图。
+
+        :param view: hr=保种任务（默认）/ del=最近删除；其余取值一律回落默认视图
+        :param apikey: 由路由的 apikey 鉴权消费，函数体不再重复校验
+        :return: 切换结果
+        """
+        target = (PAGE_VIEW_DEL if str(view or "").strip().lower().startswith("d")
+                  else PAGE_VIEW_HR)
+        self.save_data(PAGE_VIEW_DATA_KEY, target)
+        logger.info(f"彩虹岛HR监控：详情页视图切换为「{target}」")
+        return {"success": True, "view": target}
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
         """返回插件配置表单与默认配置。
@@ -1383,6 +1520,15 @@ class ChdbitsHrMonitor(_PluginBase):
                 return task, idx
         return task, -1
 
+    def __resolve_view(self) -> str:
+        """读取详情页当前视图（存插件数据，缺省／值非法一律回落「保种任务」）。
+
+        不缓存到实例属性：重载/重装后实例会重建，每次都从数据读，
+        才能保证页面上显示的永远是用户最后选中的那一页。
+        """
+        raw = str(self.get_data(PAGE_VIEW_DATA_KEY) or "").strip().lower()
+        return PAGE_VIEW_DEL if raw.startswith("d") else PAGE_VIEW_HR
+
     def get_page(self) -> Optional[List[dict]]:
         """返回插件详情页面。
 
@@ -1445,12 +1591,39 @@ class ChdbitsHrMonitor(_PluginBase):
                 }
             )
 
-        # ── 统一任务清单 ──────────────────────────────────────────
+        # ── 视图切换条（保种任务 / 最近删除） ──────────────────────
+        # 两个视图的计数都要印在分段上，所以两份数据源都在分流之前备好。
+        # 切换状态由后端记（get_api 里那条 /switch_view），原因见模块 docstring。
+        display_items = self.__build_display_items()
+        deleted_log: Dict[str, Dict[str, Any]] = self.get_data(DELETE_LOG_DATA_KEY) or {}
+        view = self.__resolve_view()
+        page_content.append(
+            _page_view_switch(view, len(display_items), len(deleted_log),
+                              self.__class__.__name__)
+        )
+
+        # ── 视图②：最近删除留档（保险闸门 ⑤：删了什么，事后可追溯） ──────
+        # 版式：时间轴（日期列｜轴线｜名称 + 指标），见 _deleted_log_block()。
+        # 旧版把记录拼成一段 pre-line 文本，长片名折行后字段彼此对不齐，
+        # 5 条会渲染成 11 行；这里改成结构化组件树，每条恒定两行。
+        if view == PAGE_VIEW_DEL:
+            if deleted_log:
+                recent = sorted(
+                    deleted_log.items(),
+                    key=lambda kv: float(kv[1].get("deleted_at") or 0),
+                    reverse=True,
+                )[:DELETE_LOG_DISPLAY]
+                page_content.append(
+                    _deleted_log_block([rec for _, rec in recent], len(deleted_log))
+                )
+            else:
+                page_content.append(_empty_view_hint("暂无删除留档。"))
+            return page_content
+
+        # ── 视图①：保种任务清单 ────────────────────────────────────
         # 站点视角 / 本地 QB 视角 / 已完成待删除 三份数据源合成一个列表，
         # 同一个种子只保留一条；站点做种时间与本地做种时间分列显示，
         # 站点任务消失后站点侧显示「已移除」，本地时长依旧可读。
-        display_items = self.__build_display_items()
-
         counts: Dict[str, int] = {}
         for item in display_items:
             counts[item["state"]] = counts.get(item["state"], 0) + 1
@@ -1560,20 +1733,11 @@ class ChdbitsHrMonitor(_PluginBase):
                     ],
                 }
             )
-
-        # ── 最近删除留档（保险闸门 ⑤：删了什么，事后可追溯） ────────────
-        # 版式：时间轴（日期列｜轴线｜名称 + 指标），见 _deleted_log_block()。
-        # 旧版把 5 条记录拼成一段 pre-line 文本，长片名折行后字段彼此对不齐，
-        # 5 条会渲染成 11 行；这里改成结构化组件树，每条恒定两行。
-        deleted_log: Dict[str, Dict[str, Any]] = self.get_data(DELETE_LOG_DATA_KEY) or {}
-        if deleted_log:
-            recent = sorted(
-                deleted_log.items(),
-                key=lambda kv: float(kv[1].get("deleted_at") or 0),
-                reverse=True,
-            )[:DELETE_LOG_DISPLAY]
+        else:
+            # 之前这里什么都不渲染 —— 有了切换条之后整页就只剩它，看着像坏了。
             page_content.append(
-                _deleted_log_block([rec for _, rec in recent], len(deleted_log))
+                _empty_view_hint("当前没有纳入统计的 H&R 任务；"
+                                 "站点侧未完成的 H&R 任务会在下一轮检查后出现。")
             )
 
         return page_content
