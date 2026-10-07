@@ -21,11 +21,14 @@ HR_PROGRESS_THRESHOLD = 0.5
 # 宁可多保种，也不要在保种未达标时误删任务。
 HR_DEFAULT_CYCLE_HOURS = 120.0
 # 保种时长闸门的安全余量：闸门要求「周期 + 余量」才放行，兜住站点登记延迟与
-# 标题匹配瞬时失败两类风险。实测本站点 H&R 计数仅比 QB 的 seeding_time 慢约
-# 2 小时，故余量取固定 2 小时即可，对 5 天周期即 122 小时。
+# 标题匹配瞬时失败两类风险。
+# 原为固定 2 小时（顾及本站点 H&R 计数比 QB seeding_time 慢约 2 小时），
+# v2.0.6 起按用户要求下调为 0.5 小时 —— 5 天周期门槛即 120.5 小时。
+# 注意：余量越小，越依赖「站点登记不延迟」这一前提；下方保险闸门②③
+# （匹配失效冻结 / 必须曾在站点出现过）仍是主要防线。
 # （v1.9.1/v1.9.2 曾按周期的 5% 追加余量，5 天周期要拖到 126 小时才删，过于保守。）
 HR_CYCLE_MARGIN_RATIO = 0.0
-HR_CYCLE_MARGIN_MIN_HOURS = 2.0
+HR_CYCLE_MARGIN_MIN_HOURS = 0.5
 # UHD原盘自动下载 插件ID（用于读取副标题与种子标题）
 UHD_PLUGIN_ID = "UhdBlurayAutoDownload"
 # UHD原盘自动下载 插件的已处理记录键名
@@ -451,7 +454,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.5"
+    plugin_version = "2.0.6"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -756,7 +759,8 @@ class ChdbitsHrMonitor(_PluginBase):
                                                     "安全闸门：站点从下载达标到登记 H&R 记录存在延迟，"
                                                     "因此「站点未列出」不等于「已完成保种」——"
                                                     "插件会先用本地做种时长与该任务的 H&R 周期比对，"
-                                                    "保种时长未达标（周期 + 2 小时安全余量）前绝不进入删除流程；"
+                                                    f"保种时长未达标（周期 + {HR_CYCLE_MARGIN_MIN_HOURS:g} 小时安全余量）"
+                                                    "前绝不进入删除流程；"
                                                     "站点从未给出周期时，以「兜底保种周期」为准。",
                                         },
                                     }
@@ -1652,7 +1656,8 @@ class ChdbitsHrMonitor(_PluginBase):
             else:
                 base_hours = float(self._fallback_cycle_hours or HR_DEFAULT_CYCLE_HOURS)
                 label = "保种要求（兜底周期）"
-            # 闸门在周期之上再加一段固定的安全余量（默认 2 小时）
+            # 闸门在周期之上再加一段固定的安全余量（默认 0.5 小时，见
+            # HR_CYCLE_MARGIN_MIN_HOURS；可用 RATIO 按周期比例再放大）
             margin_hours = max(
                 HR_CYCLE_MARGIN_MIN_HOURS, base_hours * HR_CYCLE_MARGIN_RATIO
             )
