@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
@@ -81,15 +82,82 @@ YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
 # ── 删除保险 ⑤：删除留档 ─────────────────────────────────────────
 DELETE_LOG_DATA_KEY = "hr_deleted_log"
 DELETE_LOG_LIMIT = 50        # 存储条数（保证事后可追溯）
-DELETE_LOG_DISPLAY = 5       # 页面展示条数（v2.0.10 曾提到 10；v2.0.11 回到 5 —— 内容区改成等高，10 条会把弹窗撑太高）
+DELETE_LOG_DISPLAY = 5       # 页面展示条数（v2.0.10 曾提到 10；v2.0.11 回到 5；v2.0.12 起同页带两个视图、10 条也只是容器内滚动，仍按用户要求保持 5）
 
 # ── 详情页视图切换（保种任务 / 最近删除）────────────────────────────
-# 详情页组件树的 props 是**单向 v-bind、没有 v-model**（见 PageRender.vue），
-# 所以「点一下换一个界面」这类状态只能落在后端：点分段 → 调 switch_view API 存值
-# → 前端整页重载 → get_page() 按存下的值只渲染一个视图。
+# 详情页组件树的 props 是**单向 v-bind、没有 v-model**（见 PageRender.vue）。
+#
+# 🔴 v2.0.12 起切换**不走服务器**了。v2.0.11 及以前是「点分段 → 调 switch_view
+#    存值 → 前端整页重载 → get_page() 按值只渲染一个视图」，但真机读 MP 前端
+#    PluginDataDialog.vue 的实现发现：它每次收到 action 都先
+#        k.value = false; B.value = [];        // 清空页面数组
+#    再 `GET plugin/page/{id}`，中间模板落到 `<LoadingBanner class="mt-5"/>`
+#    （212px 的 4 点动画）；而弹窗本身是 `scrollable` + 垂直居中 ⇒ 卡片
+#    697→316→697、上蹿 190px 再弹回 —— 用户看到的就是「抖」。
+#    这是弹窗对**所有** vuetify 渲染插件的固有行为，改内容高度没用（2.0.11 已试）。
+#
+#    现在的做法：页面里**一次带两个视图**，前面放两个隐藏 radio 记住选中哪一路，
+#    分段条改成 `<label for=…>`，显示谁由纯 CSS 兄弟选择器决定
+#    （`#radio:checked ~ .view-x`）。`PageRender` 把页面数组的每个块渲染成
+#    **同一个父 div 下的兄弟元素**，所以这种选择器能用（2026-10-07 真机干跑实测）。
+#    ⇒ 点击零请求、零进度弹窗、零 LoadingBanner，卡片几何一点不动。
+#
+# 代价：选了哪一路不再落库，重开弹窗回到下面这个「初始视图」。
 PAGE_VIEW_DATA_KEY = "page_view"
 PAGE_VIEW_HR = "hr"          # 视图①保种任务（默认，也是值非法时的回落）
 PAGE_VIEW_DEL = "del"        # 视图②最近删除
+
+# ── 客户端切换用的 id / class（v2.0.12）─────────────────────────────
+# 全部被 _VIEW_SWITCH_CSS 里的选择器引用 —— 改名必须同步改那段 CSS。
+VIEW_TOGGLE_NAME = "chdbits-hrv"     # radio group 名（带前缀，防与面板其它 radio 撞组）
+VIEW_TOGGLE_HR_ID = "chdbits-hrv-hr"
+VIEW_TOGGLE_DEL_ID = "chdbits-hrv-del"
+VIEW_CLASS = "chdbits-view"          # 两个视图容器的公共 class
+VIEW_CLASS_HR = "chdbits-view-hr"    # 视图①容器
+VIEW_CLASS_DEL = "chdbits-view-del"  # 视图②容器
+SEG_CLASS = "chdbits-seg"            # 分段胶囊宿主
+
+# 客户端切换的 CSS（会被内联进切换条块里的 <style>）。
+# 用 % 模板而不是 f-string：CSS 里全是花括号，f-string 得逐个双写，太容易错。
+_VIEW_SWITCH_CSS = (
+    # radio 藏掉。display:none 的 radio 照样能被 <label for> 点中（浏览器原生行为），
+    # 所以不需要 opacity/position 那套把戏。
+    "#%s,#%s{display:none!important}"
+    # 两路默认都藏，只有选中的那一路显示
+    ".%s{display:none}"
+    "#%s:checked ~ .%s{display:block}"
+    "#%s:checked ~ .%s{display:block}"
+    # label 的静态样式（原来写在 VBtn 的 inline style 上，现在没有 VBtn 了）
+    ".%s label{min-width:0;min-height:28px;height:28px;padding:0 16px;"
+    "border-radius:8px;font-size:13px;font-weight:600;letter-spacing:0;"
+    "text-transform:none;font-variant-numeric:tabular-nums;"
+    "display:inline-flex;align-items:center;justify-content:center;"
+    "cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent;"
+    "background:transparent;color:rgba(var(--v-theme-on-surface),0.62);"
+    "box-shadow:none;transition:background-color .18s,color .18s,box-shadow .18s}"
+    ".%s label:hover{background:rgba(var(--v-theme-on-surface),0.06)}"
+    # 选中态：白底 + 主色字 + 加粗 + 细投影。
+    # `~ *` 先落到后面任意一个兄弟，再往下找胶囊 —— 胶囊外面还套着 VRow/VCol，
+    # 不是 radio 的直接兄弟。属性选择器用单引号，免得在 Python 里转义。
+    "#%s:checked ~ * .%s label[for='%s'],"
+    "#%s:checked ~ * .%s label[for='%s']"
+    "{background:rgb(var(--v-theme-surface));color:rgb(var(--v-theme-primary));"
+    "font-weight:700;box-shadow:0 1px 3px rgba(0,0,0,0.16)}"
+)
+
+
+def _view_switch_css() -> str:
+    """把上面的模板填成实际 CSS（引用常量，避免手抄 id 抄错）。"""
+    return _VIEW_SWITCH_CSS % (
+        VIEW_TOGGLE_HR_ID, VIEW_TOGGLE_DEL_ID,
+        VIEW_CLASS,
+        VIEW_TOGGLE_HR_ID, VIEW_CLASS_HR,
+        VIEW_TOGGLE_DEL_ID, VIEW_CLASS_DEL,
+        SEG_CLASS,
+        SEG_CLASS,
+        VIEW_TOGGLE_HR_ID, SEG_CLASS, VIEW_TOGGLE_HR_ID,
+        VIEW_TOGGLE_DEL_ID, SEG_CLASS, VIEW_TOGGLE_DEL_ID,
+    )
 
 
 def format_name_list_text(names: List[str]) -> str:
@@ -690,63 +758,47 @@ SEG_TRACK_STYLE = (
     "border-radius: 10px; background: rgba(var(--v-theme-on-surface), 0.06); "
     "border: 1px solid rgba(var(--v-theme-on-surface), 0.06);"
 )
-# 两个分段共用同一套骨架；选中/未选中的差异（背景、字色、字重、投影）追加在后面，
-# 同一属性后写的胜出 —— 所以不用拆成两套常量，也不会出现「改了骨架漏改一半」。
-SEG_BTN_STYLE = (
-    "min-width: 0; min-height: 28px; height: 28px; padding: 0 16px; "
-    "border-radius: 8px; font-size: 13px; font-weight: 600; "
-    "letter-spacing: 0; text-transform: none; box-shadow: none; "
-    "font-variant-numeric: tabular-nums;"
-)
-SEG_BTN_STYLE_ON = (
-    " background: rgb(var(--v-theme-surface)); "
-    # 🔴 必须带 !important：Vuetify 会给 VBtn 自动加 text-primary 类，
-    #    而 `.text-primary { color: rgb(var(--v-theme-primary)) !important }`
-    #    带 !important，会压过这里没加 !important 的 color（2026-10-07 真机实测）。
-    "color: rgb(var(--v-theme-primary)) !important; font-weight: 700; "
-    "box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16);"
-)
-SEG_BTN_STYLE_OFF = (
-    # 🔴 同上：未选中是「透明底 + 62% 灰」，字色不加 !important 会被染成主色，
-    #    真机上看着像两段都是选中态（只剩底色与字重两处差异）。
-    " background: transparent; "
-    "color: rgba(var(--v-theme-on-surface), 0.62) !important;"
-)
+def _view_toggle_radios(active: str) -> List[dict]:
+    """两个隐藏 radio —— 客户端切换的「当前视图」状态。
 
-
-def _seg_button(label: str, view: str, active: bool, plugin_id: str) -> dict:
-    """分段胶囊里的一个分段。
-
-    🔴 必须用 `VBtn`：MP 详情页只给 `VBtn` 绑得动 `events.click`，
-       自己用 `div` / `span` 画的「按钮」点了没反应。
-    🔴 `params` 是静态字典，事件回调解不到「点的是哪个」⇒ 每个分段写死自己的 `view`。
-    🔴 路由默认鉴权是 `apikey`（`_update_plugin_api_routes` 里
-       `api.pop("auth", "apikey")`），所以必须显式带上 `apikey`。
+    🔴 必须各占一个**独立页面块**：只有它们是两个视图容器的兄弟，
+       CSS 的 `#id:checked ~ .xxx` 才选得中（包一层 div 就得改用 `:has()`）。
+    🔴 `checked` 只放在当前视图那一个上：服务端存的 page_view 决定弹窗**打开时**
+       停在哪个视图；点过之后由 CSS 接管，不再回写。
     """
-    return {
-        "component": "VBtn",
-        "props": {
-            "variant": "text",
-            "ripple": False,
-            "style": SEG_BTN_STYLE + (SEG_BTN_STYLE_ON if active else SEG_BTN_STYLE_OFF),
-        },
-        "text": label,
-        "events": {
-            "click": {
-                "api": f"plugin/{plugin_id}/switch_view",
-                "method": "get",
-                "params": {"view": view, "apikey": settings.API_TOKEN},
-            }
-        },
-    }
+    out: List[dict] = []
+    for rid, on in ((VIEW_TOGGLE_HR_ID, active == PAGE_VIEW_HR),
+                    (VIEW_TOGGLE_DEL_ID, active != PAGE_VIEW_HR)):
+        props: Dict[str, Any] = {
+            "type": "radio",
+            "name": VIEW_TOGGLE_NAME,
+            "id": rid,
+            "style": "display: none;",
+        }
+        if on:
+            props["checked"] = True
+        out.append({"component": "input", "props": props, "text": ""})
+    return out
 
 
-def _page_view_switch(active: str, hr_count: int, del_count: int, plugin_id: str) -> dict:
+def _page_view_switch(active: str, hr_count: int, del_count: int) -> dict:
     """详情页顶部的「保种任务 / 最近删除」切换条。
 
-    两个分段各自带计数 —— 一眼能看出**另一页有没有东西**，这是折叠面板做不到的
-    （也是这一版选分段胶囊而非手风琴的主要理由）。
+    v2.0.12 起不用 `VBtn` + `events.click` 了（那会触发 MP 重新拉整页、闪空档），
+    改成裸 `<label for=…>`：点它 = 点亮对应 radio，CSS 随即换视图 —— 零请求。
+
+    🔴 分段文案里的计数保留：一眼能看出**另一页有没有东西**，
+       这是折叠面板做不到的（也是当初选分段胶囊而非手风琴的主要理由）。
+    🔴 改完不再需要 plugin_id / apikey —— 根本不发请求。
     """
+    labels = "".join(
+        '<label for="%s">%s</label>' % (rid, escape(text))
+        for rid, text in (
+            (VIEW_TOGGLE_HR_ID, "保种任务 %d" % hr_count),
+            (VIEW_TOGGLE_DEL_ID, "最近删除 %d" % del_count),
+        )
+    )
+    html = "<style>%s</style>%s" % (_view_switch_css(), labels)
     return {
         "component": "VRow",
         "content": [
@@ -755,22 +807,20 @@ def _page_view_switch(active: str, hr_count: int, del_count: int, plugin_id: str
                 "props": {"cols": 12},
                 "content": [
                     {
+                        # 裸 `<div>` + `html`（PageRender 有 `config.html` 那一路，
+                        # 会走 innerHTML）：里面塞 <style> 与两个 label。
+                        # 胶囊几何仍用内联 style 兜底；选中态只能靠 CSS ——
+                        # 服务端渲染时不知道用户会点哪一下。
                         "component": "div",
-                        "props": {"style": SEG_TRACK_STYLE},
-                        "content": [
-                            _seg_button(f"保种任务 {hr_count}", PAGE_VIEW_HR,
-                                        active == PAGE_VIEW_HR, plugin_id),
-                            _seg_button(f"最近删除 {del_count}", PAGE_VIEW_DEL,
-                                        active == PAGE_VIEW_DEL, plugin_id),
-                        ],
+                        "props": {"class": SEG_CLASS, "style": SEG_TRACK_STYLE},
+                        "html": html,
                     }
                 ],
             }
         ],
     }
 
-
-# ── 详情页内容区固定高度（v2.0.11）──────────────────────────────
+# ── 详情页内容区固定高度（v2.0.11 引入，v2.0.12 沿用）──────────────
 # 弹窗是 `<VDialog scrollable>` 且**垂直居中**（PluginDataDialog.vue），内容一变高
 # 整个卡片就重新居中 —— 切换条跟着上下跳。真机实测（视口 1574×1060）：
 # 视图① 内容 504px、视图② 内容 702px，点一下分段切换条位移 99px、弹窗高度差 198px。
@@ -789,14 +839,21 @@ VIEW_BODY_STYLE = (
 )
 
 
-def _view_body(blocks: List[dict]) -> dict:
-    """把视图正文块包进固定高度的容器。
+def _view_body(blocks: List[dict], view: str) -> dict:
+    """把某个视图的正文块包进固定高度的容器。
 
-    两个视图用**同一份 style 串**，高度必然相等 —— 这就是「切换不跳动」的判据，
-    回归里直接比对两个视图的容器 style 是否逐字节相同。
+    两个视图用**同一份 style 串**，高度必然相等 —— 这是「切换时卡片几何不动」
+    的一半；另一半是它们各自带 class，由 CSS 决定显示谁。
+    🔴 公共 class（VIEW_CLASS）+ 各自的 class 都要带：前者管「默认藏起来」，
+       后者管「哪一路选中时显示」。
     """
-    return {"component": "div", "props": {"style": VIEW_BODY_STYLE},
-            "content": blocks}
+    own = VIEW_CLASS_HR if view == PAGE_VIEW_HR else VIEW_CLASS_DEL
+    return {
+        "component": "div",
+        "props": {"class": "%s %s" % (VIEW_CLASS, own), "style": VIEW_BODY_STYLE},
+        "content": blocks,
+    }
+
 
 def _empty_view_hint(text: str) -> dict:
     """当前视图没有内容时的占位提示。
@@ -835,7 +892,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.11"
+    plugin_version = "2.0.12"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -968,14 +1025,17 @@ class ChdbitsHrMonitor(_PluginBase):
                 "methods": ["GET"],
                 # 不写 auth：路由默认就是 apikey（见 _update_plugin_api_routes），
                 # 与仓库里 tvfirstwatch / qbcategorypause 的写法一致。
-                "summary": "切换详情页视图（保种任务 / 最近删除）",
-                "description": "详情页顶部分段胶囊点击后调用：把选中的视图写入插件数据，"
-                               "随后前端重载整页，get_page() 按该值只渲染一个视图。",
+                "summary": "设置详情页初始视图（保种任务 / 最近删除）",
+                "description": "v2.0.12 起详情页的视图切换由前端纯 CSS 完成、不再回调本接口；"
+                               "这里写入的值只决定**弹窗打开时**默认停在哪个视图。",
             }
         ]
 
     def api_switch_view(self, view: str = None, apikey: str = None) -> Dict[str, Any]:
-        """API：切换详情页当前视图。
+        """API：设置详情页的**初始**视图。
+
+        v2.0.12 起详情页里点分段是纯前端行为（不回调本接口，见模块顶部说明），
+        所以这里存下的值只在下次渲染 get_page() 时决定默认显示哪一路。
 
         :param view: hr=保种任务（默认）/ del=最近删除；其余取值一律回落默认视图
         :param apikey: 由路由的 apikey 鉴权消费，函数体不再重复校验
@@ -1627,40 +1687,40 @@ class ChdbitsHrMonitor(_PluginBase):
 
         # ── 视图切换条（保种任务 / 最近删除） ──────────────────────
         # 两个视图的计数都要印在分段上，所以两份数据源都在分流之前备好。
-        # 切换状态由后端记（get_api 里那条 /switch_view），原因见模块 docstring。
+        # 🔴 v2.0.12 起切换**完全不请求服务器**：先把两个隐藏 radio 放进页面，
+        #    它们是下面两个视图容器的**兄弟**，CSS 靠 `#radio:checked ~ .view-x`
+        #    决定显示哪一路。原因见模块顶部「详情页视图切换」那段。
         display_items = self.__build_display_items()
         deleted_log: Dict[str, Dict[str, Any]] = self.get_data(DELETE_LOG_DATA_KEY) or {}
         view = self.__resolve_view()
+        page_content.extend(_view_toggle_radios(view))
         page_content.append(
-            _page_view_switch(view, len(display_items), len(deleted_log),
-                              self.__class__.__name__)
+            _page_view_switch(view, len(display_items), len(deleted_log))
         )
 
         # ── 视图②：最近删除留档（保险闸门 ⑤：删了什么，事后可追溯） ──────
         # 版式：时间轴（日期列｜轴线｜名称 + 指标），见 _deleted_log_block()。
         # 旧版把记录拼成一段 pre-line 文本，长片名折行后字段彼此对不齐，
         # 5 条会渲染成 11 行；这里改成结构化组件树，每条恒定两行。
-        if view == PAGE_VIEW_DEL:
-            body_blocks: List[dict] = []
-            if deleted_log:
-                recent = sorted(
-                    deleted_log.items(),
-                    key=lambda kv: float(kv[1].get("deleted_at") or 0),
-                    reverse=True,
-                )[:DELETE_LOG_DISPLAY]
-                body_blocks.append(
-                    _deleted_log_block([rec for _, rec in recent], len(deleted_log))
-                )
-            else:
-                body_blocks.append(_empty_view_hint("暂无删除留档。"))
-            page_content.append(_view_body(body_blocks))
-            return page_content
+        # 注意：两个视图**都要**构建 —— v2.0.12 起同一页里同时带着它们。
+        del_blocks: List[dict] = []
+        if deleted_log:
+            recent = sorted(
+                deleted_log.items(),
+                key=lambda kv: float(kv[1].get("deleted_at") or 0),
+                reverse=True,
+            )[:DELETE_LOG_DISPLAY]
+            del_blocks.append(
+                _deleted_log_block([rec for _, rec in recent], len(deleted_log))
+            )
+        else:
+            del_blocks.append(_empty_view_hint("暂无删除留档。"))
 
         # ── 视图①：保种任务清单 ────────────────────────────────────
         # 站点视角 / 本地 QB 视角 / 已完成待删除 三份数据源合成一个列表，
         # 同一个种子只保留一条；站点做种时间与本地做种时间分列显示，
         # 站点任务消失后站点侧显示「已移除」，本地时长依旧可读。
-        body_blocks: List[dict] = []
+        hr_blocks: List[dict] = []
         counts: Dict[str, int] = {}
         for item in display_items:
             counts[item["state"]] = counts.get(item["state"], 0) + 1
@@ -1669,7 +1729,7 @@ class ChdbitsHrMonitor(_PluginBase):
             # 插件重载后内存态被清空，此时只有持久化的完成态记录可显示，
             # 需要显式说明，避免被误读成「保种中的任务都消失了」
             if not self._last_check_time:
-                body_blocks.append(
+                hr_blocks.append(
                     {
                         "component": "VRow",
                         "content": [
@@ -1700,7 +1760,7 @@ class ChdbitsHrMonitor(_PluginBase):
                                  ("siteonly", "本地未找到")):
                 if counts.get(state):
                     summary.append(f"{label} {counts[state]}")
-            body_blocks.append(
+            hr_blocks.append(
                 {
                     "component": "VRow",
                     "content": [
@@ -1758,7 +1818,7 @@ class ChdbitsHrMonitor(_PluginBase):
                     )
                 )
 
-            body_blocks.append(
+            hr_blocks.append(
                 {
                     "component": "VRow",
                     "content": [
@@ -1772,12 +1832,14 @@ class ChdbitsHrMonitor(_PluginBase):
             )
         else:
             # 之前这里什么都不渲染 —— 有了切换条之后整页就只剩它，看着像坏了。
-            body_blocks.append(
+            hr_blocks.append(
                 _empty_view_hint("当前没有纳入统计的 H&R 任务；"
                                  "站点侧未完成的 H&R 任务会在下一轮检查后出现。")
             )
 
-        page_content.append(_view_body(body_blocks))
+        # 两个视图**都**进页面：显示哪一路完全交给 CSS，切换不再走服务器。
+        page_content.append(_view_body(hr_blocks, PAGE_VIEW_HR))
+        page_content.append(_view_body(del_blocks, PAGE_VIEW_DEL))
         return page_content
 
     def get_service(self) -> List[Dict[str, Any]]:
