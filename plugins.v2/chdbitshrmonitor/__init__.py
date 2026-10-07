@@ -81,7 +81,7 @@ YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
 # ── 删除保险 ⑤：删除留档 ─────────────────────────────────────────
 DELETE_LOG_DATA_KEY = "hr_deleted_log"
 DELETE_LOG_LIMIT = 50        # 存储条数（保证事后可追溯）
-DELETE_LOG_DISPLAY = 5       # 页面展示条数
+DELETE_LOG_DISPLAY = 10      # 页面展示条数（v2.0.10：5 → 10，留档常见就是一屏的量，别让用户为了看全再翻）
 
 # ── 详情页视图切换（保种任务 / 最近删除）────────────────────────────
 # 详情页组件树的 props 是**单向 v-bind、没有 v-model**（见 PageRender.vue），
@@ -807,7 +807,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.9"
+    plugin_version = "2.0.10"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
