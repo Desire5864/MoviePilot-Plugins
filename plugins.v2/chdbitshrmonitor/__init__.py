@@ -568,8 +568,12 @@ TIMELINE_NAME_STYLE = (
     "font-size: 13px; font-weight: 600; line-height: 1.45; "
     "white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
 )
+# 「本地做种 5天02.5h · 周期 5天」是这条留档唯一能说明「为什么可以删」的指标，
+# 而原样式（11.5px + `opacity: 0.55`）在常用的深色主题下淡到几乎读不出来。
+# v2.0.13 起改用正向色 + 加粗、字号提一档：5 条记录扫一眼就能对上做种时长。
 TIMELINE_META_STYLE = (
-    "margin-top: 2px; font-size: 11.5px; line-height: 1.5; opacity: 0.55; "
+    "margin-top: 3px; font-size: 12.5px; font-weight: 700; "
+    f"color: {COLOR_OK}; line-height: 1.5; "
     "font-variant-numeric: tabular-nums;"
 )
 
@@ -892,7 +896,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.12"
+    plugin_version = "2.0.13"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
