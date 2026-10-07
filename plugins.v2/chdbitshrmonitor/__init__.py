@@ -162,6 +162,11 @@ CARD_TITLE_STYLE_DANGER = (
     "color: #ffd9da;"
 )
 
+# 「最近删除」时间轴的轴线 / 节点 / 计数强调色。
+# 用字面量而非 var(--v-theme-primary)：插件其余强调色一律字面量，
+# 且主题变量万一缺失会让整条 rgb() 声明失效、时间轴节点直接消失。
+COLOR_TIMELINE = "#8d51f9"
+
 
 def _fmt_duration(seconds: float) -> str:
     """把秒数格式化为便于阅读的时长文本（如 "3天04:30"、"5.2h"）。"""
@@ -440,6 +445,235 @@ def _ring_card(ring: dict, title: str, chip: Optional[dict] = None,
 
 
 
+# ─────────────────── 「最近删除」时间轴版式（v2.0.7） ───────────────────
+# 区块外壳刻意不用信息蓝：它是「历史流水」，不是需要立刻处理的告警，
+# 视觉重量必须明确低于上方任务卡，但仍沿用同一套卡片语言（同底色、同描边）。
+CARD_TIMELINE_STYLE = (
+    "padding: 12px 16px 4px; border-radius: 12px; "
+    "background: rgba(var(--v-theme-surface-variant), 0.10); "
+    "border: 1px solid rgba(var(--v-theme-on-surface), 0.08);"
+)
+TIMELINE_HEAD_STYLE = "display: flex; align-items: center; gap: 9px; margin-bottom: 8px;"
+TIMELINE_TITLE_STYLE = (
+    "flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 700; "
+    "line-height: 1.5; word-break: break-word;"
+)
+TIMELINE_HINT_STYLE = "flex: 0 0 auto; font-size: 11.5px; line-height: 1.5; opacity: 0.45;"
+TIMELINE_ROW_STYLE = "display: flex; align-items: stretch;"
+# 日期列：日期在上、时间在下，右对齐 + 等宽数字，5 条记录的时刻能扫成一列
+TIMELINE_DATE_STYLE = (
+    "flex: 0 0 78px; padding: 1px 14px 0 0; text-align: right; "
+    "font-variant-numeric: tabular-nums;"
+)
+TIMELINE_DATE_MAIN = "font-size: 12.5px; font-weight: 700; line-height: 1.6; opacity: 0.78;"
+TIMELINE_DATE_SUB = "font-size: 11px; line-height: 1.5; opacity: 0.45;"
+# 轴线：竖向 flex 的「上段｜圆点｜下段」三段拼成，不用绝对定位与伪元素。
+# `align-self: stretch` 让轴线列撑满整行高度，下段用 flex-grow 吃掉剩余空间。
+TIMELINE_RAIL_STYLE = (
+    "flex: 0 0 13px; align-self: stretch; display: flex; "
+    "flex-direction: column; align-items: center; box-sizing: border-box;"
+)
+TIMELINE_RAIL_LINE_TOP = (
+    "flex: 0 0 5px; width: 1px; "
+    "background: rgba(var(--v-theme-on-surface), 0.18);"
+)
+TIMELINE_RAIL_LINE_BOTTOM = (
+    "flex: 1 1 auto; width: 1px; "
+    "background: rgba(var(--v-theme-on-surface), 0.18);"
+)
+TIMELINE_RAIL_DOT = (
+    "flex: 0 0 7px; width: 7px; height: 7px; border-radius: 50%; "
+    f"background: {COLOR_TIMELINE}; "
+    f"box-shadow: 0 0 0 3px {_rgba(COLOR_TIMELINE, 0.14)};"
+)
+TIMELINE_BODY_STYLE = "flex: 1 1 auto; min-width: 0; padding: 0 0 11px 12px;"
+# 片名单行省略：4K 原盘名动辄 90+ 字符，折行正是旧版对不齐列的病根
+TIMELINE_NAME_STYLE = (
+    "font-size: 13px; font-weight: 600; line-height: 1.45; "
+    "white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"
+)
+TIMELINE_META_STYLE = (
+    "margin-top: 2px; font-size: 11.5px; line-height: 1.5; opacity: 0.55; "
+    "font-variant-numeric: tabular-nums;"
+)
+
+
+def _clock_glyph(size: int = 15) -> dict:
+    """小号时钟图标（纯 div 绘制）。
+
+    MP 详情页只渲染 Vuetify 组件与原生标签，自绘 `<svg>` 不会渲染
+    （详见 `_ring()` 的说明），所以图标也用 div 拼：一个圆环 + 两根指针。
+    指针长度 / 粗细全部按 `size` 等比推算，改尺寸不用同步改坐标。
+
+    :param size: 图标外径（px）
+    :return: 图标组件结构
+    """
+    stroke = "rgb(var(--v-theme-on-surface))"
+    hand = round(size / 10.0, 1)          # 15px → 1.5px
+    center = size / 2.0
+    axis = f"{center - hand / 2:g}"
+    return {
+        "component": "div",
+        "props": {
+            "style": f"position: relative; flex: 0 0 {size}px; "
+                     f"width: {size}px; height: {size}px; opacity: 0.55;",
+        },
+        "content": [
+            {
+                "component": "div",
+                "props": {
+                    "style": f"position: absolute; top: 0; left: 0; "
+                             f"width: {size}px; height: {size}px; "
+                             f"box-sizing: border-box; border: {hand}px solid {stroke}; "
+                             f"border-radius: 50%;",
+                },
+            },
+            {
+                # 竖直指针：从 22% 处往下扎，末端停在圆心
+                "component": "div",
+                "props": {
+                    "style": f"position: absolute; left: {axis}px; "
+                             f"top: {size * 0.22:g}px; width: {hand}px; "
+                             f"height: {size * 0.30:g}px; background: {stroke};",
+                },
+            },
+            {
+                # 水平指针：从圆心往右
+                "component": "div",
+                "props": {
+                    "style": f"position: absolute; left: {axis}px; top: {axis}px; "
+                             f"width: {size * 0.26:g}px; height: {hand}px; "
+                             f"background: {stroke};",
+                },
+            },
+        ],
+    }
+
+
+def _deleted_log_block(rows: List[Dict[str, Any]], total: int) -> dict:
+    """构造「最近删除」留档区块（时间轴版式）。
+
+    为什么不再用 `VAlert` + 多行文本：`white-space: pre-line` 下长片名一折行，
+    紧跟其后的「删除时间／本地做种／周期」就被挤到下一行，5 条记录会渲染成
+    11 行，且字段与字段之间对不上列。这里改成三段式「日期列｜轴线｜名称 + 指标」：
+    日期与指标各自成列、片名超长走省略号，**每条恒定两行**。
+
+    :param rows: 待展示的留档记录（已按删除时间倒序裁剪）
+    :param total: 留档总条数（含未展示的）
+    :return: VRow 组件结构
+    """
+    items: List[dict] = []
+    last_index = len(rows) - 1
+    for index, rec in enumerate(rows):
+        stamp = str(rec.get("deleted_time") or "")
+        # 「2026-10-05 02:43:46」→ 日期列拆成上下两行「10-05」「02:43:46」
+        date_text = stamp[5:10] if len(stamp) >= 10 else (stamp or "-")
+        time_text = stamp[11:19] if len(stamp) >= 19 else ""
+        date_lines: List[dict] = [
+            {"component": "div", "props": {"style": TIMELINE_DATE_MAIN}, "text": date_text}
+        ]
+        if time_text:
+            date_lines.append(
+                {"component": "div", "props": {"style": TIMELINE_DATE_SUB}, "text": time_text}
+            )
+
+        # 最后一条不画「下段」：竖线自然收在节点处，不会孤零零拖到区块底部
+        rail: List[dict] = [
+            {"component": "div", "props": {"style": TIMELINE_RAIL_LINE_TOP}},
+            {"component": "div", "props": {"style": TIMELINE_RAIL_DOT}},
+        ]
+        if index != last_index:
+            rail.append({"component": "div", "props": {"style": TIMELINE_RAIL_LINE_BOTTOM}})
+
+        items.append(
+            {
+                "component": "div",
+                "props": {"style": TIMELINE_ROW_STYLE},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"style": TIMELINE_DATE_STYLE},
+                        "content": date_lines,
+                    },
+                    {
+                        "component": "div",
+                        "props": {"style": TIMELINE_RAIL_STYLE},
+                        "content": rail,
+                    },
+                    {
+                        "component": "div",
+                        "props": {"style": TIMELINE_BODY_STYLE},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"style": TIMELINE_NAME_STYLE},
+                                "text": str(rec.get("name") or "-"),
+                            },
+                            {
+                                "component": "div",
+                                "props": {"style": TIMELINE_META_STYLE},
+                                "text": f"本地做种 {rec.get('local_seeding') or '-'}"
+                                        f" · 周期 {rec.get('hr_cycle') or '-'}",
+                            },
+                        ],
+                    },
+                ],
+            }
+        )
+
+    hint = f"留档上限 {DELETE_LOG_LIMIT} 条"
+    # `rows` 为空时不能写「显示最新 0 条」：调用方只在留档非空时才进来，
+    # 但这个函数本身要能安全处理空输入（回归 C 组专门盯这一条）。
+    if rows and total > len(rows):
+        hint += f" · 显示最新 {len(rows)} 条"
+
+    return {
+        "component": "VRow",
+        "content": [
+            {
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"style": CARD_TIMELINE_STYLE},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"style": TIMELINE_HEAD_STYLE},
+                                "content": [
+                                    _clock_glyph(),
+                                    {
+                                        "component": "div",
+                                        "props": {"style": TIMELINE_TITLE_STYLE},
+                                        "content": [
+                                            {"component": "span", "text": "最近删除 "},
+                                            {
+                                                "component": "span",
+                                                "props": {
+                                                    "style": f"color: {COLOR_TIMELINE};"
+                                                },
+                                                "text": str(total),
+                                            },
+                                            {"component": "span", "text": " 个任务"},
+                                        ],
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"style": TIMELINE_HINT_STYLE},
+                                        "text": hint,
+                                    },
+                                ],
+                            },
+                            *items,
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
 class ChdbitsHrMonitor(_PluginBase):
     """彩虹岛 H&R 种子监控插件。
 
@@ -454,7 +688,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.6"
+    plugin_version = "2.0.7"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1328,43 +1562,18 @@ class ChdbitsHrMonitor(_PluginBase):
             )
 
         # ── 最近删除留档（保险闸门 ⑤：删了什么，事后可追溯） ────────────
+        # 版式：时间轴（日期列｜轴线｜名称 + 指标），见 _deleted_log_block()。
+        # 旧版把 5 条记录拼成一段 pre-line 文本，长片名折行后字段彼此对不齐，
+        # 5 条会渲染成 11 行；这里改成结构化组件树，每条恒定两行。
         deleted_log: Dict[str, Dict[str, Any]] = self.get_data(DELETE_LOG_DATA_KEY) or {}
         if deleted_log:
-            rows = sorted(
+            recent = sorted(
                 deleted_log.items(),
                 key=lambda kv: float(kv[1].get("deleted_at") or 0),
                 reverse=True,
             )[:DELETE_LOG_DISPLAY]
-            lines = [
-                "· %s｜删除 %s｜本地做种 %s｜周期 %s"
-                % (rec.get("name") or "-", rec.get("deleted_time") or "-",
-                   rec.get("local_seeding") or "-", rec.get("hr_cycle") or "-")
-                for _, rec in rows
-            ]
-            head = f"最近删除 {len(deleted_log)} 个任务"
-            if len(deleted_log) > len(rows):
-                head += f"（留档上限 {DELETE_LOG_LIMIT} 条，仅显示最新 {len(rows)} 条）"
             page_content.append(
-                {
-                    "component": "VRow",
-                    "content": [
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12},
-                            "content": [
-                                {
-                                    "component": "VAlert",
-                                    "props": {
-                                        "type": "info",
-                                        "variant": "tonal",
-                                        "style": "white-space: pre-line;",
-                                        "text": head + "：\n" + "\n".join(lines),
-                                    },
-                                }
-                            ],
-                        }
-                    ],
-                }
+                _deleted_log_block([rec for _, rec in recent], len(deleted_log))
             )
 
         return page_content
