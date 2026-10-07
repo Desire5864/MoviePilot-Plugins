@@ -81,7 +81,7 @@ YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
 # ── 删除保险 ⑤：删除留档 ─────────────────────────────────────────
 DELETE_LOG_DATA_KEY = "hr_deleted_log"
 DELETE_LOG_LIMIT = 50        # 存储条数（保证事后可追溯）
-DELETE_LOG_DISPLAY = 10      # 页面展示条数（v2.0.10：5 → 10，留档常见就是一屏的量，别让用户为了看全再翻）
+DELETE_LOG_DISPLAY = 5       # 页面展示条数（v2.0.10 曾提到 10；v2.0.11 回到 5 —— 内容区改成等高，10 条会把弹窗撑太高）
 
 # ── 详情页视图切换（保种任务 / 最近删除）────────────────────────────
 # 详情页组件树的 props 是**单向 v-bind、没有 v-model**（见 PageRender.vue），
@@ -682,7 +682,7 @@ def _deleted_log_block(rows: List[Dict[str, Any]], total: int) -> dict:
     }
 
 
-# ─────── 详情页视图切换条（分段胶囊 · v2.0.8，2.0.9 修字色） ───────
+# ─────── 详情页视图切换条（分段胶囊 · v2.0.8，2.0.9 修字色，2.0.11 视图等高） ───────
 # 观感对齐 iOS segmented：整条做成一个胶囊容器，选中项白底浮起。
 # 配色沿用卡片那一族（surface-variant 低透明度），视觉重量低于任务卡。
 SEG_TRACK_STYLE = (
@@ -770,6 +770,34 @@ def _page_view_switch(active: str, hr_count: int, del_count: int, plugin_id: str
     }
 
 
+# ── 详情页内容区固定高度（v2.0.11）──────────────────────────────
+# 弹窗是 `<VDialog scrollable>` 且**垂直居中**（PluginDataDialog.vue），内容一变高
+# 整个卡片就重新居中 —— 切换条跟着上下跳。真机实测（视口 1574×1060）：
+# 视图① 内容 504px、视图② 内容 702px，点一下分段切换条位移 99px、弹窗高度差 198px。
+# 把「切换条以下」的正文锁成同一个高度，两个视图就永远等高 ⇒ 切换零位移。
+# 用 vh 比例而不是写死像素：不同窗口尺寸下都不会顶满屏幕或空掉半屏。
+#
+# 🔴 上下各 12px 内边距是**必须的**：里面那层 VRow 带 `margin: -12px`，
+#    在滚动容器上不补回来，第一块的顶部会被裁掉 12px。
+VIEW_BODY_VH = 45            # 正文高度 = 视口高度的 45%
+VIEW_BODY_MIN_H = 300        # 小窗口兜底（保证 5 条时间轴放得下）
+VIEW_BODY_MAX_H = 560        # 大屏上限（别把弹窗撑满整屏）
+VIEW_BODY_STYLE = (
+    f"height: {VIEW_BODY_VH}vh; min-height: {VIEW_BODY_MIN_H}px; "
+    f"max-height: {VIEW_BODY_MAX_H}px; padding: 12px 0; box-sizing: border-box; "
+    "overflow-y: auto; overflow-x: hidden;"
+)
+
+
+def _view_body(blocks: List[dict]) -> dict:
+    """把视图正文块包进固定高度的容器。
+
+    两个视图用**同一份 style 串**，高度必然相等 —— 这就是「切换不跳动」的判据，
+    回归里直接比对两个视图的容器 style 是否逐字节相同。
+    """
+    return {"component": "div", "props": {"style": VIEW_BODY_STYLE},
+            "content": blocks}
+
 def _empty_view_hint(text: str) -> dict:
     """当前视图没有内容时的占位提示。
 
@@ -807,7 +835,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.10"
+    plugin_version = "2.0.11"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1613,23 +1641,26 @@ class ChdbitsHrMonitor(_PluginBase):
         # 旧版把记录拼成一段 pre-line 文本，长片名折行后字段彼此对不齐，
         # 5 条会渲染成 11 行；这里改成结构化组件树，每条恒定两行。
         if view == PAGE_VIEW_DEL:
+            body_blocks: List[dict] = []
             if deleted_log:
                 recent = sorted(
                     deleted_log.items(),
                     key=lambda kv: float(kv[1].get("deleted_at") or 0),
                     reverse=True,
                 )[:DELETE_LOG_DISPLAY]
-                page_content.append(
+                body_blocks.append(
                     _deleted_log_block([rec for _, rec in recent], len(deleted_log))
                 )
             else:
-                page_content.append(_empty_view_hint("暂无删除留档。"))
+                body_blocks.append(_empty_view_hint("暂无删除留档。"))
+            page_content.append(_view_body(body_blocks))
             return page_content
 
         # ── 视图①：保种任务清单 ────────────────────────────────────
         # 站点视角 / 本地 QB 视角 / 已完成待删除 三份数据源合成一个列表，
         # 同一个种子只保留一条；站点做种时间与本地做种时间分列显示，
         # 站点任务消失后站点侧显示「已移除」，本地时长依旧可读。
+        body_blocks: List[dict] = []
         counts: Dict[str, int] = {}
         for item in display_items:
             counts[item["state"]] = counts.get(item["state"], 0) + 1
@@ -1638,7 +1669,7 @@ class ChdbitsHrMonitor(_PluginBase):
             # 插件重载后内存态被清空，此时只有持久化的完成态记录可显示，
             # 需要显式说明，避免被误读成「保种中的任务都消失了」
             if not self._last_check_time:
-                page_content.append(
+                body_blocks.append(
                     {
                         "component": "VRow",
                         "content": [
@@ -1669,7 +1700,7 @@ class ChdbitsHrMonitor(_PluginBase):
                                  ("siteonly", "本地未找到")):
                 if counts.get(state):
                     summary.append(f"{label} {counts[state]}")
-            page_content.append(
+            body_blocks.append(
                 {
                     "component": "VRow",
                     "content": [
@@ -1727,7 +1758,7 @@ class ChdbitsHrMonitor(_PluginBase):
                     )
                 )
 
-            page_content.append(
+            body_blocks.append(
                 {
                     "component": "VRow",
                     "content": [
@@ -1741,11 +1772,12 @@ class ChdbitsHrMonitor(_PluginBase):
             )
         else:
             # 之前这里什么都不渲染 —— 有了切换条之后整页就只剩它，看着像坏了。
-            page_content.append(
+            body_blocks.append(
                 _empty_view_hint("当前没有纳入统计的 H&R 任务；"
                                  "站点侧未完成的 H&R 任务会在下一轮检查后出现。")
             )
 
+        page_content.append(_view_body(body_blocks))
         return page_content
 
     def get_service(self) -> List[Dict[str, Any]]:
