@@ -30,6 +30,13 @@ HR_DEFAULT_CYCLE_HOURS = 120.0
 # （v1.9.1/v1.9.2 曾按周期的 5% 追加余量，5 天周期要拖到 126 小时才删，过于保守。）
 HR_CYCLE_MARGIN_RATIO = 0.0
 HR_CYCLE_MARGIN_MIN_HOURS = 0.5
+# 「站点 H&R 列表为空」的权威确认门槛（v2.0.15）：连续多少轮「0 条 + 登录态正常」
+# 才认定站点确实没有未完成 H&R。配合页面顶栏的 `H&R: N` 计数使用 ——
+# 计数明确为 0 时一轮即可放行；计数明确大于 0 时一律判解析失效、不放行。
+# 背景：列表为空有两种成因（真没任务 / 页面异常），v2.0.14 及以前一律当异常，
+# 于是「最后一个 H&R 任务完成、站点把它移出列表」时会永久跳过比对 —— 本地任务
+# 不被删就会一直在，条件恒真 ⇒ 死锁（2026-10-08 实测踩到）。
+HR_ZERO_CONFIRM_STREAK = 2
 # UHD原盘自动下载 插件ID（用于读取副标题与种子标题）
 UHD_PLUGIN_ID = "UhdBlurayAutoDownload"
 # UHD原盘自动下载 插件的已处理记录键名
@@ -897,7 +904,7 @@ class ChdbitsHrMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "CHDBits.png"
     # 插件版本
-    plugin_version = "2.0.14"
+    plugin_version = "2.0.15"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -927,6 +934,10 @@ class ChdbitsHrMonitor(_PluginBase):
     _last_hr_tasks: List[Dict[str, Any]] = []
     # 上次站点 H&R 任务数，用于检测骤降异常
     _last_hr_count: int = 0
+    # 连续多少轮「站点 H&R 列表为空且登录态正常」（v2.0.15）
+    _zero_streak: int = 0
+    # 最近一次抓取到的页面信号：页面是否已登录 / 站点顶栏 H&R 计数（v2.0.15）
+    _page_signals: Dict[str, Any] = {}
     # 最近一次 QB 与站点比对明细
     _last_compare_items: List[Dict[str, Any]] = []
     # 最近一次「本地任务 × 站点记录」的互斥分配结果
@@ -956,6 +967,8 @@ class ChdbitsHrMonitor(_PluginBase):
         self._last_error = ""
         self._last_hr_tasks = []
         self._last_hr_count = 0
+        self._zero_streak = 0
+        self._page_signals = {}
         self._last_compare_items = []
         self._site_assignment = None
 
@@ -1876,7 +1889,7 @@ class ChdbitsHrMonitor(_PluginBase):
         self._last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # 1. 抓取站点 H&R 页面
-        hr_tasks, error = self.__fetch_hr_tasks()
+        hr_tasks, error, page_signals = self.__fetch_hr_tasks()
         if error:
             self._last_error = error
             logger.error(f"彩虹岛HR监控：抓取H&R页面失败，{error}")
@@ -1890,14 +1903,40 @@ class ChdbitsHrMonitor(_PluginBase):
 
         self._last_error = ""
         self._last_hr_tasks = hr_tasks
+        self._page_signals = page_signals
         logger.info(f"彩虹岛HR监控：站点未完成 H&R 任务 {len(hr_tasks)} 个")
 
-        # 安全校验：站点任务数相比上次骤降时，视为页面异常，跳过本次比对。
+        # ── 「列表为空」的权威确认（v2.0.15）──────────────────────────
+        # 站点 H&R 列表为空有两种完全不同的成因，v2.0.14 及以前一律当页面异常：
+        #   ① 真的没有未完成 H&R（例如最后一个任务刚好完成、站点把它移出列表）
+        #   ② 页面异常（cookie 失效返回登录页 / 站点改版 / 解析失效……）
+        # ① 在旧版会死锁：本地那个任务不被删就一直在 ⇒ 下一轮又是「0 条 +
+        # 本地有任务」⇒ 永远跳过比对（2026-10-08 实测踩到）。
+        # 这里用两个独立信号把 ① 辨认出来，详见 `__confirm_empty_hr`。
+        zero_confirmed = False
+        if not hr_tasks:
+            self._zero_streak += 1
+            zero_confirmed, zero_reason = self.__confirm_empty_hr()
+            if zero_confirmed:
+                logger.info(
+                    f"彩虹岛HR监控：站点 H&R 列表为空，已确认属实（{zero_reason}），"
+                    f"本轮按「无未完成任务」继续比对"
+                )
+            else:
+                self._last_error = (
+                    f"站点 H&R 页面解析到 0 个任务，疑似页面异常，"
+                    f"已跳过本次比对（{zero_reason}）"
+                )
+        else:
+            self._zero_streak = 0
+
+        # 安全校验①：站点任务数相比上次骤降时，视为页面异常，跳过本次比对。
         # 站点 H&R 任务通常只会缓慢减少，若一次减少超过一半（且上次有任务），
         # 很可能是页面解析不完整或 cookie 失效，此时比对会误判为「已完成」。
+        # 🔴 已确认属实的空列表不算骤降 —— 否则「最后一个任务完成」时仍被拦下。
         prev_count = self._last_hr_count
         self._last_hr_count = len(hr_tasks)
-        if prev_count > 0 and len(hr_tasks) < prev_count / 2:
+        if not zero_confirmed and prev_count > 0 and len(hr_tasks) < prev_count / 2:
             self._last_error = (
                 f"站点 H&R 任务数骤降（{prev_count} → {len(hr_tasks)}），"
                 f"疑似页面异常，已跳过本次比对"
@@ -1931,10 +1970,12 @@ class ChdbitsHrMonitor(_PluginBase):
         ]
         logger.info(f"彩虹岛HR监控：本地分类 {self._category} 任务 {len(local_torrents)} 个")
 
-        # 安全校验：站点解析出 0 个任务但本地有任务时，视为页面异常（如 cookie 失效、
+        # 安全校验②：站点解析出 0 个任务但本地有任务时，视为页面异常（如 cookie 失效、
         # 页面改版返回登录页），跳过本次比对，避免误判为已完成而删除任务。
-        if not hr_tasks and local_torrents:
-            self._last_error = "站点 H&R 页面解析到 0 个任务，疑似页面异常，已跳过本次比对"
+        # 🔴 例外：**已权威确认的空列表要放行**（v2.0.15）—— 这正是「最后一个 H&R
+        # 任务完成」的正常形态。放行不等于直接删：下面仍有保种时长闸门（本地做种
+        # 必须已达周期 + 余量）、「必须曾在站点出现过」的证据、以及 delete_delay 缓冲。
+        if not hr_tasks and local_torrents and not zero_confirmed:
             logger.warning(f"彩虹岛HR监控：{self._last_error}")
             if self._notify:
                 self.post_message(
@@ -2420,14 +2461,15 @@ class ChdbitsHrMonitor(_PluginBase):
             return max(0.0, now_ts - completion_on)
         return 0.0
 
-    def __fetch_hr_tasks(self) -> Tuple[List[Dict[str, Any]], str]:
+    def __fetch_hr_tasks(self) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
         """抓取并解析站点 H&R 页面。
 
-        :return: (HR 任务列表, 错误信息)；成功时错误信息为空字符串
+        :return: (HR 任务列表, 错误信息, 页面信号)；成功时错误信息为空字符串，
+                 页面信号形如 ``{"logged_in": bool, "hr_count": int | None}``
         """
         site = self.__get_site_config()
         if not site:
-            return [], "未找到彩虹岛站点配置"
+            return [], "未找到彩虹岛站点配置", {}
 
         try:
             res = RequestUtils(
@@ -2437,14 +2479,77 @@ class ChdbitsHrMonitor(_PluginBase):
                 timeout=site.get("timeout") or 20,
             ).get_res(url=self._hr_url)
         except Exception as err:
-            return [], f"请求异常：{str(err)}"
+            return [], f"请求异常：{str(err)}", {}
 
         if res is None:
-            return [], "无法连接站点"
+            return [], "无法连接站点", {}
         if res.status_code != 200:
-            return [], f"站点返回状态码 {res.status_code}"
+            return [], f"站点返回状态码 {res.status_code}", {}
 
-        return self.__parse_hr_page(res.text), ""
+        # 页面信号先于任务行解析取：即使一行都没解析到（例如站点在「无未完成
+        # H&R」时返回的权限错误页），登录态与顶栏 H&R 计数照样读得到。
+        signals = self.__parse_page_signals(res.text)
+        return self.__parse_hr_page(res.text), "", signals
+
+    def __confirm_empty_hr(self) -> Tuple[bool, str]:
+        """判定「站点 H&R 列表为空」是真没任务、还是页面异常（v2.0.15）。
+
+        :return: (是否确认属实, 判定依据)
+        """
+        # 前置条件：页面必须处于已登录状态。cookie 失效时 NexusPHP 返回登录页，
+        # 不含用户栏 ⇒ 一律判异常，旧版的保护在这里**一点没松**。
+        if not self._page_signals.get("logged_in"):
+            return False, "页面未呈现已登录状态（疑似 cookie 失效或页面改版）"
+
+        hr_count = self._page_signals.get("hr_count")
+        if hr_count == 0:
+            # 站点自己给出的权威数字：顶栏 `H&R: 0` ⇒ 确实没有未完成 H&R，一轮即放行
+            return True, "站点顶栏 H&R 计数为 0"
+        if isinstance(hr_count, int) and hr_count > 0:
+            # 站点说有任务、我们一行都没解析到 ⇒ 明确是解析失效，绝不放行
+            return False, (
+                f"站点顶栏 H&R 计数为 {hr_count}，但页面未解析到任务行"
+                f"（疑似页面改版导致解析失效）"
+            )
+
+        # 计数不可得（页面改版把用户栏拿掉了？）：退回「连续为空」的宽限
+        if self._zero_streak >= HR_ZERO_CONFIRM_STREAK:
+            return True, (
+                f"连续 {self._zero_streak} 轮解析到 0 个任务且登录态正常"
+                f"（未取到顶栏 H&R 计数）"
+            )
+        return False, (
+            f"连续 {self._zero_streak} 轮为 0、且未取到顶栏 H&R 计数，"
+            f"未达 {HR_ZERO_CONFIRM_STREAK} 轮门槛"
+        )
+
+    @staticmethod
+    def __parse_page_signals(html: str) -> Dict[str, Any]:
+        """提取「页面是否已登录」与「站点顶栏 H&R 计数」（v2.0.15）。
+
+        为什么单独提信号：``__parse_hr_page`` 只回答「表格里有没有任务行」，
+        而「0 行」至少有三种成因（真没任务 / 登录态失效 / 页面改版），单看
+        行数分不出来。这里补两个与行数无关的信号做交叉验证。
+
+        2026-10-08 对 CHDBits 实测：
+          · 有未完成 H&R → 正常表格，顶栏 ``H&R: 1``
+          · 无未完成 H&R → **HTTP 200 +「错误 您无权访问此页面。」**，顶栏 ``H&R: 0``
+          · cookie 失效 → 登录页，**不含**「欢迎回来」
+
+        :param html: 页面 HTML
+        :return: ``{"logged_in": bool, "hr_count": int | None}``
+        """
+        text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html,
+                      flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"&nbsp;?", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        # 用户栏在页面最上方，只看前 4000 字符，避免命中正文里别的 H&R 字样
+        head = text[:4000]
+        logged_in = ("欢迎回来" in head) or ("退出" in head and "魔力值" in head)
+        match = re.search(r"H&R\s*[:：]\s*(\d+)", head)
+        hr_count: Optional[int] = int(match.group(1)) if match else None
+        return {"logged_in": logged_in, "hr_count": hr_count}
 
     @staticmethod
     def __parse_hr_page(html: str) -> List[Dict[str, Any]]:
