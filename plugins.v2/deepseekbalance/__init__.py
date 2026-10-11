@@ -1,3 +1,5 @@
+import base64
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +18,77 @@ BALANCE_HISTORY_LIMIT = 200
 ALERT_STATE_KEY = "alert_state"
 
 
+# ---------------------------------------------------------------------------
+# 插件图标
+# ---------------------------------------------------------------------------
+# 前端 PluginAppCard 的取值逻辑（实测 /public/assets/PluginAppCard-*.js）：
+#     plugin_icon.startsWith("http") ? "/api/v1/system/img/1?imgurl=<url>&cache=true"
+#                                    : "./plugin_icon/<icon>"
+# 两条路本机都实测过：
+#   · http 形式（raw.githubusercontent.com）：图片代理由后端抓取，而前端**不带**
+#     proxy=true ⇒ 后端直连 GitHub，实测 30s 超时；只有 7 天图片缓存命中时才显示，
+#     缓存过期即永久裂图。不用。
+#   · 相对文件名：走面板自带的 ./plugin_icon/，由前端静态服务直接吐文件，
+#     不依赖外网、不依赖缓存。用它。
+# 代价：/public 住在容器镜像层里（没有挂载），容器重建就会丢 —— 所以下面做一次
+# 自愈写入：插件启动时若文件缺失就补回去。
+PLUGIN_ICON_NAME = "deepseek.png"
+PLUGIN_ICON_DIR = "/public/plugin_icon"
+# 128x128 PNG（品牌蓝实心圆 + 白色鲸鱼，取自 DeepSeek 官方 favicon）
+PLUGIN_ICON_B64 = (
+    "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"
+)
+
+
+def ensure_plugin_icon() -> None:
+    """保证面板的 ./plugin_icon/<name> 能取到本插件图标（容器重建后自愈）。
+
+    失败一律吞掉并记一条 warn —— 图标只是观感，绝不能因此影响插件加载。
+    """
+    try:
+        target = os.path.join(PLUGIN_ICON_DIR, PLUGIN_ICON_NAME)
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            return
+        os.makedirs(PLUGIN_ICON_DIR, exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(base64.b64decode(PLUGIN_ICON_B64))
+        logger.info(f"DeepSeek余额监控：已补写插件图标 {target}")
+    except Exception as err:      # noqa: BLE001
+        logger.warn(f"DeepSeek余额监控：补写插件图标失败（不影响插件运行）：{err}")
+
+
 class DeepSeekBalance(_PluginBase):
     """DeepSeek 开放平台余额监控插件。
 
@@ -28,9 +101,9 @@ class DeepSeekBalance(_PluginBase):
     # 插件描述
     plugin_desc = "定时查询DeepSeek账户余额，记录消耗明细，低于阈值时通知提醒。"
     # 插件图标
-    plugin_icon = "deepseek.png"
+    plugin_icon = PLUGIN_ICON_NAME
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -68,6 +141,9 @@ class DeepSeekBalance(_PluginBase):
         """
         # 停止现有任务
         self.stop_service()
+
+        # 保证面板能取到图标（/public 不在持久层，容器重建后会丢）
+        ensure_plugin_icon()
 
         # 重置状态
         self._enabled = False
