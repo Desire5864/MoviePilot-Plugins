@@ -1,3 +1,5 @@
+import base64
+import os
 import re
 import threading
 import time
@@ -284,6 +286,117 @@ def _format_speed(bytes_per_sec: Any) -> str:
     return f"{speed / 1024 / 1024:.1f} MB/s"
 
 
+# ---------------------------------------------------------------------------
+# 插件图标（v2.25.2 起）
+# 面板卡片读的是源码类属性 plugin_icon（已装插件走 get_local_plugins 取类属性，
+# 只有市场条目才读 package.v2.json 的 icon ⇒ 两处都要改）。
+# 相对文件名会被前端解析成 ./plugin_icon/<name>，由前端静态服务(:3000)直接从容器
+# /public/plugin_icon/ 取文件 —— 那目录是镜像烘焙的官方图标，里面没有 UHD.png，
+# 于是卡片回落到默认占位（蓝圆 + 白拼图）。
+# 这里自绘「蓝光原盘」标：亮蓝(#1E6FE0)底 + 白色光光盘（中心孔 + 内圈细环 + 左上高光弧），
+# 128x128 PNG，64 色量化后仅 4.1 KB。
+# 卡片头像是 48px 圆形裁切（object-fit: cover，是圆裁不是方裁）—— 方标四角最先被切。
+# 本图最远非底色像素距圆心 51.8、圆半径 64 ⇒ 余量 12.2px（9.5% 直径，48px 折合 4.6px），
+# 远高于 6% 安全门槛，不会被切平。
+# /public 住在容器可写层、不持久，容器重建即丢 —— 故做一次启动自愈写入。
+# 注：文件名沿用 "UHD.png"，BdmvToIso 插件共用同一个图标，一并受益。
+# ---------------------------------------------------------------------------
+PLUGIN_ICON_NAME = "UHD.png"
+PLUGIN_ICON_DIR = "/public/plugin_icon"
+# 128x128 PNG（亮蓝底 + 白色光光盘，自绘；供 UhdBlurayAutoDownload / BdmvToIso 共用）
+PLUGIN_ICON_B64 = (
+    "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"
+)
+
+
+def ensure_plugin_icon() -> None:
+    """保证面板的 ./plugin_icon/<name> 能取到本插件图标（容器重建后自愈）。
+
+    失败一律吞掉并记一条 warn —— 图标只是观感，绝不能因此影响插件加载。
+    """
+    try:
+        target = os.path.join(PLUGIN_ICON_DIR, PLUGIN_ICON_NAME)
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            return
+        os.makedirs(PLUGIN_ICON_DIR, exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(base64.b64decode(PLUGIN_ICON_B64))
+        logger.info(f"UHD原盘自动下载：已补写插件图标 {target}")
+    except Exception as err:      # noqa: BLE001
+        logger.warn(f"UHD原盘自动下载：补写插件图标失败（不影响插件运行）：{err}")
+
+
 class UhdBlurayAutoDownload(_PluginBase):
     """4K UHD BluRay 原盘自动下载插件。
 
@@ -296,9 +409,9 @@ class UhdBlurayAutoDownload(_PluginBase):
     plugin_name = "UHD原盘自动下载"
     plugin_desc = "监控多站点4K UHD原盘并推送下载器。采集站点可勾选，分类/标签/路径逐站可配，支持只推免费。"
     # 插件图标
-    plugin_icon = "UHD.png"
+    plugin_icon = PLUGIN_ICON_NAME
     # 插件版本
-    plugin_version = "2.25.1"
+    plugin_version = "2.25.2"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -500,6 +613,9 @@ class UhdBlurayAutoDownload(_PluginBase):
 
         :param config: 插件配置字典
         """
+        # 保证面板 ./plugin_icon/ 下能取到本插件图标（容器重建后自愈）
+        ensure_plugin_icon()
+
         # 停止现有任务
         self.stop_service()
 
