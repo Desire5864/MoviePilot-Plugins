@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import os
 import re
 import secrets
 import threading
@@ -149,6 +150,61 @@ def _traffic_tone(pct: float) -> str:
     return "rgb(var(--v-theme-primary))"
 
 
+# ---------------------------------------------------------------------------
+# 插件图标
+# ---------------------------------------------------------------------------
+# 前端 PluginAppCard 的取值逻辑（实测 /public/assets/PluginAppCard-*.js）：
+#     plugin_icon.startsWith("http") ? "/api/v1/system/img/1?imgurl=<url>&cache=true"
+#                                    : "./plugin_icon/<icon>"
+# 两条路本机都实测过：
+#   · http 形式（raw.githubusercontent.com）：图片代理由后端抓取，而前端**不带**
+#     proxy=true（见 core/plugin.py 的 _get_request_params：proxy=False ⇒ proxies=None），
+#     面板直连 raw.githubusercontent.com 实测 30s 超时 ⇒ 只有图片缓存命中时才显示，
+#     缓存 TTL 7 天，过期后就是永久裂图。不用。
+#   · 相对文件名：走面板自带的 ./plugin_icon/，由前端静态服务直接吐文件，
+#     不依赖外网、不依赖缓存。用它。
+# 代价：/public 住在容器镜像层里（没有挂载），容器重建就会丢 —— 所以下面做一次
+# 自愈写入：插件启动时若文件缺失就补回去。
+PLUGIN_ICON_NAME = "scptrafficmonitor.png"
+PLUGIN_ICON_DIR = "/public/plugin_icon"
+# 64x64 PNG（圆角方块 + 白色标识，来自用户提供的 favicon）
+PLUGIN_ICON_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAADK0lEQVR4nOWbS2gTURSGvzlO+rDW"
+    "tyKCglHsQnCj1q58gC4EF4IiCuKiZCGCdhF00aW6LYigKIQuFEGKIohupCtBKKKoiCBSqvjAR62o"
+    "tS9TGjnhpsaYjjHG2pnzhUAyufcO/5+5c87cmePxG2KJZA2wBdgONAFxoJ6pyQDQDXQB14HOdKpt"
+    "OKiDN9EPsURyOnAQOAwsIZy8BE4BZ9KptsGSDYglko1AO7CKaPAYaE6n2u4EGhBLJAXY7cTXEi2G"
+    "1ASgI51qG8tt9Asaqfjz6gXRo9ZpUy79cgTEEsm1wK0I/vPFjoRNueng5Z3w7kRozpdyTmjUE6PO"
+    "eeWAIfE4raoZz8X5pyEOdX8TIleKS3Ksicdp3iIuw7PKdnHprVWa1IAV2CWuiVDdn/aaPb2WnWtW"
+    "43kTXkpUjP7hEZ68ecejV28Yy2QqPXx9YSZYEotm1nN63y5E/r0Bigp//uEjx6/d5GLXvYqOLYQA"
+    "8TziC+bR3ryHYzu2VXZsQoROuaPbNrOxYblNAxQRoWXrBswaoGxsWEHVtGmYNWBGdRWL58yqyFh+"
+    "OZ2GR0e5/+LVeBisq66iYdHCwD49vX18GtQr0Ymp8n2WzZ+bHS8I3e+CGXXZyPBfDHjW28f6EyfH"
+    "v6+PL+V2a0tgn9YrN7h892FJIfbqoWbWLVsa2K5SOYiU00l3LnlvfZW0s4J+xd7v+7+SuqWLupOD"
+    "MAX5PBS4kh19AyYTwTiCcQTjCMYRjCMYRzCOYBzBOIJxBOMIxhGMIxhHMI5gHME4PiElQ+anm6Ve"
+    "mQulPiGlvXkvAyPfsp8zmQx7z10oa5ncJ6Tk34cYG8tQ45cnRTCOYBzBOIJxBOP4lRhEw8/BC5cD"
+    "2zx48brk8bTt78bLR8Pg2y/9lIMXSyS/TOESmH/NgE6BHuzSrQZM3r3oqUeXuOoqq1xXAzrdo+PW"
+    "UM2d4urqfjzvYoeTqj2XB5x1ZSRWeOw0kzXAFRVqSVnwY1wRKp/LFVJKbqurolIT0kSXdGEBpRQ0"
+    "6AD2R/RIGHLaVOM4nvXSWSnW2jVUE46EPES+dBoai4knqHo8R8jK5/WKSFP7ksvnvwOnudpmflat"
+    "KAAAAABJRU5ErkJggg=="
+)
+
+
+def ensure_plugin_icon() -> None:
+    """保证面板的 ./plugin_icon/<name> 能取到本插件图标（容器重建后自愈）。
+
+    失败一律吞掉并记一条 warn —— 图标只是观感，绝不能因此影响插件加载。
+    """
+    try:
+        target = os.path.join(PLUGIN_ICON_DIR, PLUGIN_ICON_NAME)
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            return
+        os.makedirs(PLUGIN_ICON_DIR, exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(base64.b64decode(PLUGIN_ICON_B64))
+        logger.info(f"SCP流量监控：已补写插件图标 {target}")
+    except Exception as err:      # noqa: BLE001
+        logger.warn(f"SCP流量监控：补写插件图标失败（不影响插件运行）：{err}")
+
+
 class ScpTrafficMonitor(_PluginBase):
     """Server Control Panel（servercontrolpanel.de）流量监控插件。
 
@@ -163,9 +219,9 @@ class ScpTrafficMonitor(_PluginBase):
     # 插件描述
     plugin_desc = "监控Server Control Panel服务器计费月流量，按TB展示，超阈值时通知。"
     # 插件图标
-    plugin_icon = "world.png"
+    plugin_icon = PLUGIN_ICON_NAME
     # 插件版本
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -211,6 +267,7 @@ class ScpTrafficMonitor(_PluginBase):
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
         self.stop_service()
+        ensure_plugin_icon()
 
         self._enabled = False
         self._notify = False
