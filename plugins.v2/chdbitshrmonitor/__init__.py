@@ -1,3 +1,5 @@
+import base64
+import os
 import re
 from datetime import datetime
 from html import escape
@@ -890,6 +892,49 @@ def _empty_view_hint(text: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 插件图标（v2.0.16 起）
+# 面板卡片读的是源码类属性 plugin_icon（已装插件走 get_local_plugins 取类属性，
+# 只有市场条目才读 package.v2.json 的 icon ⇒ 两处都要改）。
+# 相对文件名会被前端解析成 ./plugin_icon/<name>，由前端静态服务(:3000)直接从容器
+# /public/plugin_icon/ 取文件 —— 那目录是镜像烘焙的官方图标，里面没有本插件的
+# 图标，于是卡片回落到默认占位（蓝圆 + 白拼图）。
+# 这里用彩虹岛（ptchdbits.co）官方图标：favicon 里的红黑 CHD 方标，抠掉外围浅蓝底、
+# 放大 6 倍最近邻（保持像素画锐度）后置于白底，输出 128x128。
+# /public 住在容器可写层、不持久，容器重建即丢 —— 故做一次启动自愈写入。
+# ---------------------------------------------------------------------------
+PLUGIN_ICON_NAME = "CHDBits.png"
+PLUGIN_ICON_DIR = "/public/plugin_icon"
+# 128x128 PNG（白底 + 彩虹岛 CHD 方标，取自 ptchdbits.co/favicon.ico）
+PLUGIN_ICON_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAABg0lEQVR42u3dUa6DIBBA0aHp/rc8"
+    "XcF8aAEFzvl+SV/MDToVbcvMDI71cQgEgAAQAAJAAAgAASAABIAAEAACQAAIgB19p39ia476HYO2"
+    "bVgBnAIQAAJAAJgCXO2/VnU8/5wOrABOAQgAASAATAEvvNo/7dHFydOTFcApAAEgAASAKSCW2fHS"
+    "Fr/XUL6YZfLUYwVwCkAACAABYAogpn3l3/pMDVYABIAAEAAC4JgpIB+6d9Dravzq/1P9fXouAAEg"
+    "AASAABAAAkAACAABIADCjqCIcTtqrAAIAAEgAASAKSA22Yd/yjRhBXAKQAAIAAEgAASAABAAAkAA"
+    "CAABIAAEgAAQAGFHUOy0w2eVz/WmUASAABAAAsAUEJ5WtgIgAASAABAAq08B1XfsxdXytu/8uXqv"
+    "we8FIAAEgAAQAPOngOoqtNfOmYd24FgBEAACQAAIAFPA66aDOG4LkRUAASAABIAAWHVHkF/vsgIg"
+    "AASAABAAAkAACAABIAAEgAAQAAJAAIz2AzPgORCxEs0MAAAAAElFTkSuQmCC"
+)
+
+
+def ensure_plugin_icon() -> None:
+    """保证面板的 ./plugin_icon/<name> 能取到本插件图标（容器重建后自愈）。
+
+    失败一律吞掉并记一条 warn —— 图标只是观感，绝不能因此影响插件加载。
+    """
+    try:
+        target = os.path.join(PLUGIN_ICON_DIR, PLUGIN_ICON_NAME)
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            return
+        os.makedirs(PLUGIN_ICON_DIR, exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(base64.b64decode(PLUGIN_ICON_B64))
+        logger.info(f"彩虹岛HR监控：已补写插件图标 {target}")
+    except Exception as err:      # noqa: BLE001
+        logger.warn(f"彩虹岛HR监控：补写插件图标失败（不影响插件运行）：{err}")
+
+
 class ChdbitsHrMonitor(_PluginBase):
     """彩虹岛 H&R 种子监控插件。
 
@@ -902,9 +947,9 @@ class ChdbitsHrMonitor(_PluginBase):
     plugin_name = "彩虹岛HR监控"
     plugin_desc = "监控彩虹岛H&R任务，完成后延迟自动删除QB任务与本地文件。"
     # 插件图标
-    plugin_icon = "CHDBits.png"
+    plugin_icon = PLUGIN_ICON_NAME
     # 插件版本
-    plugin_version = "2.0.15"
+    plugin_version = "2.0.16"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -950,6 +995,9 @@ class ChdbitsHrMonitor(_PluginBase):
 
         :param config: 插件配置字典
         """
+        # 保证面板 ./plugin_icon/ 下能取到本插件图标（容器重建后自愈）
+        ensure_plugin_icon()
+
         # 停止现有任务
         self.stop_service()
 
