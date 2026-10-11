@@ -9,7 +9,9 @@
   · 实例保活（意外停止且在允许运行时段内则拉起，阈值熔断优先）
   · 定时日报（统计「时段内实际消耗」而非累计值）
   · 可选账单：账户可用余额 + 实例当月费用
-  · 详情页看板：逐账号卡片（进度条 / 用量 / 剩余 / 增量）+ 手动刷新 / 开机 / 停机
+  · 详情页看板：逐账号卡片（金额 / 进度条 / 用量 / 剩余 / 增量）+ 手动刷新 / 开机 / 停机
+  · 配置表单：主实例逐字段填写（AK / Secret / 实例 / 地域 / 额度 / 站点类型 / 备注 / 定时），
+    Secret 不回显（留空即保持不变），多账号写在下方的「附加账号」里
 
 与原版 Go 项目的差异（刻意的）：
 
@@ -78,6 +80,21 @@ _BYTES_PER_GIB = 1024.0 * 1024.0 * 1024.0
 
 # 持久化键名
 STATE_KEY = "account_state"          # 逐账号运行时状态 + 采样 + 告警去重
+# 主实例的 AccessKey Secret 不进配置表单：只在这里留一份，表单永远显示「留空保持不变」
+SECRET_KEY = "access_key_secret"
+
+# 站点类型：只决定 BSS 账单接口走中国站还是国际站（与流量分类无关）
+SITE_TYPE_CN = "china"
+SITE_TYPE_INTL = "international"
+_SITE_TYPE_ITEMS = [
+    {"title": "中国站", "value": SITE_TYPE_CN},
+    {"title": "国际站", "value": SITE_TYPE_INTL},
+]
+
+# 币种符号（CDC 账单返回的 Currency，未收录的原样带出）
+_CURRENCY_SYMBOLS = {
+    "CNY": "¥", "RMB": "¥", "USD": "$", "HKD": "HK$", "JPY": "JP¥", "EUR": "€",
+}
 # 每个账号保留的采样条数（详情页算「较上次 / 24h 增量」用）
 ACCOUNT_SAMPLE_LIMIT = 24
 # 打开详情页时缓存的最大容忍年龄（秒），超过则后台静默刷新一次
@@ -109,6 +126,15 @@ COLOR_OK = "#2E7D32"                                    # 正常 / 恢复
 COLOR_ERR = "#C0392B"                                   # 失败
 # 右下角悬浮齿轮（56px，距对话框右下各 12px）会扫过整页，右端有内容的块都要让位
 _FAB_CHANNEL = 68
+
+# ---- 图标 ----
+# 🔴 只能用面板前端**确实打包进来**的名字：前端按需打包 @mdi/js，
+#    用没被打包的图标名（例如 mdi-server-outline / mdi-power）会渲染成空白。
+ICON_SERVER = "mdi-server-network-outline"
+ICON_CLOCK = "mdi-clock-outline"
+ICON_REFRESH = "mdi-refresh"
+ICON_PLAY = "mdi-play-circle-outline"
+ICON_STOP = "mdi-stop-circle-outline"
 
 # 实例状态
 STATUS_RUNNING = "Running"
@@ -342,8 +368,13 @@ def _normalize_account(raw: Dict[str, Any], line_no: int, errors: List[str]) -> 
     # 布尔项：显式写了才覆盖全局（None = 跟随全局）
     def tri_bool(field: str) -> Optional[bool]:
         for alias in _KEY_ALIASES[field]:
-            if alias in lowered and str(lowered[alias]).strip() != "":
-                return _to_bool(lowered[alias])
+            if alias not in lowered:
+                continue
+            value = lowered[alias]
+            # 键存在但值为空（表单没填 / JSON 里写了 null）→ 仍视为「跟随全局」
+            if value is None or str(value).strip() == "":
+                return None
+            return _to_bool(value)
         return None
 
     quota = _to_float(pick("quota", None), -1.0)
@@ -426,6 +457,30 @@ def _format_signed_gb(value: float) -> str:
     value = _to_float(value)
     sign = "+" if value >= 0 else "-"
     return f"{sign}{_format_gb(abs(value))}"
+
+
+def _currency_symbol(currency: str) -> str:
+    """币种代码 → 符号（BSS 返回的 Currency，未知币种原样带出代码）。"""
+    code = str(currency or "").strip().upper()
+    if not code:
+        return "¥"
+    return _CURRENCY_SYMBOLS.get(code, f"{code} ")
+
+
+def _format_money(value: Any, currency: str = "CNY") -> str:
+    """金额文案；拿不到值时给占位符（而不是显示成 ¥0.00）。"""
+    if value in (None, ""):
+        return "—"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{_currency_symbol(currency)}{amount:,.2f}"
+
+
+def _region_items() -> List[dict]:
+    """地域下拉候选（与原版前端列表一致，顺序按 _REGION_NAMES）。"""
+    return [{"title": name, "value": region} for region, name in _REGION_NAMES.items()]
 
 
 def _percent_encode(value: Any) -> str:
@@ -788,11 +843,11 @@ class CdtTrafficMonitor(_PluginBase):
     # 插件名称
     plugin_name = "阿里云CDT流量监控"
     # 插件描述（≤48 字，卡片 3 行内可完整显示）
-    plugin_desc = "监控阿里云账号CDT流量与ECS实例，超阈值通知，可定时开关机与日报。"
+    plugin_desc = "监控阿里云账号CDT流量与ECS实例，超阈值通知，可定时开关机、日报与账单。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Desire5864/MoviePilot-Plugins/main/icons/cdttrafficmonitor.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -917,8 +972,14 @@ class CdtTrafficMonitor(_PluginBase):
             str(config.get("daily_report_time") or ""), "22:00"
         )
 
+        # 主实例的 Secret：表单留空时沿用上次保存的（只在换了 AccessKey ID 时才失效）
+        form_ak = str(config.get("account_ak") or "").strip()
+        form_sk = str(config.get("account_sk") or "").strip()
+        if form_ak and form_sk:
+            self.__remember_secret(form_ak, form_sk)
+
         self._accounts_raw = str(config.get("accounts") or "")
-        self._accounts, self._config_errors = _parse_accounts(self._accounts_raw)
+        self._accounts, self._config_errors = self.__resolve_accounts(config)
         # 兜底：任何形态的脏数据都不许让半个账号流进后续流程
         self._accounts = [item for item in self._accounts if item and item.get("ak")]
 
@@ -952,6 +1013,91 @@ class CdtTrafficMonitor(_PluginBase):
         if parsed <= 0:
             parsed = default
         return max(low, min(high, parsed))
+
+    # ------------------------------------------------------------------
+    # 账号配置：结构化「实例表单」+ 可选的多账号文本框
+    # ------------------------------------------------------------------
+
+    def __stored_secret(self, access_key_id: str) -> str:
+        """取已保存的主实例 Secret；只跟同一个 AccessKey ID 配对，换 AK 即失效。"""
+        access_key_id = str(access_key_id or "").strip()
+        if not access_key_id:
+            return ""
+        stored = self.get_data(SECRET_KEY)
+        if not isinstance(stored, dict):
+            return ""
+        if str(stored.get("ak") or "").strip() != access_key_id:
+            return ""
+        return str(stored.get("sk") or "").strip()
+
+    def __remember_secret(self, access_key_id: str, secret: str) -> None:
+        """把表单里新填的 Secret 存起来（表单本身只留空占位，不回显明文）。"""
+        access_key_id = str(access_key_id or "").strip()
+        secret = str(secret or "").strip()
+        if not access_key_id or not secret:
+            return
+        current = self.get_data(SECRET_KEY)
+        if (isinstance(current, dict)
+                and str(current.get("ak") or "").strip() == access_key_id
+                and str(current.get("sk") or "").strip() == secret):
+            return
+        try:
+            self.save_data(SECRET_KEY, {"ak": access_key_id, "sk": secret})
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"{self.plugin_name}：保存 AccessKey Secret 失败 {err}")
+
+    def __resolve_accounts(self, config: dict) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """把「实例表单」与「附加账号文本」合并成账号列表。
+
+        结构化字段（``account_*``）描述主实例；``accounts`` 文本框留给附加账号，
+        两种都空就是没配账号。只填了 ``accounts`` 的老配置照常可用。
+        """
+        errors: List[str] = []
+        accounts: List[Dict[str, Any]] = []
+
+        access_key_id = str(config.get("account_ak") or "").strip()
+        if access_key_id:
+            # 表单留空 = 沿用已保存的 Secret（「留空保持不变」）
+            secret = str(config.get("account_sk") or "").strip() or self.__stored_secret(access_key_id)
+            if secret:
+                primary = _normalize_account({
+                    "name": config.get("account_name"),
+                    "ak": access_key_id,
+                    "sk": secret,
+                    "region": config.get("account_region"),
+                    "instance": config.get("account_instance"),
+                    "quota": config.get("account_quota"),
+                    "site_type": config.get("account_site_type"),
+                    "schedule": config.get("account_schedule"),
+                    "start_time": config.get("account_start_time"),
+                    "stop_time": config.get("account_stop_time"),
+                }, 1, errors)
+                if primary:
+                    accounts.append(primary)
+            else:
+                errors.append("主实例缺少 AccessKey Secret：请在插件设置里填一次"
+                              "（之后留空即表示保持不变）")
+        elif any(str(config.get(key) or "").strip()
+                 for key in ("account_sk", "account_instance", "account_name", "account_region")):
+            errors.append("主实例缺少 AccessKey ID，已跳过")
+
+        extra, extra_errors = _parse_accounts(str(config.get("accounts") or ""))
+        errors.extend(extra_errors)
+        accounts.extend(extra)
+
+        # 去重：同一个「AK + 实例」只保留一条（结构化字段与文本框重复填时不会双算）
+        seen = set()
+        unique: List[Dict[str, Any]] = []
+        for account in accounts:
+            if not account or not account.get("ak"):
+                continue
+            key = _account_key(account)
+            if key in seen:
+                errors.append(f"账号 {account.get('name')} 与前面的配置重复，已忽略")
+                continue
+            seen.add(key)
+            unique.append(account)
+        return unique, errors
 
     def get_state(self) -> bool:
         return self._enabled
@@ -998,28 +1144,40 @@ class CdtTrafficMonitor(_PluginBase):
     # ------------------------------------------------------------------
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
-        """配置表单（Vuetify 组件树）。"""
+        """配置表单（Vuetify 组件树）。
+
+        账号部分用**结构化字段**描述主实例（对齐原版 CDT-Monitor 的「实例」表单），
+        另留一个文本框给附加账号；AccessKey Secret 不接受回显 —— 表单里永远是空的，
+        留空即沿用已保存的那一份。
+        """
+
+        def col(md: int, component: str, props: Dict[str, Any]) -> dict:
+            return {
+                "component": "VCol",
+                "props": {"cols": 12, "md": md},
+                "content": [{"component": component, "props": props}],
+            }
 
         def text_col(model: str, label: str, hint: str = "", md: int = 4,
-                     placeholder: str = "", field_type: str = "text") -> dict:
+                     placeholder: str = "", field_type: str = "text", suffix: str = "") -> dict:
             props: Dict[str, Any] = {
                 "model": model, "label": label, "type": field_type, "density": "comfortable",
             }
             if placeholder:
                 props["placeholder"] = placeholder
+            if suffix:
+                props["suffix"] = suffix
             if hint:
                 props["hint"] = hint
                 props["persistent-hint"] = True
-            return {"component": "VCol", "props": {"cols": 12, "md": md},
-                    "content": [{"component": "VTextField", "props": props}]}
+            return col(md, "VTextField", props)
 
         def switch_col(model: str, label: str, hint: str = "", md: int = 4) -> dict:
             props: Dict[str, Any] = {"model": model, "label": label, "density": "comfortable"}
             if hint:
                 props["hint"] = hint
                 props["persistent-hint"] = True
-            return {"component": "VCol", "props": {"cols": 12, "md": md},
-                    "content": [{"component": "VSwitch", "props": props}]}
+            return col(md, "VSwitch", props)
 
         def select_col(model: str, label: str, items: List[dict], hint: str = "",
                        md: int = 4) -> dict:
@@ -1029,8 +1187,28 @@ class CdtTrafficMonitor(_PluginBase):
             if hint:
                 props["hint"] = hint
                 props["persistent-hint"] = True
-            return {"component": "VCol", "props": {"cols": 12, "md": md},
-                    "content": [{"component": "VSelect", "props": props}]}
+            return col(md, "VSelect", props)
+
+        def section(title: str) -> dict:
+            return {
+                "component": "VRow",
+                "content": [col(12, "div", {
+                    "style": ("font-size:13px;font-weight:700;letter-spacing:0;"
+                              "padding:10px 0 2px;"),
+                    "text": title,
+                })],
+            }
+
+        # 表单永远不回显 Secret：这里只判断「是否已经存过一份」，用来提示「已配置」
+        saved: Dict[str, Any] = {}
+        try:
+            loaded = self.get_config()
+            if isinstance(loaded, dict):
+                saved = loaded
+        except Exception:  # noqa: BLE001
+            saved = {}
+        saved_ak = str(saved.get("account_ak") or "").strip()
+        secret_saved = bool(saved_ak and self.__stored_secret(saved_ak))
 
         return [
             {
@@ -1045,6 +1223,112 @@ class CdtTrafficMonitor(_PluginBase):
                                        "流量回落到阈值以下时补一条恢复提示"),
                         ],
                     },
+                    section("监控实例"),
+                    {
+                        "component": "VRow",
+                        "content": [
+                            text_col("account_ak", "AccessKey ID",
+                                     "建议使用只授予只读权限的 RAM 子账号",
+                                     md=6, placeholder="LTAI5t..."),
+                            col(6, "VTextField", {
+                                "model": "account_sk",
+                                "label": "AccessKey Secret" + (" · 已配置" if secret_saved else ""),
+                                "type": "password",
+                                "density": "comfortable",
+                                "placeholder": "留空保持不变",
+                                "hint": "留空即沿用已保存的 Secret；换了 AccessKey ID 才需要重新填",
+                                "persistent-hint": True,
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            text_col("account_instance", "实例 ID",
+                                     "留空表示只监控流量、不控制实例",
+                                     md=6, placeholder="i-j6c2qpj3j9q562vvkckc"),
+                            select_col("account_region", "地域", _region_items(),
+                                       "决定流量归属：cn- 开头且非 cn-hongkong 的算中国大陆流量",
+                                       md=6),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            text_col("account_quota", "流量额度",
+                                     f"单位 GB；留空按阿里云免费额度 {CDT_FREE_QUOTA_GB:.0f} GB 计算",
+                                     md=6, field_type="number", suffix="GB"),
+                            select_col("account_site_type", "站点类型", _SITE_TYPE_ITEMS,
+                                       "只影响账单接口（余额 / 当月费用）走中国站还是国际站",
+                                       md=6),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            text_col("account_name", "备注",
+                                     "显示在详情页卡片标题，留空显示 AccessKey 掩码",
+                                     md=6, placeholder="香港主节点"),
+                            switch_col("account_schedule", "每日定时开关机",
+                                       "账号级开关，按下面的开机 / 关机时间执行", md=6),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            text_col("account_start_time", "每天开机时间",
+                                     "24 小时制，如 08:00；支持跨零点时段", md=6),
+                            text_col("account_stop_time", "每天关机时间",
+                                     "24 小时制，如 23:30；留空表示不自动关机", md=6),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "accounts",
+                                            "label": "附加账号（可选）",
+                                            "rows": 4,
+                                            "auto-grow": True,
+                                            "placeholder": (
+                                                "名称=香港中转, AK=LTAI5t..., SK=..., "
+                                                "地域=cn-hongkong, 实例=i-j6..., 额度=500"
+                                            ),
+                                            "hint": "每行一个附加账号；也支持直接粘贴 JSON 数组。"
+                                                    "附加账号自带 AK/SK，不读上面的字段",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": self.__form_help_text(),
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    section("告警与调度"),
                     {
                         "component": "VRow",
                         "content": [
@@ -1084,15 +1368,6 @@ class CdtTrafficMonitor(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            switch_col("schedule_enabled", "启用每日定时开关机",
-                                       "按下面的时间每天自动开机 / 关机"),
-                            text_col("start_time", "每天开机时间", "24 小时制，如 08:00；留空表示不定时开机"),
-                            text_col("stop_time", "每天关机时间", "24 小时制，如 23:30；留空表示不定时关机"),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
                             switch_col("daily_report", "启用日报",
                                        "每天在下面时间推送「时段内实际消耗」日报"),
                             text_col("daily_report_time", "日报时间",
@@ -1104,55 +1379,21 @@ class CdtTrafficMonitor(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            switch_col("schedule_enabled", "定时开关机（附加账号默认）",
+                                       "只对没单独设置定时的附加账号生效；主实例用上面的开关"),
+                            text_col("start_time", "默认开机时间",
+                                     "24 小时制；主实例请用上面的「每天开机时间」"),
+                            text_col("stop_time", "默认关机时间",
+                                     "24 小时制；主实例请用上面的「每天关机时间」"),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             switch_col("proxy", "使用代理",
                                        "仅当阿里云接口必须经代理访问时打开；默认直连"),
                             switch_col("run_once", "立即执行一次",
                                        "保存后同步跑一轮检查（期间页面会等待），完成后自动关闭"),
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "accounts",
-                                            "label": "阿里云账号配置",
-                                            "rows": 8,
-                                            "auto-grow": True,
-                                            "placeholder": (
-                                                "名称=香港中转, AK=LTAI5t..., SK=..., "
-                                                "地域=cn-hongkong, 实例=i-j6..., 额度=500"
-                                            ),
-                                            "hint": "每行一个账号；也支持直接粘贴 JSON 数组",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": self.__form_help_text(),
-                                        },
-                                    }
-                                ],
-                            }
                         ],
                     },
                 ],
@@ -1161,6 +1402,19 @@ class CdtTrafficMonitor(_PluginBase):
             "enabled": False,
             "notify": True,
             "notify_recover": True,
+            # ---- 主实例（结构化字段）----
+            "account_name": "",
+            "account_ak": "",
+            "account_sk": "",
+            "account_region": "cn-hongkong",
+            "account_instance": "",
+            "account_quota": "",
+            "account_site_type": SITE_TYPE_CN,
+            "account_schedule": False,
+            "account_start_time": "",
+            "account_stop_time": "",
+            "accounts": "",
+            # ---- 告警与调度 ----
             "interval": DEFAULT_INTERVAL_MINUTES,
             "tick": DEFAULT_TICK_MINUTES,
             "threshold": DEFAULT_THRESHOLD,
@@ -1175,9 +1429,27 @@ class CdtTrafficMonitor(_PluginBase):
             "enable_billing": False,
             "proxy": False,
             "run_once": False,
-            "accounts": "",
         }
 
+    def __form_help_text(self) -> str:
+        """表单底部的填写说明（跟着常量走，避免改了规则忘了改文案）。"""
+        return (
+            f"上方字段描述主实例；「附加账号」每行一条、字段用逗号分隔、键名支持中英文："
+            f"名称 / AK / SK / 地域 / 实例 / 额度 / 站点 / 定时 / 开机 / 关机 / "
+            f"保活 / 停机模式 / 日报 / 日报时间。"
+            f"「额度」单位 GB，按账号所在「地域」归属的那一类流量比对 —— "
+            f"地域是 cn- 开头且非 cn-hongkong 的算中国大陆流量，其余算非中国大陆流量。"
+            f"阿里云 CDT 免费额度为每月 {CDT_FREE_QUOTA_GB:.0f} GB"
+            f"（中国大陆 {CDT_FREE_QUOTA_CN_GB:.0f} GB + 非中国大陆 "
+            f"{CDT_FREE_QUOTA_INTL_GB:.0f} GB，账号级、每月 1 日 00:00 重置），"
+            f"额度留空即按 {CDT_FREE_QUOTA_GB:.0f} GB 计算。"
+            f"AccessKey Secret 以明文存在面板数据库中（表单不回显、留空即保持不变），"
+            f"请务必使用只授予下列权限的 RAM 子账号，且不要给这个面板开放公网访问。"
+            f"需要的最小权限：cdt 只读（ListCdtInternetTraffic）、"
+            f"ecs 只读（DescribeInstanceStatus）、"
+            f"ecs 启停（StartInstance / StopInstance，仅在你打开停机或保活时才需要）、"
+            f"bss 只读（QueryAccountBalance / DescribeInstanceBill，仅查询账单时需要）。"
+        )
     def __form_help_text(self) -> str:
         """表单底部的填写说明（跟着常量走，避免改了规则忘了改文案）。"""
         return (
@@ -1220,13 +1492,22 @@ class CdtTrafficMonitor(_PluginBase):
         # ---- 顶部：配置概览 ----
         threshold_text = f"{self._threshold:g}%"
         action_text = "停机并通知" if self._threshold_action == THRESHOLD_ACTION_STOP else "仅通知"
-        schedule_text = "未启用"
-        if self._schedule_enabled and (self._start_time or self._stop_time):
-            schedule_text = f"{self._start_time or '—'} 开 / {self._stop_time or '—'} 关"
+        # 定时开关机是账号级的，这里报「有几个账号开了」而不是一个全局开关
+        scheduled = [item for item in
+                     (self.__schedule_of(account) for account in self._accounts) if item[0]]
+        if scheduled:
+            schedule_text = (f"{len(scheduled)} 个账号"
+                             f"（{scheduled[0][1] or '—'} 开 / {scheduled[0][2] or '—'} 关）")
+        else:
+            schedule_text = "未启用"
+        if self._enable_billing:
+            billing_text = "账单已开启"
+        else:
+            billing_text = "账单未开启"
         page.append(self.__alert(
             f"账号 {len(self._accounts)} 个；查询间隔 {self._interval} 分钟；"
             f"阈值 {threshold_text}（{action_text}）；定时开关机 {schedule_text}；"
-            f"最近检查 {self._last_check_time or '尚未检查'}",
+            f"{billing_text}；最近检查 {self._last_check_time or '尚未检查'}",
             alert_type="info",
         ))
 
@@ -1241,17 +1522,22 @@ class CdtTrafficMonitor(_PluginBase):
             page.append(self.__alert(f"最近一次检查出错：{self._last_error}", alert_type="error"))
         if not self._accounts:
             page.append(self.__alert(
-                "还没有可用的账号配置。请在插件设置里按「名称=…, AK=…, SK=…, 地域=…」"
-                "的格式填写至少一个阿里云账号。",
+                "还没有可用的账号配置。请在插件设置的「监控实例」里填好 AccessKey ID、"
+                "AccessKey Secret 与地域（要控制实例再补实例 ID）后保存；"
+                "多账号可以写在下方的「附加账号」里。",
                 alert_type="info",
             ))
             return page
 
-        # ---- 汇总：总量 / 总额度 / 最高占比 ----
+        # ---- 汇总：总量 / 总额度 / 最高占比（+ 账单金额）----
         total_used = 0.0
         total_quota = 0.0
         peak_percent = 0.0
         alarmed = 0
+        total_cost = 0.0
+        total_balance = 0.0
+        currencies: set = set()
+        money_seen = False
         for account in self._accounts:
             state = self.__account_state(account)
             total_used += _to_float(state.get("traffic"))
@@ -1259,8 +1545,25 @@ class CdtTrafficMonitor(_PluginBase):
             peak_percent = max(peak_percent, _to_float(state.get("percent")))
             if state.get("alerting"):
                 alarmed += 1
+            billing = state.get("billing") if isinstance(state.get("billing"), dict) else {}
+            if billing:
+                currencies.add(str(billing.get("currency") or "CNY"))
+                if billing.get("monthly_cost") is not None:
+                    total_cost += _to_float(billing.get("monthly_cost"))
+                    money_seen = True
+                if billing.get("balance") is not None:
+                    total_balance += _to_float(billing.get("balance"))
+                    money_seen = True
+        # 多币种不做合计（各账号站点不同时会出现），宁可不显示也不给一个错的数字
+        money: List[Tuple[str, str, str]] = []
+        if self._enable_billing and money_seen and len(currencies) <= 1:
+            code = currencies.pop() if currencies else "CNY"
+            money = [
+                ("本月费用", _format_money(total_cost, code), COLOR_VALUE),
+                ("账户余额", _format_money(total_balance, code), COLOR_VALUE),
+            ]
         page.append(self.__summary_row(
-            len(self._accounts), total_used, total_quota, peak_percent, alarmed
+            len(self._accounts), total_used, total_quota, peak_percent, alarmed, money
         ))
 
         # ---- 逐账号卡片 ----
@@ -1316,8 +1619,9 @@ class CdtTrafficMonitor(_PluginBase):
         }
 
     @staticmethod
-    def __summary_row(count: int, used: float, quota: float, peak: float, alarmed: int) -> dict:
-        """汇总条：账号数 / 总用量 / 总额度 / 最高占比 / 告警数。"""
+    def __summary_row(count: int, used: float, quota: float, peak: float, alarmed: int,
+                      money: Optional[List[Tuple[str, str, str]]] = None) -> dict:
+        """汇总条：账号数 / 总用量 / 总额度 / 最高占比 / 告警数（+ 金额）。"""
         percent = _usage_percent(used, quota)
         tone = COLOR_ERR if alarmed else (BAR_COLOR_WARN if percent >= 80 else COLOR_OK)
 
@@ -1325,7 +1629,7 @@ class CdtTrafficMonitor(_PluginBase):
             return {
                 "component": "div",
                 "props": {"style": "display:flex;flex-direction:column;min-width:0;"
-                                   "flex:1 1 120px;"},
+                                   "flex:1 1 110px;"},
                 "content": [
                     {"component": "span",
                      "props": {"style": f"font-size:11px;color:{COLOR_LABEL};"},
@@ -1336,6 +1640,16 @@ class CdtTrafficMonitor(_PluginBase):
                      "text": value},
                 ],
             }
+
+        cells = [
+            cell("账号", f"{count} 个"),
+            cell("合计用量", _format_gb(used)),
+            cell("合计额度", _format_gb(quota)),
+            cell("最高占比", f"{peak:.2f}%", tone),
+            cell("告警中", f"{alarmed} 个", COLOR_ERR if alarmed else COLOR_LABEL),
+        ]
+        for label, value, color in (money or []):
+            cells.append(cell(label, value, color))
 
         return {
             "component": "VRow",
@@ -1351,20 +1665,80 @@ class CdtTrafficMonitor(_PluginBase):
                                  "background:rgba(var(--v-theme-on-surface),0.04);"
                                  "border:1px solid rgba(var(--v-theme-on-surface),0.08);"
                     },
-                    "content": [
-                        cell("账号", f"{count} 个"),
-                        cell("合计用量", _format_gb(used)),
-                        cell("合计额度", _format_gb(quota)),
-                        cell("最高占比", f"{peak:.2f}%", tone),
-                        cell("告警中", f"{alarmed} 个",
-                             COLOR_ERR if alarmed else COLOR_LABEL),
-                    ],
+                    "content": cells,
                 }],
             }],
         }
 
+    def __billing_block(self, state: Dict[str, Any]) -> List[dict]:
+        """卡片右上角的金额区：本月费用 / 账户余额 / 同步状态。
+
+        账单没开启、或这一轮还没取到时返回空列表 —— 宁可什么都不显示，
+        也不要凭空多出一块 ``¥0.00`` 让人以为免费。
+        """
+        if not self._enable_billing:
+            return []
+        billing = state.get("billing") if isinstance(state.get("billing"), dict) else {}
+        if not billing:
+            return [{
+                "component": "div",
+                "props": {"style": f"font-size:10.5px;color:{COLOR_LABEL};margin-top:4px;"},
+                "text": "账单待同步",
+            }]
+
+        currency = str(billing.get("currency") or "CNY")
+        has_cost = billing.get("monthly_cost") is not None
+        has_balance = billing.get("balance") is not None
+        error = str(billing.get("error") or "")
+        if not (has_cost or has_balance):
+            return [{
+                "component": "div",
+                "props": {"style": f"font-size:10.5px;color:{COLOR_ERR};margin-top:4px;",
+                          "title": error or "账单未取到"},
+                "text": "账单同步失败",
+            }]
+
+        def money_cell(label: str, value: Any) -> dict:
+            return {
+                "component": "div",
+                "props": {"style": "display:flex;flex-direction:column;align-items:flex-end;"},
+                "content": [
+                    {"component": "span",
+                     "props": {"style": f"font-size:10.5px;color:{COLOR_LABEL};"},
+                     "text": label},
+                    {"component": "span",
+                     "props": {"style": f"font-size:13px;font-weight:700;color:{COLOR_VALUE};"
+                                       "font-variant-numeric:tabular-nums;white-space:nowrap;"},
+                     "text": _format_money(value, currency)},
+                ],
+            }
+
+        stamp = str(billing.get("at") or "")
+        if len(stamp) >= 16:
+            sync_text = f"已同步 {stamp[11:16]}"
+        else:
+            sync_text = "已同步" if stamp else "尚未同步"
+        return [
+            {
+                "component": "div",
+                "props": {"style": "display:flex;gap:14px;justify-content:flex-end;"
+                                   "margin-top:4px;"},
+                "content": [
+                    money_cell("本月费用", billing.get("monthly_cost")),
+                    money_cell("账户余额", billing.get("balance")),
+                ],
+            },
+            {
+                "component": "div",
+                "props": {"style": f"font-size:10.5px;margin-top:1px;"
+                                   f"color:{COLOR_ERR if error else COLOR_LABEL};",
+                          "title": error},
+                "text": sync_text,
+            },
+        ]
+
     def __account_card(self, index: int, account: Dict[str, Any]) -> dict:
-        """单个账号的卡片。"""
+        """单个账号的卡片：顶部信息 + 金额 / 流量 / 进度 + 动作按钮。"""
         state = self.__account_state(account)
         traffic = _to_float(state.get("traffic"))
         quota = self.__quota_of(account)
@@ -1374,42 +1748,111 @@ class CdtTrafficMonitor(_PluginBase):
         traffic_class = _traffic_class(account["region"])
         bar_color = BAR_COLOR_OVER if alerting else _bar_color(percent, self._threshold)
         bar_width = max(0.0, min(100.0, percent))
+        name = account.get("name") or _mask_ak(account["ak"])
+        tone = _status_tone(status)
+        remaining = quota - traffic
+        china_gb = _to_float(state.get("traffic_china"))
+        intl_gb = _to_float(state.get("traffic_intl"))
+
+        sub_bits: List[str] = []
+        # 标题已经用了 AK 掩码时就不再重复；写了备注才把 AK 掩码放到副标题里
+        if name != _mask_ak(account["ak"]):
+            sub_bits.append(_mask_ak(account["ak"]))
+        sub_bits.append(_region_name(account["region"]))
+        if account.get("instance"):
+            sub_bits.append(f"实例 {account['instance']}")
+        sub_bits.append(_class_label(traffic_class))
 
         rows: List[dict] = []
 
-        # ① 名称 + 大号百分比
+        # ① 顶部：左（图标 + 名称 / 地域），右（状态徽章 + 金额）
         rows.append({
             "component": "div",
-            "props": {"style": "display:flex;align-items:center;gap:8px;"},
+            "props": {"style": "display:flex;align-items:flex-start;gap:10px;"},
             "content": [
-                {"component": "div",
-                 "props": {"style": f"flex:0 0 auto;width:8px;height:8px;border-radius:50%;"
-                                   f"background:{_status_tone(status)};"}},
-                {"component": "span",
-                 "props": {"style": f"flex:1 1 auto;min-width:0;font-size:13px;font-weight:600;"
-                                   f"color:{COLOR_VALUE};overflow:hidden;text-overflow:ellipsis;"
-                                   f"white-space:nowrap;",
-                           "title": account.get("name") or ""},
-                 "text": account.get("name") or _mask_ak(account["ak"])},
-                {"component": "span",
-                 "props": {"style": f"flex:0 0 auto;font-size:17px;font-weight:700;"
-                                   f"color:{bar_color};font-variant-numeric:tabular-nums;"
-                                   f"white-space:nowrap;"},
-                 "text": f"{percent:.2f}%"},
+                {
+                    "component": "div",
+                    "props": {"style": "display:flex;align-items:flex-start;gap:8px;"
+                                       "flex:1 1 auto;min-width:0;"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"style": "flex:0 0 auto;width:32px;height:32px;"
+                                               "border-radius:9px;display:flex;"
+                                               "align-items:center;justify-content:center;"
+                                               "background:rgba(var(--v-theme-on-surface),0.06);"},
+                            "content": [
+                                {"component": "VIcon",
+                                 "props": {"size": "small", "style": f"color:{tone};"},
+                                 "text": ICON_SERVER},
+                            ],
+                        },
+                        {
+                            "component": "div",
+                            "props": {"style": "min-width:0;padding-top:1px;"},
+                            "content": [
+                                {"component": "div",
+                                 "props": {"style": f"font-size:13.5px;font-weight:700;"
+                                                   f"color:{COLOR_VALUE};overflow:hidden;"
+                                                   "text-overflow:ellipsis;white-space:nowrap;",
+                                           "title": name},
+                                 "text": name},
+                                {"component": "div",
+                                 "props": {"style": f"font-size:11.5px;color:{COLOR_NAME};"
+                                                   "overflow:hidden;text-overflow:ellipsis;"
+                                                   "white-space:nowrap;",
+                                           "title": " · ".join(sub_bits)},
+                                 "text": " · ".join(sub_bits)},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {"style": "flex:0 0 auto;text-align:right;"},
+                    "content": [
+                        {"component": "span",
+                         "props": {"style": f"display:inline-block;font-size:11px;font-weight:700;"
+                                           "padding:2px 9px;border-radius:9px;white-space:nowrap;"
+                                           f"color:{tone};"
+                                           "background:rgba(var(--v-theme-on-surface),0.06);"},
+                         "text": _status_text(status)},
+                    ] + self.__billing_block(state),
+                },
             ],
         })
 
-        # ② AK · 地域 · 实例
-        meta_bits = [_mask_ak(account["ak"]), _region_name(account["region"])]
-        if account.get("instance"):
-            meta_bits.append(f"实例 {account['instance']}")
-        meta_bits.append(_class_label(traffic_class))
+        # ② 本月流量：大号数字 + 刷新按钮
         rows.append({
             "component": "div",
-            "props": {"style": f"display:block;font-size:11.5px;color:{COLOR_NAME};"
-                               "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
-                               "margin-top:2px;"},
-            "content": [{"component": "span", "text": " · ".join(meta_bits)}],
+            "props": {"style": "display:flex;align-items:flex-end;justify-content:space-between;"
+                               "gap:8px;margin-top:10px;"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"style": "min-width:0;"},
+                    "content": [
+                        {"component": "div",
+                         "props": {"style": f"font-size:11.5px;color:{COLOR_LABEL};"},
+                         "text": "本月 CDT 流量"},
+                        {"component": "div",
+                         "props": {"style": "display:flex;align-items:baseline;gap:4px;"
+                                           "margin-top:2px;flex-wrap:wrap;"},
+                         "content": [
+                             {"component": "span",
+                              "props": {"style": f"font-size:22px;font-weight:800;line-height:1.1;"
+                                                f"color:{COLOR_VALUE};"
+                                                "font-variant-numeric:tabular-nums;"},
+                              "text": _format_gb(traffic)},
+                             {"component": "span",
+                              "props": {"style": f"font-size:12.5px;color:{COLOR_LABEL};"},
+                              "text": f"/ {_format_gb(quota)}"},
+                         ]},
+                    ],
+                },
+                self.__action_button("刷新", "/refresh", {"idx": str(index)},
+                                     icon=ICON_REFRESH),
+            ],
         })
 
         # ③ 进度条（容器 + 单个色块：定宽定高的色块比 VProgressLinear 更好控）
@@ -1424,55 +1867,50 @@ class CdtTrafficMonitor(_PluginBase):
             }],
         })
 
-        # ④ 已用 / 额度 / 剩余
-        remaining = quota - traffic
+        # ④ 左「已使用」/ 右「阈值」
         rows.append({
             "component": "div",
-            "props": {"style": "display:block;font-size:12px;margin-top:6px;"},
+            "props": {"style": "display:flex;justify-content:space-between;gap:8px;"
+                               "margin-top:6px;font-size:11.5px;"},
             "content": [
                 {"component": "span",
-                 "props": {"style": f"color:{COLOR_LABEL};"}, "text": "已用 "},
-                {"component": "span",
-                 "props": {"style": f"color:{COLOR_VALUE};font-weight:700;"
+                 "props": {"style": f"color:{bar_color};font-weight:700;"
                                    "font-variant-numeric:tabular-nums;"},
-                 "text": f"{_format_gb(traffic)} / {_format_gb(quota)}"},
+                 "text": f"{percent:.2f}% 已使用"},
                 {"component": "span",
-                 "props": {"style": f"color:{COLOR_LABEL};"}, "text": " · 剩余 "},
-                {"component": "span",
-                 "props": {"style": f"color:{COLOR_OK if remaining >= 0 else COLOR_ERR};"
-                                   "font-weight:700;font-variant-numeric:tabular-nums;"},
-                 "text": _format_gb(max(0.0, remaining))},
+                 "props": {"style": f"color:{COLOR_LABEL};"},
+                 "text": f"阈值 {self._threshold:g}%"},
             ],
         })
 
-        # ⑤ 两条分类的实测值（让用户看到「另一类」用了多少）
-        china_gb = _to_float(state.get("traffic_china"))
-        intl_gb = _to_float(state.get("traffic_intl"))
+        # ⑤ 两条分类的实测值 + 剩余
         rows.append({
             "component": "div",
-            "props": {"style": f"display:block;font-size:11.5px;color:{COLOR_LABEL};margin-top:2px;"},
-            "content": [{
-                "component": "span",
-                "text": f"中国大陆 {_format_gb(china_gb)} · 非中国大陆 {_format_gb(intl_gb)}",
-            }],
-        })
-
-        # ⑥ 实例状态 + 增量
-        trend = self.__trend_text(state)
-        rows.append({
-            "component": "div",
-            "props": {"style": "display:flex;flex-wrap:wrap;gap:2px 8px;align-items:center;"
+            "props": {"style": f"display:block;font-size:11.5px;color:{COLOR_LABEL};"
                                "margin-top:6px;"},
             "content": [
                 {"component": "span",
-                 "props": {"style": f"font-size:11px;font-weight:700;padding:1px 7px;"
-                                   f"border-radius:9px;white-space:nowrap;"
-                                   f"color:{_status_tone(status)};"
-                                   f"background:rgba(var(--v-theme-on-surface),0.06);"},
-                 "text": _status_text(status)},
+                 "text": f"中国大陆 {_format_gb(china_gb)} · "
+                         f"非中国大陆 {_format_gb(intl_gb)}"},
+                {"component": "span",
+                 "props": {"style": f"color:{COLOR_OK if remaining >= 0 else COLOR_ERR};"
+                                   "font-weight:700;font-variant-numeric:tabular-nums;"},
+                 "text": f" · 剩余 {_format_gb(max(0.0, remaining))}"},
+            ],
+        })
+
+        # ⑥ 最近检查时间 + 增量
+        rows.append({
+            "component": "div",
+            "props": {"style": "display:flex;align-items:center;gap:5px;margin-top:6px;"},
+            "content": [
+                {"component": "VIcon",
+                 "props": {"size": "x-small", "style": f"color:{COLOR_LABEL};"},
+                 "text": ICON_CLOCK},
                 {"component": "span",
                  "props": {"style": f"font-size:11.5px;color:{COLOR_LABEL};"},
-                 "text": trend},
+                 "text": f"最近检查 {self._last_check_time or '尚未检查'}"
+                         f" · {self.__trend_text(state)}"},
             ],
         })
 
@@ -1488,20 +1926,16 @@ class CdtTrafficMonitor(_PluginBase):
             })
 
         # ⑦ 动作按钮（只有 VBtn 带得动面板的事件回调，div / span 无效）
-        buttons: List[dict] = [
-            self.__action_button("刷新", "/refresh", {"idx": str(index)}),
-        ]
         has_instance = bool(account.get("instance"))
-        buttons.append(self.__action_button(
-            "开机", "/start", {"idx": str(index)}, disabled=not has_instance
-        ))
-        buttons.append(self.__action_button(
-            "停机", "/stop", {"idx": str(index)}, disabled=not has_instance
-        ))
         rows.append({
             "component": "div",
             "props": {"style": "display:flex;justify-content:flex-end;gap:4px;margin-top:6px;"},
-            "content": buttons,
+            "content": [
+                self.__action_button("开机", "/start", {"idx": str(index)},
+                                     icon=ICON_PLAY, disabled=not has_instance),
+                self.__action_button("停机", "/stop", {"idx": str(index)},
+                                     icon=ICON_STOP, disabled=not has_instance),
+            ],
         })
 
         return {
@@ -1517,7 +1951,8 @@ class CdtTrafficMonitor(_PluginBase):
         }
 
     def __action_button(self, label: str, path: str, params: Dict[str, str],
-                        primary: bool = False, disabled: bool = False) -> dict:
+                        primary: bool = False, disabled: bool = False,
+                        icon: str = "") -> dict:
         """详情页动作按钮。
 
         🔴 详情页没有 v-model，``events`` 是唯一的「交互 → 后端」出口；
@@ -1536,6 +1971,8 @@ class CdtTrafficMonitor(_PluginBase):
         }
         if primary:
             props["color"] = "primary"
+        if icon:
+            props["prepend-icon"] = icon
         return {
             "component": "VBtn",
             "props": props,
