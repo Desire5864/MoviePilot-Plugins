@@ -20,9 +20,9 @@ class SiteUserDataFix(_PluginBase):
     """
 
     plugin_name = "站点数据修正"
-    plugin_desc = "修正猫站、春天等站点做种数、做种体积、积分解析错误。"
+    plugin_desc = "修正猫站、春天等站点做种数、做种体积、积分解析错误；Depth Studio 上传/下载量。"
     plugin_icon = "world.png"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "Desire5864"
     plugin_config_prefix = "siteuserdatafix_"
     plugin_order = 1
@@ -32,6 +32,17 @@ class SiteUserDataFix(_PluginBase):
     _fix_domains = {
         "pterclub.net": "pterclub",
         "springsunday.net": "springsunday",
+        "dstudio.me": "dstudio",
+    }
+
+    # 容量单位换算（Depth Studio 的 info-stat 卡片会给出 1.404 TB 这种带小数的值）
+    _SIZE_UNITS = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024 ** 2,
+        "GB": 1024 ** 3,
+        "TB": 1024 ** 4,
+        "PB": 1024 ** 5,
     }
 
     _enabled = False
@@ -70,8 +81,9 @@ class SiteUserDataFix(_PluginBase):
                         "component": "VAlert",
                         "props": {
                             "type": "info",
-                            "text": "启用后自动修正猫站(pterclub.net)做种数/做种体积、"
-                            "春天(springsunday.net)积分。",
+                            "text": "启用后自动修正：猫站(pterclub.net) 做种数/做种体积、"
+                            "春天(springsunday.net) 积分、"
+                            "Depth Studio(dstudio.me) 上传量/下载量。",
                         },
                     },
                 ],
@@ -120,6 +132,8 @@ class SiteUserDataFix(_PluginBase):
                 self.__fix_pterclub(site, userdata)
             elif domain == "springsunday.net":
                 self.__fix_springsunday(site, userdata)
+            elif domain == "dstudio.me":
+                self.__fix_dstudio(site, userdata)
         except Exception as err:
             logger.error(f"站点数据修正失败 {domain}：{err}")
 
@@ -290,3 +304,61 @@ class SiteUserDataFix(_PluginBase):
         if match:
             bonus = float(match.group(1).replace(",", ""))
             userdata.bonus = bonus
+
+    def __fix_dstudio(self, site: dict, userdata: SiteUserData) -> None:
+        """
+        修正 Depth Studio 的上传量与下载量。
+
+        该站已换成自定义主题，上传/下载不再放在 NexusPHP 的 #info_block/<font> 里，
+        而是首页 info-stat 卡片（数值与单位分处两个 span，如「1.404 TB」）。
+        系统解析器只能取到分享率、积分、等级这些，上传量和下载量会落到 0，
+        表现为站点用户数据弹窗里两个总容量卡片显示 0.00 B。
+
+        :param site: 站点索引配置
+        :param userdata: 待修正的用户数据
+        """
+        html = self.__get_page(site, "/")
+        if not html:
+            logger.warning("站点数据修正：Depth Studio 首页抓取失败，跳过上传/下载量修正")
+            return
+
+        upload = self.__parse_dstudio_stat(html, "color_uploaded")
+        download = self.__parse_dstudio_stat(html, "color_downloaded")
+
+        if upload is not None:
+            userdata.upload = upload
+        if download is not None:
+            userdata.download = download
+
+        if upload is None and download is None:
+            logger.warning(
+                "站点数据修正：Depth Studio 未解析到上传/下载量（页面结构可能已变）"
+            )
+
+    @classmethod
+    def __parse_dstudio_stat(cls, text: str, marker: str) -> Optional[int]:
+        """
+        解析 Depth Studio 首页 info-stat 卡片中的容量数值。
+
+        HTML 形如：
+            <span class="info-stat-label color_uploaded">上传量</span>
+            <span class="info-stat-value">1.404 <span class="info-stat-unit">TB</span></span>
+
+        :param text: 首页 HTML
+        :param marker: color_uploaded 或 color_downloaded
+        :return: 字节数，未匹配到返回 None
+        """
+        match = re.search(
+            marker + r'[^>]*>[^<]*</span>\s*'
+            r'<span class="info-stat-value"[^>]*>\s*'
+            r'([\d.,]+)\s*(?:<[^>]+>\s*)*([KMGT]?B)',
+            text,
+        )
+        if not match:
+            return None
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        unit = match.group(2).upper()
+        return int(value * cls._SIZE_UNITS.get(unit, 1))
