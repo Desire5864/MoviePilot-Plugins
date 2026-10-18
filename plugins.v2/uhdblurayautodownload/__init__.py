@@ -411,7 +411,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = PLUGIN_ICON_NAME
     # 插件版本
-    plugin_version = "2.25.2"
+    plugin_version = "2.25.3"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1059,7 +1059,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 3},
+                        "props": {"cols": 2},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1093,7 +1093,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 2},
+                        "props": {"cols": 3},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1155,7 +1155,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 3},
+                        "props": {"cols": 2},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1189,7 +1189,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 2},
+                        "props": {"cols": 3},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1251,7 +1251,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 3},
+                        "props": {"cols": 2},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1285,7 +1285,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 2},
+                        "props": {"cols": 3},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1347,7 +1347,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 3},
+                        "props": {"cols": 2},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1381,7 +1381,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                     },
 {
                         "component": "VCol",
-                        "props": {"cols": 2},
+                        "props": {"cols": 3},
                         "content": [
                             {
                                 "component": "VTextField",
@@ -1449,7 +1449,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                     },
                                     {
                                         "component": "VCol",
-                                        "props": {"cols": 3},
+                                        "props": {"cols": 2},
                                         "content": [
                                             {
                                                 "component": "VTextField",
@@ -1483,7 +1483,7 @@ class UhdBlurayAutoDownload(_PluginBase):
                                     },
                                     {
                                         "component": "VCol",
-                                        "props": {"cols": 2},
+                                        "props": {"cols": 3},
                                         "content": [
                                             {
                                                 "component": "VTextField",
