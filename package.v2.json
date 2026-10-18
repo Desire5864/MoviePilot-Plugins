@@ -51,15 +51,16 @@
   },
   "SiteUserDataFix": {
     "name": "站点数据修正",
-    "description": "修正猫站、春天等站点做种数、做种体积、积分解析错误。",
+    "description": "修正猫站、春天等站点做种数、做种体积、积分解析错误；Depth Studio 上传/下载量。",
     "labels": "站点",
-    "version": "1.0",
+    "version": "1.1",
     "icon": "world.png",
     "author": "Desire5864",
     "level": 1,
     "system_version": ">=2.12.0",
     "history": {
-      "v1.0": "初始版本：修正猫站做种数/做种体积、春天积分解析错误。"
+      "v1.0": "初始版本：修正猫站做种数/做种体积、春天积分解析错误。",
+      "v1.1": "新增 Depth Studio（dstudio.me）上传量/下载量修正：该站换成自定义主题后，上传/下载不再放在 NexusPHP 的 #info_block/<font> 里，而是首页 info-stat 卡片（数值与单位分处两个 span，如「1.404 TB」），系统解析器只能取到分享率、积分、等级，两个容量字段落到 0，表现为站点用户数据弹窗里「总上传量/总下载量」都显示 0.00 B（历史流量图却是正常的）。v1.1 起额外抓一次首页，从 info-stat 卡片解析这两个值并按KB/MB/GB/TB/PB 换算成字节；抓不到页面或页面结构变化时不覆盖原值，只记一条 WARNING。"
     }
   },
   "ChdbitsHrMonitor": {
