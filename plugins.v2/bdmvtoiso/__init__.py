@@ -117,7 +117,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.9.5"
+    plugin_version = "1.9.6"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1249,13 +1249,13 @@ class BdmvToIso(_PluginBase):
         if collected is None:
             logger.warning("BDMV自动打包ISO：获取下载器任务失败，跳过检查")
             return
-        candidates, iso_names, iso_hashes = collected
+        candidates, iso_names, iso_hashes, candidate_hashes = collected
 
         # 2. ISO 直通：直出 ISO 的站点跳过打包，直接触发 CD2 备份（不依赖 BDMV 服务）
         self.__process_iso_passthrough(iso_names, iso_hashes)
 
         # 3. BDMV 打包
-        self.__process_bdmv_packaging(candidates)
+        self.__process_bdmv_packaging(candidates, candidate_hashes)
 
         # 4. 检查已触发的 CD2 备份是否完成
         self.__check_cd2_finished()
@@ -1393,12 +1393,18 @@ class BdmvToIso(_PluginBase):
                 continue
 
             job_status = job.get("status")
+            # 顶层覆盖记录时必须把种子 hash 带上，否则去重口径会退化成「按目录名」（v1.9.6）
+            prev = submitted_map.get(name)
+            if not isinstance(prev, dict):
+                prev = {}
+            prev_hash = str(prev.get("torrent_hash") or "")
 
             if job_status == "done":
-                if submitted_map.get(name, {}).get("status") != "done":
+                if prev.get("status") != "done":
                     submitted_map[name] = {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "done",
+                        "torrent_hash": prev_hash,
                     }
                     changed = True
                     logger.info(f"BDMV自动打包ISO：打包完成（快通道）{name}")
@@ -1407,10 +1413,11 @@ class BdmvToIso(_PluginBase):
                 continue
 
             if job_status in ("running", "queued"):
-                if submitted_map.get(name, {}).get("status") != "running":
+                if prev.get("status") != "running":
                     submitted_map[name] = {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "running",
+                        "torrent_hash": prev_hash,
                     }
                     changed = True
 
@@ -1568,13 +1575,22 @@ class BdmvToIso(_PluginBase):
                 targets[name] = (name, 0)
         return targets
 
-    def __process_bdmv_packaging(self, names: List[str]) -> None:
+    def __process_bdmv_packaging(
+        self, names: List[str], name_hashes: Optional[Dict[str, str]] = None
+    ) -> None:
         """将命中的已完成原盘任务提交到 BDMV to ISO 服务打包。
 
+        去重口径是「资源目录名 + 种子 hash」（v1.9.6 起）：
+        目录名只说明「同一个资源目录」，种子 hash 才说明「同一份下载」。
+        站点重下/洗版后目录名往往一字不差，只按目录名判重会把新下载当成旧任务永久跳过。
+
         :param names: 待打包的资源目录名列表
+        :param name_hashes: {资源目录名: 种子 hash}，取不到 hash 时按旧口径处理
         """
         if not names:
             return
+
+        name_hashes = name_hashes or {}
 
         if not self._server_url:
             logger.warning("BDMV自动打包ISO：未配置服务地址，跳过打包检查")
@@ -1607,24 +1623,56 @@ class BdmvToIso(_PluginBase):
             if name not in resource_set:
                 continue
 
+            torrent_hash = str(name_hashes.get(name) or "").strip()
+            record = submitted_map.get(name)
+            if not isinstance(record, dict):
+                record = None
+            record_hash = str((record or {}).get("torrent_hash") or "").strip()
+            record_status = str((record or {}).get("status") or "")
+
+            # 存量记录补登 hash：老记录没有 hash 时只补录，不当成新任务，
+            # 否则升级那一刻会把历史上已打包的任务全部重打一遍。
+            if record is not None and not record_hash and torrent_hash:
+                record["torrent_hash"] = torrent_hash
+                submitted_map[name] = record
+                record_hash = torrent_hash
+                changed = True
+                logger.info(f"BDMV自动打包ISO：已补登种子 hash {name}")
+
+            # hash 不一致 = 同名目录被重新下载（新种子），旧记录对本次不再生效
+            renewed = bool(record_hash and torrent_hash and record_hash != torrent_hash)
+            if renewed:
+                logger.info(
+                    f"BDMV自动打包ISO：种子 hash 变化，按重新打包处理 {name}"
+                    f"（{record_hash[:8]} → {torrent_hash[:8]}）"
+                )
+                record = None
+                record_status = ""
+            # 取不到 hash 时无法区分新旧，沿用旧口径（宁可漏判，也不无故重打）
+            same_task = not renewed
+
             job = jobs.get(name)
             job_status = (job or {}).get("status")
 
-            # 已在打包中或已完成，仅同步状态
+            # 服务端正在打包：不论是谁提交的，都是一个活跃任务，采纳即可
             if job_status in ("running", "queued"):
-                if submitted_map.get(name, {}).get("status") != "running":
+                if record_status != "running":
                     submitted_map[name] = {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "running",
+                        "torrent_hash": torrent_hash,
                     }
                     changed = True
                 continue
 
-            if job_status == "done":
-                if submitted_map.get(name, {}).get("status") != "done":
+            # 服务端已完成：只有「同一个种子」才认这份结果。
+            # hash 变了说明服务端留着的还是上一次的旧任务，不能据此跳过新任务。
+            if job_status == "done" and same_task:
+                if record_status != "done":
                     submitted_map[name] = {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "done",
+                        "torrent_hash": torrent_hash,
                     }
                     changed = True
                     if self._notify and self._notify_on_done:
@@ -1632,11 +1680,10 @@ class BdmvToIso(_PluginBase):
                 continue
 
             # 已提交过且非失败状态，避免重复触发
-            record = submitted_map.get(name)
-            if record and record.get("status") in ("submitted", "running", "done"):
+            if same_task and record_status in ("submitted", "running", "done"):
                 continue
 
-            # 未提交过，触发打包
+            # 未提交过（或同名目录重新下载），触发打包
             if not self._auto_convert:
                 continue
 
@@ -1644,6 +1691,7 @@ class BdmvToIso(_PluginBase):
                 submitted_map[name] = {
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "status": "submitted",
+                    "torrent_hash": torrent_hash,
                 }
                 changed = True
                 logger.info(f"BDMV自动打包ISO：已提交打包任务 {name}")
@@ -1671,13 +1719,15 @@ class BdmvToIso(_PluginBase):
             return torrent.get(key, default)
         return getattr(torrent, key, default)
 
-    def __collect_completed_names(self) -> Optional[Tuple[List[str], List[str], Dict[str, str]]]:
+    def __collect_completed_names(
+        self,
+    ) -> Optional[Tuple[List[str], List[str], Dict[str, str], Dict[str, str]]]:
         """收集下载器中的已完成任务，分为打包候选与 ISO 直通候选。
 
         命中 ISO 直通分类的任务只进入 ISO 直通候选，不再参与打包匹配。
 
-        :return: (待打包目录名列表, ISO 直通任务名列表, {ISO 任务名: 种子 hash})，
-            获取失败返回 None
+        :return: (待打包目录名列表, ISO 直通任务名列表,
+            {ISO 任务名: 种子 hash}, {待打包目录名: 种子 hash})，获取失败返回 None
         """
         if not self._downloaders:
             logger.warning("BDMV自动打包ISO：未配置下载器，跳过检查")
@@ -1691,6 +1741,7 @@ class BdmvToIso(_PluginBase):
         names: List[str] = []
         iso_names: List[str] = []
         iso_hashes: Dict[str, str] = {}
+        name_hashes: Dict[str, str] = {}
         for service_name, service_info in services.items():
             # 仅处理 QB 下载器
             if not DownloaderHelper().is_downloader(service_type="qbittorrent", service=service_info):
@@ -1763,10 +1814,17 @@ class BdmvToIso(_PluginBase):
                 if not content_path:
                     continue
                 name = str(content_path).rstrip("/").split("/")[-1]
-                if name and name not in names:
-                    names.append(name)
+                if name:
+                    if name not in names:
+                        names.append(name)
+                    # 记录种子 hash：同名目录重新下载（hash 变）应视为新任务
+                    torrent_hash = str(
+                        self.__torrent_field(torrent, "hash", "") or ""
+                    ).strip()
+                    if torrent_hash:
+                        name_hashes[name] = torrent_hash
 
-        return names, iso_names, iso_hashes
+        return names, iso_names, iso_hashes, name_hashes
 
     def __login(self) -> bool:
         """登录 BDMV to ISO 服务并保持会话。
