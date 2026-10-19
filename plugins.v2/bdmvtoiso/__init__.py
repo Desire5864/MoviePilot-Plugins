@@ -117,7 +117,7 @@ class BdmvToIso(_PluginBase):
     # 插件图标
     plugin_icon = "UHD.png"
     # 插件版本
-    plugin_version = "1.9.7"
+    plugin_version = "1.10.0"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -1976,14 +1976,55 @@ class BdmvToIso(_PluginBase):
     def __fetch_resources(self) -> Optional[List[str]]:
         """获取服务端资源目录列表。
 
+        优先调用服务端 JSON 接口 /api/resources；接口不存在或返回异常时回退解析首页 HTML，
+        以兼容未升级的服务端（老版本首页才带 data-bdmv-ok-summary 属性）。
+
         :return: 目录名列表，失败返回 None
         """
+        names = self.__fetch_resources_api()
+        if names is not None:
+            return names
+
         res = self.__request("get", "/")
         if not res:
             logger.warning("BDMV自动打包ISO：获取服务端资源目录失败")
             return None
 
         return self.__parse_resources(res.text or "")
+
+    def __fetch_resources_api(self) -> Optional[List[str]]:
+        """调用 /api/resources 获取资源目录名。
+
+        :return: 目录名列表；接口不可用时返回 None（交由 HTML 回退处理）
+        """
+        res = self.__request("get", "/api/resources")
+        if not res or getattr(res, "status_code", 0) != 200:
+            return None
+
+        try:
+            data = res.json()
+        except Exception:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        names: List[str] = []
+        for item in data.get("resources") or []:
+            name = str(item or "").strip()
+            if name and name not in names:
+                names.append(name)
+        if names or isinstance(data.get("resources"), list):
+            return names
+
+        # 兼容只给 items 明细的返回
+        for item in data.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names
 
     @staticmethod
     def __parse_resources(html: str) -> List[str]:
