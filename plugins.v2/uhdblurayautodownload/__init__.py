@@ -27,6 +27,8 @@ PROCESSED_LIMIT = 500
 INTRO_MIGRATED_KEY = "intro_migrated_to_tmdb"
 # 默认下载标签（站点未单独配置 tag 时使用）
 DOWNLOAD_TAG = "UHD自动下载"
+# HR（Hit & Run）种子额外打的标签：打包服务（bdmvtoiso）靠它识别 HR 并在卡片上显示标志
+HR_TAG = "HR"
 # 推送后给新任务设置的默认上传限速（KB/s），0 = 不限速。
 # 原盘体积大、做种时间长，不限制的话很容易把上行带宽占满，
 # 因此默认给一个保守值，用户可在配置页改（0 关闭）。
@@ -411,7 +413,7 @@ class UhdBlurayAutoDownload(_PluginBase):
     # 插件图标
     plugin_icon = PLUGIN_ICON_NAME
     # 插件版本
-    plugin_version = "2.25.3"
+    plugin_version = "2.25.4"
     # 插件作者
     plugin_author = "Desire5864"
     # 作者主页
@@ -3276,7 +3278,50 @@ class UhdBlurayAutoDownload(_PluginBase):
             self.__apply_upload_limit(
                 downloader_obj, tids, str(torrent.get("title") or "")
             )
+            # 带 H&R 考核的种子补打 HR 标签
+            if torrent.get("is_hr"):
+                self.__tag_hr(
+                    downloader_obj, tids, str(torrent.get("title") or "")
+                )
         return bool(success)
+
+    def __tag_hr(self, downloader_obj: Any, tids: Any, title: str) -> None:
+        """给带 H&R 考核的种子补打 HR 标签。
+
+        打包服务读的是 QB 种子标签（见 bdmvtoiso 的 _qb_hr_names），
+        这样卡片的 HR 标志、以及人工在 QB 里筛选都靠这一个标签。
+        qB 的 addTags 是追加语义，不会覆盖原有标签。
+
+        :param downloader_obj: 下载器实例
+        :param tids: add_torrent 返回的种子 ID 列表
+        :param title: 站点种子标题（用于回查任务）
+        """
+        if not downloader_obj or not hasattr(downloader_obj, "set_torrents_tag"):
+            logger.warning("UHD原盘自动下载：下载器不支持打标签，HR 标签已跳过")
+            return
+
+        tid_list = [str(t) for t in (tids or []) if t]
+        for attempt in range(3):
+            if not tid_list and title:
+                torrent = self.__find_qb_torrent_obj(downloader_obj, title)
+                if torrent is not None:
+                    tid_list = [self.__qb_torrent_field(torrent, "hash")]
+                    tid_list = [t for t in tid_list if t]
+            if tid_list:
+                break
+            time.sleep(1)
+
+        if not tid_list:
+            logger.warning(
+                f"UHD原盘自动下载：未定位到刚推送的任务，HR 标签未设置（{title[:60]}）"
+            )
+            return
+
+        try:
+            downloader_obj.set_torrents_tag(ids="|".join(tid_list), tags=[HR_TAG])
+            logger.info(f"UHD原盘自动下载：已为 HR 种子打标签 {HR_TAG}（{title[:60]}）")
+        except Exception as err:
+            logger.error(f"UHD原盘自动下载：设置 HR 标签失败，{err}")
 
     def __apply_upload_limit(self, downloader_obj: Any, tids: Any,
                              title: str) -> None:
