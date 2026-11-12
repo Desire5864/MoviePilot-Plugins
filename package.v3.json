@@ -73,7 +73,8 @@
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
-      "v3.0.0": "适配 MoviePilot V3：导入迁移到 app.sdk（plugin/config/events/logging/services/network/utilities/media）；通知类型改用 MessageType；版本 2.0.17 → 3.0.0。",
+      "v3.0.0": "适配 MoviePilot V3：导入迁移到 app.sdk（plugin/config/events/logging/services/network/utilities/media）；通知类型改用 MessageType；版本 2.0.18 → 3.0.0。",
+      "v2.0.18": "修正详情页主标题串片：副标题只取「本轮互斥分配真的分给该任务」的站点记录，不再独立重配；取不到时回退为 QB 名里的中文前缀（如「最佳拍档：光头神探」），避免 1982 那部被贴上 1986 那部的副标题。（三改：Desire5864）",
       "v1.0.0": "初始版本：抓取彩虹岛H&R页面，与QB指定分类任务比对，完成后延迟自动删除任务与文件。",
       "v1.1.0": "详情页新增HR任务做种进度/达标状态，以及QB与站点比对明细。",
       "v1.2.0": "比对明细新增H&R周期、做种时间、剩余时间列，并优化标题匹配避免误匹配。",
