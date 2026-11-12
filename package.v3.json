@@ -1,0 +1,15 @@
+{
+  "CloudDrive2Storage": {
+    "name": "CloudDrive2储存",
+    "description": "使存储支持 CloudDrive2，grpc 原生 API 操作。魔改 UI 版本，重排版详情页指标卡。",
+    "labels": "云盘",
+    "version": "2.0.0",
+    "icon": "Cloudrive_A.png",
+    "author": "Desire5864",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v2.0.0": "适配 MoviePilot V3：导入迁移到 app.sdk（plugin/config/events/logging/services）；新增 storage_manage（配置保存/重置、整理方式、空间用量）与 get_folder 模块方法；通知类型改用 MessageType；依赖改用 pyproject.toml。（三改：Desire5864）"
+    }
+  }
+}
