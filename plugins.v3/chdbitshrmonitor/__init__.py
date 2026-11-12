@@ -1368,8 +1368,8 @@ class ChdbitsHrMonitor(_PluginBase):
             detail = str(cmp_item.get("detail") or "").strip()
 
             subtitle, seed_title = self.__get_uhd_titles(name)
-            if not subtitle:
-                subtitle = self.__find_hr_subtitle(name)
+            # 主标题兜底用的中文片名（QB 任务名里的中文前缀，见 __cn_title）
+            cn_name = self.__cn_title(name)
 
             # 站点任务（存在则说明仍在保种考核中）
             # v2.0.4：优先认判定层那一轮的**互斥分配**结果，保证卡片上显示的站点
@@ -1388,6 +1388,14 @@ class ChdbitsHrMonitor(_PluginBase):
             if site_task:
                 site_seeding = site_seeding or str(site_task.get("seeding_time") or "").strip()
                 hr_cycle = hr_cycle or str(site_task.get("hr_cycle") or "").strip()
+            if not subtitle and site_task:
+                # 副标题只能来自「本轮互斥分配**真的分给了这个任务**」的站点记录。
+                # v2.0.18 起不再用 __find_site_task 独立重配：分配判定「站点查无」时，
+                # 独立重配仍可能命中别人的记录，于是卡片主标题会变成另一部电影的名字
+                # （同系列不同部尤其容易：1982 与 1986 只差年份，而年份既不参与片名
+                # 特征、也不影响兜底评分 —— 实测「最佳拍档：光头神探(1982)」被贴上
+                # 「最佳拍档4：千里救差婆(1986)」的副标题）。
+                subtitle = self.__find_hr_subtitle(site_task)
             hr_percent = str(site_task.get("hr_percent") or "").strip() if site_task else ""
             site_remain = str(site_task.get("remain_time") or "").strip() if site_task else ""
 
@@ -1397,7 +1405,7 @@ class ChdbitsHrMonitor(_PluginBase):
                 # ── 待复核：站点首次未列出，尚未开始删除计时 ──
                 items.append({
                     "state": "pending",
-                    "title": subtitle or name or "(无标题)",
+                    "title": subtitle or cn_name or name or "(无标题)",
                     "site_title": site_title,
                     "seed_title": seed_title or name,
                     "site_seeding": site_seeding,
@@ -1429,7 +1437,7 @@ class ChdbitsHrMonitor(_PluginBase):
                 ratio = (elapsed_hours / delay_hours * 100) if delay_hours else 0.0
                 items.append({
                     "state": "deleting",
-                    "title": subtitle or name or "(无标题)",
+                    "title": subtitle or cn_name or name or "(无标题)",
                     "site_title": site_title,
                     "seed_title": seed_title or name,
                     "site_seeding": site_seeding,
@@ -1467,7 +1475,7 @@ class ChdbitsHrMonitor(_PluginBase):
                 # 匹配失效被冻结：站点查无不可信，本轮不推进任何删除判定
                 items.append({
                     "state": "frozen",
-                    "title": subtitle or name or "(无标题)",
+                    "title": subtitle or cn_name or name or "(无标题)",
                     "site_title": site_title,
                     "seed_title": seed_title or name,
                     "site_seeding": site_seeding,
@@ -1486,7 +1494,7 @@ class ChdbitsHrMonitor(_PluginBase):
                 # 从未在站点 H&R 页面出现过：查无 ≠ 已完成，永久排除在删除流程外
                 items.append({
                     "state": "unseen",
-                    "title": subtitle or name or "(无标题)",
+                    "title": subtitle or cn_name or name or "(无标题)",
                     "site_title": site_title,
                     "seed_title": seed_title or name,
                     "site_seeding": site_seeding,
@@ -1511,7 +1519,7 @@ class ChdbitsHrMonitor(_PluginBase):
             if status_raw == "未达阈值":
                 items.append({
                     "state": "threshold",
-                    "title": subtitle or name or "(无标题)",
+                    "title": subtitle or cn_name or name or "(无标题)",
                     "site_title": site_title,
                     "seed_title": seed_title or name,
                     "site_seeding": site_seeding,
@@ -1554,7 +1562,7 @@ class ChdbitsHrMonitor(_PluginBase):
 
             items.append({
                 "state": "seeding",
-                "title": subtitle or name or "(无标题)",
+                "title": subtitle or cn_name or name or "(无标题)",
                 "site_title": site_title,
                 "seed_title": seed_title or name,
                 "site_seeding": site_seeding,
@@ -1620,7 +1628,7 @@ class ChdbitsHrMonitor(_PluginBase):
                 continue
             name = str(record.get("name") or "")
             subtitle, seed_title = self.__get_uhd_titles(name)
-            display_title = subtitle or name or "(无标题)"
+            display_title = subtitle or self.__cn_title(name) or name or "(无标题)"
             if record.get("pending_confirm"):
                 items.append({
                     "state": "pending",
@@ -2823,21 +2831,37 @@ class ChdbitsHrMonitor(_PluginBase):
                 contains_match = name
         return contains_match
 
-    def __find_hr_subtitle(self, task_name: str) -> str:
-        """从站点 H&R 任务中反查任务对应的中文副标题。
+    def __find_hr_subtitle(self, site_task: Optional[Dict[str, Any]]) -> str:
+        """取站点 H&R 记录里的中文副标题。
 
-        UHD原盘自动下载 插件记录缺失时，副标题无法从记录中取到，
-        此处按 QB 任务名在站点 H&R 任务列表中匹配，取其副标题。
+        v2.0.18 起只接受**调用方已经拿到的**那条站点记录（互斥分配的结果），
+        不再按标题自己去站点列表里重配 —— 重配会绕过互斥，把别人记录的副标题
+        贴到这张卡上（主标题显示成另一部电影）。
 
-        :param task_name: QB 任务名
-        :return: 中文副标题；未找到返回空字符串
+        :param site_task: 本轮分配给该本地任务的站点记录；无则传 None
+        :return: 中文副标题；无记录时返回空字符串
         """
-        if not task_name or not self._last_hr_tasks:
-            return ""
-        site_task = self.__find_site_task(task_name, self._last_hr_tasks)
         if not site_task:
             return ""
         return str(site_task.get("subtitle") or "").strip()
+
+    @staticmethod
+    def __cn_title(name: str) -> str:
+        """从 QB 任务名里取中文片名（第一个分隔点之前的中文段）。
+
+        站点副标题缺失时（例如站点 H&R 列表里已经没有这条任务），卡片主标题
+        需要有个像样的中文名。QB 任务名的习惯是「中文片名.英文原名.规格…」，
+        取第一段即可得到「最佳拍档：光头神探」，比整串英文种子名可读得多。
+
+        :param name: QB 任务名
+        :return: 中文片名；名字里没有中文前缀时返回空字符串
+        """
+        if not name:
+            return ""
+        head = re.split(r"[.．]", name, maxsplit=1)[0].strip(" -_·")
+        if head and re.search(r"[\u4e00-\u9fff]", head):
+            return head
+        return ""
 
     @staticmethod
     def __normalize_title(title: str) -> str:
